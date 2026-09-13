@@ -27,6 +27,7 @@ import (
 	"github.com/tmih06/herder/internal/api"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/health"
+	"github.com/tmih06/herder/internal/ingest"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
@@ -66,6 +67,8 @@ func run(argv []string, w, ew io.Writer) int {
 		return cmdDoctor(resolveConfigPath(configPath), w, ew)
 	case "task":
 		return cmdTask(resolveConfigPath(configPath), args, w, ew)
+	case "ingest":
+		return cmdIngest(resolveConfigPath(configPath), args, w, ew)
 	default:
 		fmt.Fprintf(ew, "herder: unknown command %q\n\n", cmd)
 		printUsage(ew)
@@ -447,6 +450,106 @@ func taskEvent(store *storage.Store, args []string, w, ew io.Writer) int {
 	return 0
 }
 
+// labelList collects repeatable --label flags into the issue label set.
+type labelList []string
+
+// String renders the collected labels for flag usage output.
+func (l *labelList) String() string { return strings.Join(*l, ",") }
+
+// Set appends one --label occurrence; repeat the flag for several labels.
+func (l *labelList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
+// cmdIngest simulates one webhook delivery through the same policy gate
+// the daemon's webhook endpoint uses, or lists recorded deliveries.
+// Purpose: operators replay and inspect trigger decisions without
+// crafting GitHub payloads by hand.
+func cmdIngest(path string, args []string, w, ew io.Writer) int {
+	if len(args) > 0 && args[0] == "log" {
+		return ingestLog(path, args[1:], w, ew)
+	}
+	return ingestDelivery(path, args, w, ew)
+}
+
+// ingestDelivery claims one issue for one delivery id and prints the
+// durable decision: accepted with its task, duplicate pointing at the
+// survivor, or policy_denied with the reason and no task.
+func ingestDelivery(path string, args []string, w, ew io.Writer) int {
+	cfg := loadConfig(path, ew)
+	if cfg == nil {
+		return 2
+	}
+	store := openStore(cfg, ew)
+	if store == nil {
+		return 1
+	}
+	defer store.Close()
+	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
+	fs.SetOutput(ew)
+	delivery := fs.String("delivery", "", "webhook delivery id (required)")
+	repo := fs.String("repo", "", "repository name as in config (required)")
+	issue := fs.Int("issue", 0, "issue number (required)")
+	title := fs.String("title", "", "issue title for branch naming")
+	var labels labelList
+	fs.Var(&labels, "label", "issue label (repeat for several)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *delivery == "" || *repo == "" || *issue < 1 {
+		fmt.Fprintf(ew, "herder: usage: herder ingest --delivery ID --repo R --issue N [--title T] [--label L]...\n")
+		return 2
+	}
+	out, err := ingest.New(cfg, store).Handle(ingest.IssueEvent{
+		DeliveryID: *delivery, Repository: *repo,
+		IssueNumber: *issue, Title: *title, Labels: labels,
+	})
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(w, "decision: %s\n", out.Decision)
+	if out.TaskID != "" {
+		fmt.Fprintf(w, "task: %s\n", out.TaskID)
+	}
+	fmt.Fprintf(w, "reason: %s\n", out.Reason)
+	return 0
+}
+
+// ingestLog lists recorded deliveries oldest-first: accepted tasks and
+// the policy-denied or duplicate non-events.
+func ingestLog(path string, args []string, w, ew io.Writer) int {
+	if len(args) != 0 {
+		fmt.Fprintf(ew, "herder: usage: herder ingest log\n")
+		return 2
+	}
+	cfg := loadConfig(path, ew)
+	if cfg == nil {
+		return 2
+	}
+	store := openStore(cfg, ew)
+	if store == nil {
+		return 1
+	}
+	defer store.Close()
+	found, err := store.ListDeliveries()
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(w, "%d deliveries\n", len(found))
+	for _, d := range found {
+		task := d.TaskID
+		if task == "" {
+			task = "-"
+		}
+		fmt.Fprintf(w, "- %s %s %s %s %s %s\n",
+			d.DeliveryID, d.Decision, d.SourceRef, d.Repository, task, d.Reason)
+	}
+	return 0
+}
+
 // printUsage lists the v0.1 command surface.
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `herder — control plane for autonomous coding-agent fleets
@@ -466,6 +569,9 @@ usage: herder [--config PATH] <command> [args]
                           move a task, appending a structured event
   task event [--payload '{}'] <id> <type>
                           append a custom event to a task
+  ingest --delivery ID --repo R --issue N [--label L]...
+                          gate and claim one delivery, printing the decision
+  ingest log            show recorded deliveries and their decisions
   version                 print the binary version
   help                    print this text
 `)

@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tmih06/herder/internal/tasks"
 )
@@ -22,9 +24,16 @@ func openTestStore(t *testing.T) (*Store, string) {
 }
 
 func createInput() CreateInput {
+	return createInputWithRef("acme/web#7")
+}
+
+// createInputWithRef builds a CreateTask input for one distinct issue.
+// Purpose: the UNIQUE(source_provider, source_ref) invariant means each
+// task in a store needs its own issue reference.
+func createInputWithRef(ref string) CreateInput {
 	return CreateInput{
 		SourceProvider: "github",
-		SourceRef:      "acme/web#7",
+		SourceRef:      ref,
 		Repository:     "acme/web",
 		AgentProfile:   "codex-default",
 		ActorType:      "controller",
@@ -145,11 +154,11 @@ func TestListTasksEmptyAndOrdered(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("fresh store must list zero tasks, got %d", len(got))
 	}
-	first, err := store.CreateTask(createInput())
+	first, err := store.CreateTask(createInputWithRef("acme/web#7"))
 	if err != nil {
 		t.Fatalf("CreateTask = %v", err)
 	}
-	second, err := store.CreateTask(createInput())
+	second, err := store.CreateTask(createInputWithRef("acme/web#8"))
 	if err != nil {
 		t.Fatalf("CreateTask = %v", err)
 	}
@@ -159,5 +168,42 @@ func TestListTasksEmptyAndOrdered(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].ID != first.ID || got[1].ID != second.ID {
 		t.Errorf("tasks must list in creation order, got %v", got)
+	}
+}
+
+// TestOpenRetriesThroughTransientJournalLock Open shares one SQLite file
+// between the daemon and the CLI, and PRAGMA journal_mode bypasses
+// busy_timeout with instant SQLITE_BUSY under a sibling's lock. Open must
+// therefore retry the mode switch: the holder keeps an uncommitted write
+// for 400ms on a not-yet-WAL database, and Open must succeed with WAL
+// active once the holder rolls back.
+func TestOpenRetriesThroughTransientJournalLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "herder.db")
+	holder, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open holder = %v", err)
+	}
+	defer holder.Close()
+	if _, err := holder.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE = %v", err)
+	}
+	if _, err := holder.Exec(`CREATE TABLE probe (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("holder write = %v", err)
+	}
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		_, _ = holder.Exec("ROLLBACK")
+	}()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open through a transient lock = %v", err)
+	}
+	defer store.Close()
+	var mode string
+	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode = %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", mode)
 	}
 }
