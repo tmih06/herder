@@ -24,9 +24,10 @@ jobs:
 
       # Reports only vulnerabilities in code paths we actually call. Pinned
       # `go run` (not the action): the action passes its go-package input
-      # as one quoted argument, so multiple patterns never match.
+      # as one quoted argument, so multiple patterns never match. v1.8.0:
+      # older scanners panic parsing current-stdlib SSA (KeyValueExpr).
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/... ./internal/...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./cmd/... ./internal/...
 
   dependency-review:
     name: Dependency review
