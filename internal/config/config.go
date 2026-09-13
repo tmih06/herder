@@ -99,9 +99,11 @@ type RepoAgentConfig struct {
 	Default string `yaml:"default"`
 }
 
-// SandboxConfig selects the isolation provider.
+// SandboxConfig selects the isolation provider and its worker image.
+// Image is optional: empty means the provider default.
 type SandboxConfig struct {
 	Provider string `yaml:"provider"`
+	Image    string `yaml:"image"`
 }
 
 // ValidationConfig lists commands that must pass before delivery.

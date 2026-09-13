@@ -51,6 +51,23 @@ Tasks and their event history live in SQLite (default
 Illegal state jumps are rejected; every accepted jump appends a structured,
 timestamped, attributable event.
 
+## Sandbox workflow
+
+```bash
+./herder sandbox provision <task-id>   # isolated container + branch checkout
+./herder sandbox exec <id> -- go test ./...  # output + exit recorded on the task
+./herder sandbox list
+./herder sandbox inspect <id>
+./herder sandbox shell <id>            # interactive shell (needs a TTY)
+./herder sandbox stop|destroy <id>     # unknown ids are a logged no-op
+```
+
+Each task gets a least-privilege container (no privileged mode, dropped
+capabilities, CPU/memory/process caps, bridge networking, one workspace
+mount) on a deterministic `herder/<issue>-<slug>` branch under
+`<statedir>/sandboxes/`. Re-provisioning a dirty workspace refuses rather
+than discards; exec output lands in `sandbox.exec` task events.
+
 ## Developing
 
 ```bash
