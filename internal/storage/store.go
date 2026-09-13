@@ -343,7 +343,7 @@ func (s *Store) Claim(req ClaimRequest) (ClaimOutcome, error) {
 	if strings.TrimSpace(req.DeliveryID) == "" || strings.TrimSpace(req.SourceProvider) == "" ||
 		strings.TrimSpace(req.SourceRef) == "" || strings.TrimSpace(req.Repository) == "" ||
 		strings.TrimSpace(req.AgentProfile) == "" {
-		return ClaimOutcome{}, fmt.Errorf("storage: claim needs delivery, source, repository, and agent profile")
+		return ClaimOutcome{}, errors.New("storage: claim needs delivery, source, repository, and agent profile")
 	}
 	if req.MaxActive < 1 {
 		return ClaimOutcome{}, fmt.Errorf("storage: claim needs MaxActive >= 1, got %d", req.MaxActive)
@@ -505,7 +505,7 @@ func isConflict(err error) bool {
 // redelivery. A lost cross-process race re-reads instead of failing.
 func (s *Store) RecordDenied(deliveryID, provider, sourceRef, repository, reason string) (denied Delivery, created bool, err error) {
 	if strings.TrimSpace(deliveryID) == "" || strings.TrimSpace(reason) == "" {
-		return Delivery{}, false, fmt.Errorf("storage: denied delivery needs an id and a reason")
+		return Delivery{}, false, errors.New("storage: denied delivery needs an id and a reason")
 	}
 	denied = Delivery{
 		DeliveryID: deliveryID, SourceProvider: provider,

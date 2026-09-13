@@ -15,6 +15,7 @@ package ingest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -72,10 +73,10 @@ func New(cfg *config.Config, store *storage.Store) *Handler {
 // caller errors, not denials: nothing durable can reference them.
 func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 	if strings.TrimSpace(ev.DeliveryID) == "" {
-		return Outcome{}, fmt.Errorf("ingest: delivery needs an id")
+		return Outcome{}, errors.New("ingest: delivery needs an id")
 	}
 	if strings.TrimSpace(ev.Repository) == "" {
-		return Outcome{}, fmt.Errorf("ingest: delivery needs a repository")
+		return Outcome{}, errors.New("ingest: delivery needs a repository")
 	}
 	if ev.IssueNumber < 1 {
 		return Outcome{}, fmt.Errorf("ingest: delivery needs an issue number, got %d", ev.IssueNumber)
@@ -265,7 +266,7 @@ func ParseGitHubIssuesEvent(deliveryID string, body []byte) (ev IssueEvent, igno
 		Labels:      labels,
 	}
 	if strings.TrimSpace(ev.Repository) == "" || ev.IssueNumber < 1 {
-		return IssueEvent{}, false, fmt.Errorf("ingest: issues event needs repository.full_name and issue.number")
+		return IssueEvent{}, false, errors.New("ingest: issues event needs repository.full_name and issue.number")
 	}
 	return ev, false, nil
 }

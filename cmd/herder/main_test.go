@@ -175,8 +175,10 @@ func TestIngestAcceptsThroughCLI(t *testing.T) {
 // TestIngestDuplicatesThroughCLI Redeliveries converge without a second task.
 func TestIngestDuplicatesThroughCLI(t *testing.T) {
 	cfg := writeTestConfig(t)
-	flags := []string{"--config", cfg, "ingest",
-		"--delivery", "del-1", "--repo", "acme/web", "--issue", "7", "--label", "agent-ready"}
+	flags := []string{
+		"--config", cfg, "ingest",
+		"--delivery", "del-1", "--repo", "acme/web", "--issue", "7", "--label", "agent-ready",
+	}
 	if code, _, _ := runCmd(t, flags...); code != 0 {
 		t.Fatalf("first ingest = %d, want 0", code)
 	}

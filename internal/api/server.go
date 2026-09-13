@@ -163,7 +163,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, webhookOutcome{Decision: "ignored", Reason: "only labeled actions trigger work"})
 		return
 	}
-	out, err := s.ingest.Handle(ingest.IssueEvent(event))
+	out, err := s.ingest.Handle(event)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
