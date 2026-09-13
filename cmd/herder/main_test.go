@@ -214,3 +214,16 @@ func TestIngestDeniedThroughCLI(t *testing.T) {
 		t.Errorf("ingest without --issue = %d, want usage exit 2", code)
 	}
 }
+
+// TestFlagScanStopsAtSeparator commands after -- (e.g. sh -c inside
+// sandbox exec) must pass through untouched, not parsed as --config.
+func TestFlagScanStopsAtSeparator(t *testing.T) {
+	cfg, rest := scanGlobalFlags([]string{"--config", "herder.yaml", "sandbox", "exec", "task_1", "--", "sh", "-c", "echo hi"})
+	if cfg != "herder.yaml" {
+		t.Errorf("config = %q, want herder.yaml", cfg)
+	}
+	want := []string{"sandbox", "exec", "task_1", "--", "sh", "-c", "echo hi"}
+	if strings.Join(rest, " ") != strings.Join(want, " ") {
+		t.Errorf("rest = %v, want %v", rest, want)
+	}
+}
