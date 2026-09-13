@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,7 +48,8 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 	if runErr == nil {
 		return out, nil
 	}
-	if exitErr, ok := runErr.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
 		out.ExitCode = exitErr.ExitCode()
 		return out, nil
 	}
@@ -58,8 +61,8 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 type DockerProvider struct {
 	// Runner executes subprocesses; DefaultRunner in production.
 	Runner Runner
-	// Log receives no-op notes (stop/destroy of unknown sandboxes) and
-	// degraded-mode notes (offline git fallback). Defaults to discard.
+	// Log receives no-op notes (stop/destroy of unknown sandboxes).
+	// Defaults to discard.
 	Log func(format string, args ...any)
 }
 
@@ -201,13 +204,14 @@ func (p *DockerProvider) containerState(ctx context.Context, name string) (strin
 // namespaces, the Docker and Herdr sockets, and host home directories are
 // never mounted or shared: every mount below names only the workspace.
 func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace string) error {
-	args := []string{"create",
+	args := []string{
+		"create",
 		"--name", name,
 		"--hostname", name,
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--cpus", cpusOf(spec),
 		"--memory", memoryOf(spec),
-		"--pids-limit", fmt.Sprint(pidsOf(spec)),
+		"--pids-limit", strconv.Itoa(pidsOf(spec)),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--network", "bridge",
@@ -235,7 +239,7 @@ func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace 
 // takes no -- separator; the container id already delimits flags.
 func (p *DockerProvider) Exec(ctx context.Context, id string, cmd []string) (*Result, error) {
 	if strings.TrimSpace(id) == "" || len(cmd) == 0 {
-		return nil, fmt.Errorf("sandbox: exec needs a sandbox id and a command")
+		return nil, errors.New("sandbox: exec needs a sandbox id and a command")
 	}
 	args := append([]string{"exec", id}, cmd...)
 	out, err := p.run(ctx, "docker", args...)
@@ -273,7 +277,7 @@ type inspectJSON struct {
 // Inspect reports one live sandbox or ErrNotFound.
 func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, error) {
 	if strings.TrimSpace(id) == "" {
-		return nil, fmt.Errorf("sandbox: inspect needs a sandbox id")
+		return nil, errors.New("sandbox: inspect needs a sandbox id")
 	}
 	out, err := p.run(ctx, "docker", "inspect", id)
 	if err != nil {
@@ -336,7 +340,7 @@ func (p *DockerProvider) List(ctx context.Context) ([]Sandbox, error) {
 // logged no-op rather than an error cascade.
 func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("sandbox: stop needs a sandbox id")
+		return errors.New("sandbox: stop needs a sandbox id")
 	}
 	out, err := p.run(ctx, "docker", "stop", id)
 	if err != nil {
@@ -356,7 +360,7 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 // is a logged no-op rather than an error cascade.
 func (p *DockerProvider) Destroy(ctx context.Context, id string) error {
 	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("sandbox: destroy needs a sandbox id")
+		return errors.New("sandbox: destroy needs a sandbox id")
 	}
 	// docker rm -f is exit-0 idempotent: absence never surfaces in its
 	// status, so check first to keep the no-op explicit and logged. A

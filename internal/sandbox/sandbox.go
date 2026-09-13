@@ -22,6 +22,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -42,7 +43,7 @@ const (
 )
 
 // ErrNotFound reports an unknown sandbox id.
-var ErrNotFound = fmt.Errorf("sandbox: not found")
+var ErrNotFound = errors.New("sandbox: not found")
 
 // DirtyError reports a re-provision that refused to touch uncommitted
 // work. The workspace and container are left exactly as found.
@@ -196,16 +197,16 @@ func normalizeMemory(s string) string {
 // validateSpec rejects provisioning with no task, repo, or branch.
 func validateSpec(spec Spec) error {
 	if strings.TrimSpace(spec.TaskID) == "" {
-		return fmt.Errorf("sandbox: provision needs a task id")
+		return errors.New("sandbox: provision needs a task id")
 	}
 	if strings.TrimSpace(spec.Repository) == "" {
-		return fmt.Errorf("sandbox: provision needs a repository (owner/name)")
+		return errors.New("sandbox: provision needs a repository (owner/name)")
 	}
 	if strings.TrimSpace(spec.Branch) == "" {
-		return fmt.Errorf("sandbox: provision needs a branch")
+		return errors.New("sandbox: provision needs a branch")
 	}
 	if strings.TrimSpace(spec.WorkspaceRoot) == "" {
-		return fmt.Errorf("sandbox: provision needs a workspace root")
+		return errors.New("sandbox: provision needs a workspace root")
 	}
 	return nil
 }

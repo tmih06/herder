@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,11 @@ import (
 // execOutputCap bounds sandbox.exec event payloads: full output goes to
 // the terminal, the durable event keeps the head for later validation use.
 const execOutputCap = 4096
+
+// containerNamePattern restricts interactive shell targets to Docker's
+// own name charset (leading alnum, no spaces or flags), so raw container
+// names cannot smuggle options into the docker exec argv.
+var containerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // cmdSandbox implements `herder sandbox provision|exec|list|inspect|
 // shell|stop|destroy` against the live Docker host and the durable store.
@@ -321,13 +327,18 @@ func sandboxShell(path string, args []string, w, ew io.Writer) int {
 	if store == nil {
 		return 1
 	}
-	defer store.Close()
 	container, _ := resolveTarget(store, args[0])
+	if !containerNamePattern.MatchString(container) {
+		fmt.Fprintf(ew, "herder: sandbox name %q is not a valid container name\n", container)
+		return 2
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		fmt.Fprintf(ew, "herder: docker not in PATH (install Docker to enter sandboxes)\n")
 		return 1
 	}
+	//nolint:gosec // argv-form exec (no shell) with a LookPath binary and a
+	// charset-validated name: nothing for a hostile name to inject through.
 	cmd := exec.Command(docker, sandbox.ShellArgv(container)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -358,7 +369,8 @@ func sandboxDestroy(path string, args []string, w, ew io.Writer) int {
 // sandboxOneID runs one stop/destroy-style action against a task id or
 // container name. Unknown ids are a logged no-op with exit 0.
 func sandboxOneID(path string, args []string, w, ew io.Writer, verb, done string,
-	action func(ctx context.Context, p *sandbox.DockerProvider, id string) error) int {
+	action func(ctx context.Context, p *sandbox.DockerProvider, id string) error,
+) int {
 	if len(args) != 1 {
 		fmt.Fprintf(ew, "herder: usage: herder sandbox %s <task-or-container>\n", verb)
 		return 2

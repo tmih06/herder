@@ -577,7 +577,7 @@ usage: herder [--config PATH] <command> [args]
   sandbox provision <task-id>
                           create or reuse the task's isolated container
   sandbox exec <id> -- <command...>
-                          run a command inside the sandbox
+                          run a command inside it
   sandbox list|inspect|shell|stop|destroy
                           manage live sandboxes (id = task or container)
   ingest --delivery ID --repo R --issue N [--label L]...

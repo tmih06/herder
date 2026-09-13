@@ -84,14 +84,16 @@ func TestContainerNameDeterministic(t *testing.T) {
 	if got := ContainerName("task_abc123"); got != "herder-task_abc123" {
 		t.Errorf("name = %q, want herder-task_abc123", got)
 	}
-	if ContainerName("task_abc123") != ContainerName("task_abc123") {
+	first, second := ContainerName("task_abc123"), ContainerName("task_abc123")
+	if first != second {
 		t.Error("same task must map to the same container")
 	}
-	if ContainerName("task_abc123") == ContainerName("task_xyz999") {
+	if first == ContainerName("task_xyz999") {
 		t.Error("distinct tasks must map to distinct containers")
 	}
 	for _, c := range ContainerName("TASK A/B#C") {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		allowed := c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_'
+		if !allowed {
 			t.Errorf("name %q carries unsafe character %q", ContainerName("TASK A/B#C"), c)
 		}
 	}
