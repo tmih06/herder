@@ -29,7 +29,9 @@ import (
 var ErrNotFound = errors.New("storage: task not found")
 
 // schema creates the v0.1 tables: tasks plus the append-only task_events
-// log that mirrors SPEC sections 46-47.
+// log that mirrors SPEC sections 46-47, plus the webhook_deliveries log
+// that makes every trigger delivery an inspectable durable decision
+// (SPEC sections 11, 49: dedup by delivery id, one task per issue).
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
 	id TEXT PRIMARY KEY,
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_provider, source_ref);
 CREATE TABLE IF NOT EXISTS task_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -53,6 +56,16 @@ CREATE TABLE IF NOT EXISTS task_events (
 	created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id, id);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+	delivery_id TEXT PRIMARY KEY,
+	source_provider TEXT NOT NULL DEFAULT '',
+	source_ref TEXT NOT NULL DEFAULT '',
+	repository TEXT NOT NULL DEFAULT '',
+	decision TEXT NOT NULL,
+	reason TEXT NOT NULL DEFAULT '',
+	task_id TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL
+);
 `
 
 // CreateInput carries the fields needed to open a new task.
@@ -85,6 +98,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", expanded, err)
 	}
+	// Single writer: SQLite takes database-level write locks, so a
+	// pool of writers just meets SQLITE_BUSY. One connection serializes
+	// claims in the driver, keeps every PRAGMA on the same handle, and
+	// leaves the UNIQUE constraints as the cross-process safety net.
+	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA busy_timeout=5000",
@@ -244,6 +262,439 @@ func (s *Store) AppendEvent(taskID, eventType, actorType, actorID, payload strin
 		return tasks.Event{}, fmt.Errorf("storage: commit: %w", err)
 	}
 	return event, nil
+}
+
+// Delivery decisions recorded in webhook_deliveries (SPEC sections 11, 49).
+const (
+	// DecisionAccepted means the delivery created the task.
+	DecisionAccepted = "accepted"
+	// DecisionDuplicate means the delivery repeated an already-recorded
+	// delivery id or an already-claimed issue; no new task was made.
+	DecisionDuplicate = "duplicate"
+	// DecisionPolicyDenied means policy refused the work; no task was made.
+	DecisionPolicyDenied = "policy_denied"
+)
+
+// ErrDeliveryNotFound is returned when a delivery id was never recorded.
+var ErrDeliveryNotFound = errors.New("storage: delivery not found")
+
+// Delivery is one webhook receipt and its durable decision: which task it
+// created, or why it became a logged non-event instead of a second worker.
+type Delivery struct {
+	DeliveryID     string
+	SourceProvider string
+	SourceRef      string
+	Repository     string
+	Decision       string
+	Reason         string
+	TaskID         string
+	CreatedAt      time.Time
+}
+
+// ClaimRequest carries everything needed to atomically deduplicate,
+// policy-check, and claim one trigger delivery (issue #2).
+type ClaimRequest struct {
+	DeliveryID     string
+	SourceProvider string
+	SourceRef      string
+	Repository     string
+	AgentProfile   string
+	BranchName     string
+	// MaxActive caps tasks in non-terminal states; the count and the
+	// insert share one transaction so the cap cannot be raced.
+	MaxActive int
+	// PolicyPayload is stored on the policy.decision event of an
+	// accepted task so inspect shows the policy outcome end to end.
+	PolicyPayload string
+	ActorType     string
+	ActorID       string
+}
+
+// ClaimOutcome is the durable decision for one delivery.
+type ClaimOutcome struct {
+	Decision string
+	Reason   string
+	Task     tasks.Task
+}
+
+// terminalStatusClause lists the states that free worker capacity, as a
+// SQL IN-list fragment for the active-task count.
+const terminalStatusClause = `('DONE','CANCELLED','FAILED')`
+
+// Claim deduplicates one trigger delivery and, when it is new and policy
+// allows, creates exactly one task already walked to QUEUED with its full
+// event timeline. Every path records the delivery row, so redeliveries and
+// denials stay inspectable instead of silent.
+// Why: GitHub redelivers webhooks and operators relabel issues; without
+// one atomic check-then-claim, concurrent duplicates open a double-claim
+// window with two workers on one issue (SPEC sections 49, 66.8).
+// Approach: one transaction per claim. UNIQUE(delivery_id) plus
+// UNIQUE(source_provider, source_ref) turn a lost race into a re-read
+// that returns duplicate instead of a second task; ON CONFLICT DO NOTHING
+// keeps that re-read free of fragile error-string matching. The active
+// count and the insert share the transaction so the cap holds.
+// Inputs: validated delivery identity, source, agent profile, branch, cap.
+// Flow: known delivery -> duplicate; known source -> duplicate + log on
+// the surviving task; cap breached -> policy_denied; else insert task,
+// created + DISCOVERED->ELIGIBLE->CLAIMED->QUEUED + policy.decision
+// events, and the accepted delivery row, atomically.
+// Returns: the durable decision with the new or surviving task.
+func (s *Store) Claim(req ClaimRequest) (ClaimOutcome, error) {
+	if strings.TrimSpace(req.DeliveryID) == "" || strings.TrimSpace(req.SourceProvider) == "" ||
+		strings.TrimSpace(req.SourceRef) == "" || strings.TrimSpace(req.Repository) == "" ||
+		strings.TrimSpace(req.AgentProfile) == "" {
+		return ClaimOutcome{}, fmt.Errorf("storage: claim needs delivery, source, repository, and agent profile")
+	}
+	if req.MaxActive < 1 {
+		return ClaimOutcome{}, fmt.Errorf("storage: claim needs MaxActive >= 1, got %d", req.MaxActive)
+	}
+	out, err := s.claimOnce(req)
+	if err != nil && isConflict(err) {
+		// A sibling process (CLI beside the daemon) won the race between
+		// our check and our insert. Re-read under the new state and report
+		// duplicate instead of a constraint error. Same-process claims
+		// never reach here: MaxOpenConns(1) serializes them.
+		return s.claimOnce(req)
+	}
+	return out, err
+}
+
+// claimOnce runs one check-then-claim transaction; see Claim.
+func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
+	actorType, actorID := orDefault(req.ActorType, "controller"), orDefault(req.ActorID, "webhook")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ClaimOutcome{}, fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if existing, err := getDeliveryTx(tx, req.DeliveryID); err == nil {
+		reason := fmt.Sprintf("delivery %q already recorded as %s", req.DeliveryID, existing.Decision)
+		outcome := ClaimOutcome{Decision: DecisionDuplicate, Reason: reason}
+		if existing.TaskID != "" {
+			if task, terr := getTaskTx(tx, existing.TaskID); terr == nil {
+				outcome.Task = task
+				if err := insertEvent(tx, tasks.Event{
+					TaskID: task.ID, Type: tasks.EventWebhookDuplicate,
+					ActorType: actorType, ActorID: actorID,
+					Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+					CreatedAt: time.Now().UTC(),
+				}); err != nil {
+					return ClaimOutcome{}, err
+				}
+				if err := tx.Commit(); err != nil {
+					return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
+				}
+			}
+		}
+		return outcome, nil
+	}
+	if survivor, err := getTaskBySourceTx(tx, req.SourceProvider, req.SourceRef); err == nil {
+		reason := fmt.Sprintf("issue %s:%s already claimed by %s", req.SourceProvider, req.SourceRef, survivor.ID)
+		if err := recordDuplicateTx(tx, req, survivor, reason, actorType, actorID); err != nil {
+			return ClaimOutcome{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
+		}
+		return ClaimOutcome{Decision: DecisionDuplicate, Reason: reason, Task: survivor}, nil
+	}
+	var active int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status NOT IN ` + terminalStatusClause).Scan(&active); err != nil {
+		return ClaimOutcome{}, fmt.Errorf("storage: count active: %w", err)
+	}
+	if active >= req.MaxActive {
+		reason := fmt.Sprintf("concurrency cap reached: %d active tasks of %d allowed", active, req.MaxActive)
+		if err := insertDeliveryTx(tx, Delivery{
+			DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
+			SourceRef: req.SourceRef, Repository: req.Repository,
+			Decision: DecisionPolicyDenied, Reason: reason,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			return ClaimOutcome{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
+		}
+		return ClaimOutcome{Decision: DecisionPolicyDenied, Reason: reason}, nil
+	}
+	task := tasks.New(req.SourceProvider, req.SourceRef, req.Repository, req.AgentProfile)
+	task.BranchName = req.BranchName
+	const insertTask = `INSERT INTO tasks
+		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_provider, source_ref) DO NOTHING`
+	res, err := tx.Exec(insertTask, task.ID, task.SourceProvider, task.SourceRef,
+		string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
+		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
+	if err != nil {
+		return ClaimOutcome{}, fmt.Errorf("storage: insert task: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		survivor, serr := getTaskBySourceTx(tx, req.SourceProvider, req.SourceRef)
+		if serr != nil {
+			return ClaimOutcome{}, fmt.Errorf("storage: lost claim race with no winner: %w", serr)
+		}
+		reason := fmt.Sprintf("issue %s:%s claimed concurrently by %s", req.SourceProvider, req.SourceRef, survivor.ID)
+		if err := recordDuplicateTx(tx, req, survivor, reason, actorType, actorID); err != nil {
+			return ClaimOutcome{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
+		}
+		return ClaimOutcome{Decision: DecisionDuplicate, Reason: reason, Task: survivor}, nil
+	}
+	if err := insertEvent(tx, tasks.CreatedEvent(task, actorType, actorID)); err != nil {
+		return ClaimOutcome{}, err
+	}
+	for _, to := range []tasks.State{tasks.Eligible, tasks.Claimed, tasks.Queued} {
+		event, err := tasks.ApplyTransition(&task, to, actorType, actorID)
+		if err != nil {
+			return ClaimOutcome{}, err
+		}
+		if _, err := tx.Exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+			string(task.Status), formatTime(task.UpdatedAt), task.ID); err != nil {
+			return ClaimOutcome{}, fmt.Errorf("storage: update status: %w", err)
+		}
+		if err := insertEvent(tx, event); err != nil {
+			return ClaimOutcome{}, err
+		}
+	}
+	if err := insertEvent(tx, tasks.Event{
+		TaskID: task.ID, Type: tasks.EventPolicyDecision,
+		ActorType: actorType, ActorID: actorID,
+		Payload:   orDefault(req.PolicyPayload, "{}"),
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		return ClaimOutcome{}, err
+	}
+	if err := insertDeliveryTx(tx, Delivery{
+		DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
+		SourceRef: req.SourceRef, Repository: req.Repository,
+		Decision: DecisionAccepted, Reason: "policy accepted; task claimed and queued",
+		TaskID: task.ID, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		return ClaimOutcome{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
+	}
+	return ClaimOutcome{Decision: DecisionAccepted, Reason: "policy accepted; task claimed and queued", Task: task}, nil
+}
+
+// isConflict reports SQLite uniqueness violations from a lost cross-process
+// race: a UNIQUE delivery id or a UNIQUE source already taken by a sibling.
+// Purpose: lets Claim retry once as a re-read instead of surfacing a
+// constraint error for what is really a duplicate delivery.
+func isConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") ||
+		strings.Contains(msg, "PRIMARY KEY constraint") ||
+		strings.Contains(msg, "constraint failed")
+}
+
+// RecordDenied durably logs a delivery refused before claiming: unknown or
+// disabled repository, or a label outside the trigger set. It creates no
+// task. Redelivering the same delivery id returns the first decision so
+// the log stays stable and callers report duplicate.
+// Inputs: delivery identity plus the human-readable policy reason.
+// Returns: the recorded (or already-recorded) delivery plus whether this
+// call created the row, so callers can tell a fresh denial from a
+// redelivery. A lost cross-process race re-reads instead of failing.
+func (s *Store) RecordDenied(deliveryID, provider, sourceRef, repository, reason string) (denied Delivery, created bool, err error) {
+	if strings.TrimSpace(deliveryID) == "" || strings.TrimSpace(reason) == "" {
+		return Delivery{}, false, fmt.Errorf("storage: denied delivery needs an id and a reason")
+	}
+	denied = Delivery{
+		DeliveryID: deliveryID, SourceProvider: provider,
+		SourceRef: sourceRef, Repository: repository,
+		Decision: DecisionPolicyDenied, Reason: reason,
+		CreatedAt: time.Now().UTC(),
+	}
+	// ON CONFLICT DO NOTHING plus the re-read inside recordDeniedOnce
+	// already turn a lost race into the rival row; no retry needed.
+	got, created, err := recordDeniedOnce(s, denied)
+	return got, created, err
+}
+
+// recordDeniedOnce inserts one denial unless the delivery id is taken.
+// Purpose: one attempt of RecordDenied. Returns created=false with a nil
+// error when the row already exists, so the caller can report duplicate.
+func recordDeniedOnce(s *Store, denied Delivery) (Delivery, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Delivery{}, false, fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if existing, err := getDeliveryTx(tx, denied.DeliveryID); err == nil {
+		return existing, false, nil
+	}
+	const insert = `INSERT INTO webhook_deliveries
+		(delivery_id, source_provider, source_ref, repository, decision, reason, task_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(delivery_id) DO NOTHING`
+	res, err := tx.Exec(insert, denied.DeliveryID, denied.SourceProvider, denied.SourceRef,
+		denied.Repository, denied.Decision, denied.Reason, denied.TaskID, formatTime(denied.CreatedAt))
+	if err != nil {
+		return Delivery{}, false, fmt.Errorf("storage: insert delivery: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		existing, rerr := getDeliveryTx(tx, denied.DeliveryID)
+		if rerr != nil {
+			return Delivery{}, false, fmt.Errorf("storage: re-read denied delivery: %w", rerr)
+		}
+		_ = tx.Rollback()
+		return existing, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return Delivery{}, false, fmt.Errorf("storage: commit: %w", err)
+	}
+	return denied, true, nil
+}
+
+// GetDelivery returns one recorded delivery or ErrDeliveryNotFound.
+func (s *Store) GetDelivery(id string) (Delivery, error) {
+	var d Delivery
+	var createdAt string
+	err := s.db.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id).Scan(
+		&d.DeliveryID, &d.SourceProvider, &d.SourceRef, &d.Repository,
+		&d.Decision, &d.Reason, &d.TaskID, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Delivery{}, ErrDeliveryNotFound
+	}
+	if err != nil {
+		return Delivery{}, fmt.Errorf("storage: get delivery: %w", err)
+	}
+	var perr error
+	if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
+		return Delivery{}, fmt.Errorf("storage: parse delivery time: %w", perr)
+	}
+	return d, nil
+}
+
+// ListDeliveries returns every recorded delivery in receipt order.
+// Purpose: the inspectable non-event log behind `herder ingest log` and
+// GET /v1/deliveries. Returns oldest first, never nil.
+func (s *Store) ListDeliveries() ([]Delivery, error) {
+	rows, err := s.db.Query(deliveryColumns + ` ORDER BY rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list deliveries: %w", err)
+	}
+	defer rows.Close()
+	out := []Delivery{}
+	for rows.Next() {
+		var d Delivery
+		var createdAt string
+		if err := rows.Scan(&d.DeliveryID, &d.SourceProvider, &d.SourceRef,
+			&d.Repository, &d.Decision, &d.Reason, &d.TaskID, &createdAt); err != nil {
+			return nil, fmt.Errorf("storage: scan delivery: %w", err)
+		}
+		var perr error
+		if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
+			return nil, fmt.Errorf("storage: parse delivery time: %w", perr)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list deliveries: %w", err)
+	}
+	return out, nil
+}
+
+// FindTaskBySource returns the task claimed for one provider issue, or
+// ErrNotFound when the issue was never claimed.
+func (s *Store) FindTaskBySource(provider, ref string) (tasks.Task, error) {
+	task, err := scanTask(s.db.QueryRow(taskColumns+` WHERE source_provider = ? AND source_ref = ?`, provider, ref))
+	if errors.Is(err, sql.ErrNoRows) {
+		return tasks.Task{}, ErrNotFound
+	}
+	if err != nil {
+		return tasks.Task{}, fmt.Errorf("storage: find task by source: %w", err)
+	}
+	return task, nil
+}
+
+// CountActive reports tasks in non-terminal states holding worker capacity.
+// Purpose: policy input for the concurrency cap and a diagnostic signal.
+// Returns the count of tasks outside DONE/CANCELLED/FAILED.
+func (s *Store) CountActive() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status NOT IN ` + terminalStatusClause).Scan(&n); err != nil {
+		return 0, fmt.Errorf("storage: count active: %w", err)
+	}
+	return n, nil
+}
+
+// deliveryColumns lists webhook_deliveries columns in scan order.
+const deliveryColumns = `SELECT delivery_id, source_provider, source_ref, repository,
+	decision, reason, task_id, created_at FROM webhook_deliveries`
+
+// getDeliveryTx loads a delivery inside a transaction.
+// Purpose: dedup reads share the claim transaction so the decision and
+// the task insert commit or roll back together.
+// Returns sql.ErrNoRows (unmapped) when the delivery is new.
+func getDeliveryTx(tx *sql.Tx, id string) (Delivery, error) {
+	var d Delivery
+	var createdAt string
+	if err := tx.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id).Scan(
+		&d.DeliveryID, &d.SourceProvider, &d.SourceRef, &d.Repository,
+		&d.Decision, &d.Reason, &d.TaskID, &createdAt); err != nil {
+		return Delivery{}, err
+	}
+	var perr error
+	if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
+		return Delivery{}, fmt.Errorf("storage: parse delivery time: %w", perr)
+	}
+	return d, nil
+}
+
+// getTaskBySourceTx loads a task by provider issue inside a transaction.
+// Purpose: the already-claimed check inside the claim transaction.
+// Returns sql.ErrNoRows (unmapped) when the issue is unclaimed.
+func getTaskBySourceTx(tx *sql.Tx, provider, ref string) (tasks.Task, error) {
+	task, err := scanTask(tx.QueryRow(taskColumns+` WHERE source_provider = ? AND source_ref = ?`, provider, ref))
+	if err != nil {
+		return tasks.Task{}, err
+	}
+	return task, nil
+}
+
+// insertDeliveryTx records one delivery row inside the caller's transaction.
+// Purpose: single choke point so claim, duplicate, and denial paths log
+// the same way. Returns wrapped errors only.
+func insertDeliveryTx(tx *sql.Tx, d Delivery) error {
+	const insert = `INSERT INTO webhook_deliveries
+		(delivery_id, source_provider, source_ref, repository, decision, reason, task_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	if _, err := tx.Exec(insert, d.DeliveryID, d.SourceProvider, d.SourceRef,
+		d.Repository, d.Decision, d.Reason, d.TaskID, formatTime(d.CreatedAt)); err != nil {
+		return fmt.Errorf("storage: insert delivery: %w", err)
+	}
+	return nil
+}
+
+// recordDuplicateTx logs one deduplicated delivery inside the claim
+// transaction: the duplicate delivery row plus a webhook.duplicate event
+// on the surviving task, so repeats stay visible instead of silent.
+// Inputs: open claim tx, the losing request, the surviving task, the
+// human-readable reason, actor attribution. Returns wrapped errors only.
+func recordDuplicateTx(tx *sql.Tx, req ClaimRequest, survivor tasks.Task, reason, actorType, actorID string) error {
+	if err := insertDeliveryTx(tx, Delivery{
+		DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
+		SourceRef: req.SourceRef, Repository: req.Repository,
+		Decision: DecisionDuplicate, Reason: reason, TaskID: survivor.ID,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		return err
+	}
+	return insertEvent(tx, tasks.Event{
+		TaskID: survivor.ID, Type: tasks.EventWebhookDuplicate,
+		ActorType: actorType, ActorID: actorID,
+		Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+		CreatedAt: time.Now().UTC(),
+	})
 }
 
 // ListEvents returns a task's full history in append order.

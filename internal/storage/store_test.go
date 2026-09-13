@@ -22,9 +22,16 @@ func openTestStore(t *testing.T) (*Store, string) {
 }
 
 func createInput() CreateInput {
+	return createInputWithRef("acme/web#7")
+}
+
+// createInputWithRef builds a CreateTask input for one distinct issue.
+// Purpose: the UNIQUE(source_provider, source_ref) invariant means each
+// task in a store needs its own issue reference.
+func createInputWithRef(ref string) CreateInput {
 	return CreateInput{
 		SourceProvider: "github",
-		SourceRef:      "acme/web#7",
+		SourceRef:      ref,
 		Repository:     "acme/web",
 		AgentProfile:   "codex-default",
 		ActorType:      "controller",
@@ -145,11 +152,11 @@ func TestListTasksEmptyAndOrdered(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("fresh store must list zero tasks, got %d", len(got))
 	}
-	first, err := store.CreateTask(createInput())
+	first, err := store.CreateTask(createInputWithRef("acme/web#7"))
 	if err != nil {
 		t.Fatalf("CreateTask = %v", err)
 	}
-	second, err := store.CreateTask(createInput())
+	second, err := store.CreateTask(createInputWithRef("acme/web#8"))
 	if err != nil {
 		t.Fatalf("CreateTask = %v", err)
 	}

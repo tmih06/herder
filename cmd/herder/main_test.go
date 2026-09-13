@@ -146,3 +146,69 @@ func TestDoctorReportsFourSections(t *testing.T) {
 		}
 	}
 }
+
+// TestIngestAcceptsThroughCLI An eligible delivery claims a queued task
+// visible in task list, task inspect, and ingest log end to end.
+func TestIngestAcceptsThroughCLI(t *testing.T) {
+	cfg := writeTestConfig(t)
+	code, out, _ := runCmd(t, "--config", cfg, "ingest",
+		"--delivery", "del-1", "--repo", "acme/web", "--issue", "7",
+		"--title", "Fix refresh race", "--label", "bug", "--label", "agent-ready")
+	if code != 0 {
+		t.Fatalf("ingest = %d, want 0: %s", code, out)
+	}
+	if !strings.Contains(out, "decision: accepted") || !strings.Contains(out, "task: task_") {
+		t.Fatalf("ingest must print accepted with a task id, got:\n%s", out)
+	}
+	if _, out, _ := runCmd(t, "--config", cfg, "task", "list"); !strings.Contains(out, "1 tasks") {
+		t.Errorf("task list must show the claimed task, got:\n%s", out)
+	}
+	taskID := strings.TrimSpace(strings.Split(strings.Split(out, "task: ")[1], "\n")[0])
+	if _, out, _ := runCmd(t, "--config", cfg, "task", "inspect", taskID); !strings.Contains(out, "policy.decision") {
+		t.Errorf("task inspect must show the policy outcome, got:\n%s", out)
+	}
+	if _, out, _ := runCmd(t, "--config", cfg, "ingest", "log"); !strings.Contains(out, "del-1 accepted") {
+		t.Errorf("ingest log must record the accepted delivery, got:\n%s", out)
+	}
+}
+
+// TestIngestDuplicatesThroughCLI Redeliveries converge without a second task.
+func TestIngestDuplicatesThroughCLI(t *testing.T) {
+	cfg := writeTestConfig(t)
+	flags := []string{"--config", cfg, "ingest",
+		"--delivery", "del-1", "--repo", "acme/web", "--issue", "7", "--label", "agent-ready"}
+	if code, _, _ := runCmd(t, flags...); code != 0 {
+		t.Fatalf("first ingest = %d, want 0", code)
+	}
+	code, out, _ := runCmd(t, flags...)
+	if code != 0 || !strings.Contains(out, "decision: duplicate") {
+		t.Fatalf("redelivery must report duplicate, got %d:\n%s", code, out)
+	}
+	if _, out, _ := runCmd(t, "--config", cfg, "task", "list"); !strings.Contains(out, "1 tasks") {
+		t.Errorf("redelivery must not create a second task, got:\n%s", out)
+	}
+}
+
+// TestIngestDeniedThroughCLI Ineligible deliveries deny with a reason,
+// create no task, and stay visible in ingest log.
+func TestIngestDeniedThroughCLI(t *testing.T) {
+	cfg := writeTestConfig(t)
+	code, out, _ := runCmd(t, "--config", cfg, "ingest",
+		"--delivery", "del-evil", "--repo", "evil/repo", "--issue", "1", "--label", "agent-ready")
+	if code != 0 || !strings.Contains(out, "decision: policy_denied") {
+		t.Fatalf("unknown repo must deny, got %d:\n%s", code, out)
+	}
+	if strings.Contains(out, "task: ") {
+		t.Errorf("denial must not print a task, got:\n%s", out)
+	}
+	if _, out, _ := runCmd(t, "--config", cfg, "task", "list"); !strings.Contains(out, "0 tasks") {
+		t.Errorf("denial must create no task, got:\n%s", out)
+	}
+	if _, out, _ := runCmd(t, "--config", cfg, "ingest", "log"); !strings.Contains(out, "del-evil policy_denied") {
+		t.Errorf("ingest log must record the denial, got:\n%s", out)
+	}
+	code, _, _ = runCmd(t, "--config", cfg, "ingest", "--delivery", "d", "--repo", "acme/web")
+	if code != 2 {
+		t.Errorf("ingest without --issue = %d, want usage exit 2", code)
+	}
+}

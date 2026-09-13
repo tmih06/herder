@@ -55,6 +55,11 @@ const (
 	EventCreated = "task.created"
 	// EventTransition marks an accepted state transition.
 	EventTransition = "task.transition"
+	// EventPolicyDecision records the ingest policy outcome on a task.
+	EventPolicyDecision = "policy.decision"
+	// EventWebhookDuplicate records a deduplicated redelivery on the
+	// surviving task so repeats stay visible instead of silent.
+	EventWebhookDuplicate = "webhook.duplicate"
 )
 
 // State is a task lifecycle state.
