@@ -67,6 +67,8 @@ func run(argv []string, w, ew io.Writer) int {
 		return cmdDoctor(resolveConfigPath(configPath), w, ew)
 	case "task":
 		return cmdTask(resolveConfigPath(configPath), args, w, ew)
+	case "sandbox":
+		return cmdSandbox(resolveConfigPath(configPath), args, w, ew)
 	case "ingest":
 		return cmdIngest(resolveConfigPath(configPath), args, w, ew)
 	default:
@@ -78,11 +80,16 @@ func run(argv []string, w, ew io.Writer) int {
 
 // scanGlobalFlags extracts --config/-c wherever it appears (before or
 // after the subcommand) and returns its value plus the remaining argv.
+// A -- separator ends flag scanning so sandboxed commands (e.g. sh -c)
+// pass through untouched.
 func scanGlobalFlags(argv []string) (string, []string) {
 	var configPath string
 	rest := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
 		switch a := argv[i]; {
+		case a == "--":
+			rest = append(rest, argv[i:]...)
+			return configPath, rest
 		case strings.HasPrefix(a, "--config="):
 			configPath = strings.TrimPrefix(a, "--config=")
 		case (a == "--config" || a == "-c") && i+1 < len(argv):
@@ -567,8 +574,12 @@ usage: herder [--config PATH] <command> [args]
                           open a task for a configured repository
   task transition [--actor-type T] [--actor-id I] <id> <STATE>
                           move a task, appending a structured event
-  task event [--payload '{}'] <id> <type>
-                          append a custom event to a task
+  sandbox provision <task-id>
+                          create or reuse the task's isolated container
+  sandbox exec <id> -- <command...>
+                          run a command inside it
+  sandbox list|inspect|shell|stop|destroy
+                          manage live sandboxes (id = task or container)
   ingest --delivery ID --repo R --issue N [--label L]...
                           gate and claim one delivery, printing the decision
   ingest log            show recorded deliveries and their decisions
