@@ -1,0 +1,81 @@
+# golangci-lint source of truth for herder (v2 format).
+# Deliberate cuts: godot/funlen/wsl/nestif/gocyclo (fragment-first terse
+# style; length is bounded by review, not robots), goconst/prealloc (low
+# signal at this size), noctx (one local SQLite file plus a single
+# ctx-bound HTTP call; threading Background() through every store method
+# buys no cancellation). G204/G304/G703 are excluded below: herder is a CLI
+# whose inputs ARE file paths and binary names from LookPath, so those
+# rules cannot distinguish intended use from misuse here.
+version: "2"
+run:
+  concurrency: 4
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - unconvert
+    - errcheck
+    - errorlint
+    - nilerr
+    - copyloopvar
+    - durationcheck
+    - predeclared
+    - misspell
+    - dupword
+    - whitespace
+    - gocritic
+    - revive
+    - dupl
+    - perfsprint
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - gosec
+  settings:
+    errcheck:
+      # Writing to stdout/stderr is not actionable in this CLI: a failed
+      # Fprintf means the terminal is gone, and there is nowhere better to
+      # report it. Everything else must be checked.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+    gosec:
+      excludes:
+        # G204: probeBinary execs LookPath-resolved binaries for fixed names
+        # ("herdr", "docker"); the variable is the resolved path, not input.
+        - G204
+        # G304/G703: config/state paths come from --config and the config
+        # file by design; user-supplied paths are the feature, not a flaw.
+        - G304
+        - G703
+    revive:
+      confidence: 0.8
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    paths:
+      # Synced skill examples are not part of this module's build.
+      - agent/
+      - .agents/
+      - .claude/
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+  exclusions:
+    paths:
+      - agent/
+      - .agents/
+      - .claude/

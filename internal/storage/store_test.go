@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -16,7 +17,7 @@ func openTestStore(t *testing.T) (*Store, string) {
 	if err != nil {
 		t.Fatalf("Open = %v", err)
 	}
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 	return store, path
 }
 
@@ -48,7 +49,9 @@ func TestDurabilityAcrossReopen(t *testing.T) {
 		t.Fatalf("AppendEvent = %v", err)
 	}
 
-	store.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
 
 	reopened, err := Open(path)
 	if err != nil {
@@ -119,7 +122,7 @@ func TestGetUnknownTask(t *testing.T) {
 	store, _ := openTestStore(t)
 	if _, err := store.GetTask("task_missing"); err == nil {
 		t.Fatal("expected ErrNotFound, got nil")
-	} else if err != ErrNotFound {
+	} else if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

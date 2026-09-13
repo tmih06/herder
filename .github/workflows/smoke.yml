@@ -1,0 +1,79 @@
+name: Smoke
+
+# End-to-end acceptance for issue #1 against a real binary: zero-task
+# status view, validation failures, task lifecycle, illegal-jump
+# rejection, and kill -9/restart durability with identical state/history.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  daemon-lifecycle:
+    name: Daemon lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Build
+        run: go build -o herder ./cmd/herder
+
+      - name: Zero-task status view
+        run: |
+          set -euo pipefail
+          ./herder init --config "$RUNNER_TEMP/config.yaml"
+          sed -i "s/127.0.0.1:8787/127.0.0.1:18087/; s|~/.local/state/herder/herder.db|$RUNNER_TEMP/herder.db|" "$RUNNER_TEMP/config.yaml"
+          ./herder config validate --config "$RUNNER_TEMP/config.yaml"
+          (./herder daemon --config "$RUNNER_TEMP/config.yaml" > daemon.log 2>&1 & echo $! > daemon.pid)
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:18087/ >/dev/null && break; sleep 1; done
+          # Plain grep (no -q): it must consume the whole body, otherwise an
+          # early close SIGPIPEs the producer under `pipefail`.
+          curl -sf http://127.0.0.1:18087/ | grep '<p>0 tasks</p>'
+          ./herder status --config "$RUNNER_TEMP/config.yaml" | grep '^0 tasks$'
+
+      - name: Validation failures
+        run: |
+          set -euo pipefail
+          sed 's/- agent-ready/- ""/' "$RUNNER_TEMP/config.yaml" > "$RUNNER_TEMP/bad-trigger.yaml"
+          if ./herder config validate --config "$RUNNER_TEMP/bad-trigger.yaml"; then echo 'bad trigger accepted' >&2; exit 1; fi
+          sed 's/default: codex-default/default: ghost/' "$RUNNER_TEMP/config.yaml" > "$RUNNER_TEMP/bad-agent.yaml"
+          if ./herder config validate --config "$RUNNER_TEMP/bad-agent.yaml"; then echo 'unknown agent accepted' >&2; exit 1; fi
+          sed 's/provider: docker/provider: teleport/' "$RUNNER_TEMP/config.yaml" > "$RUNNER_TEMP/bad-provider.yaml"
+          if ./herder config validate --config "$RUNNER_TEMP/bad-provider.yaml"; then echo 'unknown provider accepted' >&2; exit 1; fi
+
+      - name: Kill and restart durability
+        run: |
+          set -euo pipefail
+          ID=$(./herder task create --config "$RUNNER_TEMP/config.yaml" --repo tmih06/meltiply --source-ref tmih06/meltiply#1)
+          ./herder task transition --config "$RUNNER_TEMP/config.yaml" "$ID" ELIGIBLE
+          ./herder task event --config "$RUNNER_TEMP/config.yaml" --payload '{"pane":"w3:p2"}' "$ID" agent.working
+          if ./herder task transition --config "$RUNNER_TEMP/config.yaml" "$ID" RUNNING; then echo 'illegal jump accepted' >&2; exit 1; fi
+          kill -9 "$(cat daemon.pid)"
+          sleep 1
+          (./herder daemon --config "$RUNNER_TEMP/config.yaml" > daemon2.log 2>&1 & echo $! > daemon.pid)
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:18087/ >/dev/null && break; sleep 1; done
+          ./herder task inspect --config "$RUNNER_TEMP/config.yaml" "$ID" | grep '^status: ELIGIBLE$'
+          test "$(./herder task inspect --config "$RUNNER_TEMP/config.yaml" "$ID" | grep -c '^- ')" = '3'
+          kill "$(cat daemon.pid)" || true
+
+      - name: Doctor
+        run: ./herder doctor --config "$RUNNER_TEMP/config.yaml"
+
+      - name: Upload daemon logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: daemon-logs
+          path: daemon*.log
+          retention-days: 7
+          if-no-files-found: warn
