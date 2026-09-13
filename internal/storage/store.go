@@ -104,7 +104,6 @@ func Open(path string) (*Store, error) {
 	// leaves the UNIQUE constraints as the cross-process safety net.
 	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA synchronous=NORMAL",
@@ -114,11 +113,52 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("storage: %s: %w", pragma, err)
 		}
 	}
+	// journal_mode bypasses busy_timeout and fails instantly with
+	// SQLITE_BUSY under a sibling's transient lock, so it gets its own
+	// retry: the CLI shares one SQLite file with the daemon by design
+	// (e.g. doctor racing a dying daemon), and a momentarily locked
+	// file must be waited out, not fatal.
+	if err := setWALMode(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("storage: migrate schema: %w", err)
 	}
 	return &Store{db: db, path: expanded}, nil
+}
+
+// walRetryBudget bounds how long setWALMode waits out a sibling's lock.
+const walRetryBudget = 5 * time.Second
+
+// walRetryInterval spaces journal_mode attempts while locked.
+const walRetryInterval = 50 * time.Millisecond
+
+// setWALMode switches the database to WAL durability, retrying through a
+// sibling process's transient lock. Purpose: PRAGMA journal_mode ignores
+// busy_timeout, so without a retry any CLI racing the daemon's shutdown
+// or checkpoint fails instantly with SQLITE_BUSY. The pragma is
+// idempotent, making retries safe. Returns a wrapped error past budget.
+func setWALMode(db *sql.DB) error {
+	deadline := time.Now().Add(walRetryBudget)
+	for {
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err == nil {
+			return nil
+		} else if !isBusy(err) || time.Now().After(deadline) {
+			return fmt.Errorf("storage: PRAGMA journal_mode=WAL: %w", err)
+		}
+		time.Sleep(walRetryInterval)
+	}
+}
+
+// isBusy reports transient SQLite lock errors worth waiting out.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
 // Path returns the database file in use.
