@@ -17,6 +17,7 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/health"
@@ -40,7 +41,7 @@ func New(cfg *config.Config, store *storage.Store, cfgPath string) *Server {
 	s.mux.HandleFunc("GET /v1/tasks", s.handleListTasks)
 	s.mux.HandleFunc("GET /v1/tasks/{id}", s.handleInspectTask)
 	s.mux.HandleFunc("GET /v1/health", s.handleHealth)
-	s.http = &http.Server{Addr: cfg.Server.Listen, Handler: s.mux}
+	s.http = &http.Server{Addr: cfg.Server.Listen, Handler: s.mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
 

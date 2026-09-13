@@ -62,12 +62,16 @@ func Build(cfg *config.Config, cfgPath string, reason error, store *storage.Stor
 // Inputs: the loaded config (nil on load failure), its path, load error.
 func CheckController(cfg *config.Config, cfgPath string, reason error) Check {
 	if reason != nil || cfg == nil {
-		return Check{Name: "controller", State: "fail",
-			Detail: fmt.Sprintf("config %s invalid: %v", cfgPath, reason)}
+		return Check{
+			Name: "controller", State: "fail",
+			Detail: fmt.Sprintf("config %s invalid: %v", cfgPath, reason),
+		}
 	}
-	return Check{Name: "controller", State: "ok",
+	return Check{
+		Name: "controller", State: "ok",
 		Detail: fmt.Sprintf("config %s valid (%d repositories, %d agents)",
-			cfgPath, len(cfg.Repositories), len(cfg.Agents))}
+			cfgPath, len(cfg.Repositories), len(cfg.Agents)),
+	}
 }
 
 // CheckStorage verifies the SQLite state file answers.
@@ -82,8 +86,10 @@ func CheckStorage(store *storage.Store) Check {
 	if err != nil {
 		return Check{Name: "storage", State: "fail", Detail: err.Error()}
 	}
-	return Check{Name: "storage", State: "ok",
-		Detail: fmt.Sprintf("sqlite %s reachable (%d tasks)", store.Path(), len(tasks))}
+	return Check{
+		Name: "storage", State: "ok",
+		Detail: fmt.Sprintf("sqlite %s reachable (%d tasks)", store.Path(), len(tasks)),
+	}
 }
 
 // probeResult is the outcome of running one external binary.
@@ -116,16 +122,22 @@ func probeBinary(name string, argv ...string) probeResult {
 func CheckHerdr() Check {
 	probe := probeBinary("herdr", "status")
 	if probe.err != nil && probe.path == "" {
-		return Check{Name: "herdr", State: "unreachable",
-			Detail: "herdr binary not in PATH (install Herdr to supervise agents)"}
+		return Check{
+			Name: "herdr", State: "unreachable",
+			Detail: "herdr binary not in PATH (install Herdr to supervise agents)",
+		}
 	}
 	if probe.err != nil {
-		return Check{Name: "herdr", State: "unreachable",
+		return Check{
+			Name: "herdr", State: "unreachable",
 			Detail: fmt.Sprintf("herdr found at %s but not answering (%s); start it with `herdr`",
-				probe.path, orMsg(probe.output, probe.err.Error()))}
+				probe.path, orMsg(probe.output, probe.err.Error())),
+		}
 	}
-	return Check{Name: "herdr", State: "reachable",
-		Detail: fmt.Sprintf("herdr at %s: %s", probe.path, orMsg(probe.output, "server answering"))}
+	return Check{
+		Name: "herdr", State: "reachable",
+		Detail: fmt.Sprintf("herdr at %s: %s", probe.path, orMsg(probe.output, "server answering")),
+	}
 }
 
 // CheckDocker probes the Docker sandbox provider via `docker info`.
@@ -133,15 +145,21 @@ func CheckHerdr() Check {
 func CheckDocker() Check {
 	probe := probeBinary("docker", "info", "--format", "{{.ServerVersion}}")
 	if probe.err != nil && probe.path == "" {
-		return Check{Name: "docker", State: "unreachable",
-			Detail: "docker binary not in PATH (install Docker to run sandboxes)"}
+		return Check{
+			Name: "docker", State: "unreachable",
+			Detail: "docker binary not in PATH (install Docker to run sandboxes)",
+		}
 	}
 	if probe.err != nil {
-		return Check{Name: "docker", State: "unreachable",
-			Detail: "docker found but daemon not answering (is dockerd running?)"}
+		return Check{
+			Name: "docker", State: "unreachable",
+			Detail: "docker found but daemon not answering (is dockerd running?)",
+		}
 	}
-	return Check{Name: "docker", State: "reachable",
-		Detail: fmt.Sprintf("docker at %s: server %s", probe.path, orMsg(probe.output, "daemon answering"))}
+	return Check{
+		Name: "docker", State: "reachable",
+		Detail: fmt.Sprintf("docker at %s: server %s", probe.path, orMsg(probe.output, "daemon answering")),
+	}
 }
 
 // orMsg returns s unless blank, for probe detail fallbacks.

@@ -24,7 +24,7 @@ func testServer(t *testing.T) (*api.Server, *storage.Store) {
 	if err != nil {
 		t.Fatalf("Open = %v", err)
 	}
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 	return api.New(cfg, store, "../../examples/herder.yaml"), store
 }
 

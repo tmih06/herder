@@ -12,6 +12,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -167,7 +168,7 @@ func (c *Config) validate() []error {
 			c.Server.Listen, DefaultListen))
 	}
 	if strings.TrimSpace(c.Database.Path) == "" {
-		errs = append(errs, fmt.Errorf("database.path is required (example \"~/.local/state/herder/herder.db\")"))
+		errs = append(errs, errors.New("database.path is required (example \"~/.local/state/herder/herder.db\")"))
 	}
 	if !contains(supportedHerdrModes, c.Herdr.Mode) {
 		errs = append(errs, fmt.Errorf("herdr.mode %q unknown: want one of %s",
@@ -177,13 +178,13 @@ func (c *Config) validate() []error {
 		errs = append(errs, fmt.Errorf("scheduler.max_workers must be >= 1, got %d", c.Scheduler.MaxWorkers))
 	}
 	if len(c.Repositories) == 0 {
-		errs = append(errs, fmt.Errorf("repositories must define at least one repository (example \"owner/repo\")"))
+		errs = append(errs, errors.New("repositories must define at least one repository (example \"owner/repo\")"))
 	}
 	for name, repo := range c.Repositories {
 		errs = append(errs, validateRepository(name, repo, c.Agents)...)
 	}
 	if len(c.Agents) == 0 {
-		errs = append(errs, fmt.Errorf("agents must define at least one agent profile"))
+		errs = append(errs, errors.New("agents must define at least one agent profile"))
 	}
 	for name, agent := range c.Agents {
 		if !contains(supportedAgentKinds, agent.Kind) {
@@ -216,7 +217,7 @@ func validateRepository(name string, repo RepositoryConfig, agents map[string]Ag
 		}
 	}
 	if repo.Agent.Default == "" {
-		errs = append(errs, fmt.Errorf("%s.agent.default must name an entry in agents:", prefix))
+		errs = append(errs, fmt.Errorf("%s.agent.default must name an entry in agents", prefix))
 	} else if _, ok := agents[repo.Agent.Default]; !ok {
 		errs = append(errs, fmt.Errorf("%s.agent.default %q unknown: defined agent profiles are [%s]",
 			prefix, repo.Agent.Default, strings.Join(sortedKeys(agents), ", ")))

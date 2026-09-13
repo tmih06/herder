@@ -77,7 +77,7 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	expanded := expandPath(path)
 	if dir := filepath.Dir(expanded); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, fmt.Errorf("storage: create state dir: %w", err)
 		}
 	}
@@ -92,12 +92,12 @@ func Open(path string) (*Store, error) {
 		"PRAGMA synchronous=NORMAL",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("storage: %s: %w", pragma, err)
 		}
 	}
 	if _, err := db.Exec(schema); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("storage: migrate schema: %w", err)
 	}
 	return &Store{db: db, path: expanded}, nil
@@ -137,7 +137,7 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 	if err != nil {
 		return tasks.Task{}, fmt.Errorf("storage: begin: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	const insertTask = `INSERT INTO tasks
 		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -196,7 +196,7 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	if err != nil {
 		return tasks.Event{}, fmt.Errorf("storage: begin: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	task, err := getTaskTx(tx, id)
 	if err != nil {
 		return tasks.Event{}, err
@@ -233,7 +233,7 @@ func (s *Store) AppendEvent(taskID, eventType, actorType, actorID, payload strin
 	if err != nil {
 		return tasks.Event{}, fmt.Errorf("storage: begin: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := getTaskTx(tx, taskID); err != nil {
 		return tasks.Event{}, err
 	}

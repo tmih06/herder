@@ -1,5 +1,10 @@
 # Herder
 
+[![Tests](https://github.com/tmih06/herder/actions/workflows/test.yml/badge.svg)](https://github.com/tmih06/herder/actions/workflows/test.yml)
+[![Lint](https://github.com/tmih06/herder/actions/workflows/lint.yml/badge.svg)](https://github.com/tmih06/herder/actions/workflows/lint.yml)
+[![Security](https://github.com/tmih06/herder/actions/workflows/security.yml/badge.svg)](https://github.com/tmih06/herder/actions/workflows/security.yml)
+[![Smoke](https://github.com/tmih06/herder/actions/workflows/smoke.yml/badge.svg)](https://github.com/tmih06/herder/actions/workflows/smoke.yml)
+
 Open-source control plane for autonomous coding-agent fleets, powered by Herdr.
 See [SPEC.md](SPEC.md) for the full architecture.
 
