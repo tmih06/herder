@@ -50,10 +50,14 @@ func TestTerminalStatesHaveNoOutgoing(t *testing.T) {
 // Human-intervention loop: RUNNING can block, wait, pause, then resume.
 func TestInterventionLoop(t *testing.T) {
 	pairs := [][2]State{
-		{Running, Blocked}, {Blocked, Running},
-		{Running, WaitingForHuman}, {WaitingForHuman, Running},
-		{Running, Paused}, {Paused, Running},
-		{Failed, Retrying}, {Retrying, Queued},
+		{Running, Blocked},
+		{Blocked, Running},
+		{Running, WaitingForHuman},
+		{WaitingForHuman, Running},
+		{Running, Paused},
+		{Paused, Running},
+		{Failed, Retrying},
+		{Retrying, Queued},
 	}
 	for _, p := range pairs {
 		if err := ValidateTransition(p[0], p[1]); err != nil {

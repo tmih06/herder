@@ -79,16 +79,13 @@ func scanGlobalFlags(argv []string) (string, []string) {
 	var configPath string
 	rest := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
-		a := argv[i]
-		if v, ok := strings.CutPrefix(a, "--config="); ok {
-			configPath = v
-		} else if a == "--config" && i+1 < len(argv) {
+		switch a := argv[i]; {
+		case strings.HasPrefix(a, "--config="):
+			configPath = strings.TrimPrefix(a, "--config=")
+		case (a == "--config" || a == "-c") && i+1 < len(argv):
 			i++
 			configPath = argv[i]
-		} else if a == "-c" && i+1 < len(argv) {
-			i++
-			configPath = argv[i]
-		} else {
+		default:
 			rest = append(rest, a)
 		}
 	}
@@ -147,7 +144,7 @@ func cmdInit(path string, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: %s exists (use --force to overwrite)\n", path)
 		return 1
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		fmt.Fprintf(ew, "herder: create config dir: %v\n", err)
 		return 1
 	}
@@ -228,8 +225,14 @@ func cmdStatus(path string, w, ew io.Writer) int {
 	if cfg == nil {
 		return 2
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://" + cfg.Server.Listen + "/v1/tasks")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+cfg.Server.Listen+"/v1/tasks", nil)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: build status request: %v\n", err)
+		return 1
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(ew, "herder: cannot reach daemon at http://%s (%v)\n", cfg.Server.Listen, err)
 		fmt.Fprintf(ew, "herder: is `herder daemon --config %s` running?\n", path)
@@ -455,7 +458,7 @@ usage: herder [--config PATH] <command> [args]
   config validate         fail fast on a bad config with a field-level message
   status                  show the daemon's task list
   doctor | health         report controller, storage, Herdr, Docker distinctly
-  task list               list tasks oldest-first
+  task list               show tasks oldest-first
   task inspect <id>       show one task plus its event history
   task create --repo R --source-ref REF
                           open a task for a configured repository

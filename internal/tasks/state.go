@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -196,7 +197,7 @@ func CreatedEvent(task Task, actorType, actorID string) Event {
 func hexID(n int) string {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:n]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+		return strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	}
 	return hex.EncodeToString(buf[:n])
 }
