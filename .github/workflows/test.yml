@@ -12,12 +12,20 @@ jobs:
   test:
     name: Test (Go ${{ matrix.go }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
     strategy:
       fail-fast: false
+      # Floor toolchain runs on ubuntu only: go1.22-linked test binaries
+      # abort under dyld on macos-latest (missing LC_UUID load command),
+      # a known old-linker/Xcode-16 incompatibility fixed in current Go.
+      # Ubuntu still proves the 1.22 floor; macOS proves current Go.
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        go: ["1.22", stable]
+        include:
+          - os: ubuntu-latest
+            go: "1.22"
+          - os: ubuntu-latest
+            go: stable
+          - os: macos-latest
+            go: stable
 
     steps:
       - uses: actions/checkout@v7
