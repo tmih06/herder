@@ -89,7 +89,10 @@ var allowed = map[State][]State{
 	TimedOut:        {Retrying, Cancelled},
 }
 
-// Task is the in-memory form of one row in tasks.
+// Task is the in-memory form of one row in tasks. AgentSessionID names the
+// live Herdr agent session (empty until the agent launches) and SandboxID
+// names the worker container; together they are the durable
+// task <-> sandbox <-> session link from SPEC section 18.
 type Task struct {
 	ID             string
 	SourceProvider string
@@ -98,6 +101,8 @@ type Task struct {
 	Repository     string
 	AgentProfile   string
 	BranchName     string
+	AgentSessionID string
+	SandboxID      string
 	Attempt        int
 	CreatedAt      time.Time
 	UpdatedAt      time.Time

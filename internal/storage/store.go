@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 	repository TEXT NOT NULL,
 	agent_profile TEXT NOT NULL,
 	branch_name TEXT NOT NULL DEFAULT '',
+	agent_session_id TEXT NOT NULL DEFAULT '',
+	sandbox_id TEXT NOT NULL DEFAULT '',
 	attempt INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -126,7 +128,25 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("storage: migrate schema: %w", err)
 	}
+	if err := migrateBindings(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db, path: expanded}, nil
+}
+
+// migrateBindings adds the task-sandbox-session link columns to databases
+// written before issue #4. Fresh databases already carry the columns via
+// schema; legacy files get one ALTER each, and the duplicate-column error
+// on a partially migrated file is the success signal, not a failure.
+func migrateBindings(db *sql.DB) error {
+	for _, column := range []string{"agent_session_id", "sandbox_id"} {
+		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''")
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("storage: migrate bindings: %w", err)
+		}
+	}
+	return nil
 }
 
 // walRetryBudget bounds how long setWALMode waits out a sibling's lock.
@@ -197,8 +217,8 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	const insertTask = `INSERT INTO tasks
-		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)`
 	if _, err := tx.Exec(insertTask, task.ID, task.SourceProvider, task.SourceRef,
 		string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
 		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt)); err != nil {
@@ -274,6 +294,36 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 		return tasks.Event{}, fmt.Errorf("storage: commit: %w", err)
 	}
 	return event, nil
+}
+
+// SetBinding records the durable task <-> sandbox <-> session link (SPEC
+// section 18) without touching task status: sandbox provision stores the
+// container id, agent start stores the Herdr session name. Empty values
+// leave the stored column unchanged so callers update only what they know.
+// Unknown ids fail with ErrNotFound; updated_at moves so crash recovery
+// can tell a fresh link from a stale one.
+func (s *Store) SetBinding(id, sandboxID, sessionID string) error {
+	task, err := s.GetTask(id)
+	if err != nil {
+		return err
+	}
+	if sandboxID != "" {
+		task.SandboxID = sandboxID
+	}
+	if sessionID != "" {
+		task.AgentSessionID = sessionID
+	}
+	task.UpdatedAt = time.Now().UTC()
+	res, err := s.db.Exec(`UPDATE tasks SET sandbox_id = ?, agent_session_id = ?,
+		updated_at = ? WHERE id = ?`,
+		task.SandboxID, task.AgentSessionID, formatTime(task.UpdatedAt), id)
+	if err != nil {
+		return fmt.Errorf("storage: set binding: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // AppendEvent records a custom event (agent output, validation results,
@@ -460,8 +510,8 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 	task := tasks.New(req.SourceProvider, req.SourceRef, req.Repository, req.AgentProfile)
 	task.BranchName = req.BranchName
 	const insertTask = `INSERT INTO tasks
-		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)
 		ON CONFLICT(source_provider, source_ref) DO NOTHING`
 	res, err := tx.Exec(insertTask, task.ID, task.SourceProvider, task.SourceRef,
 		string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
@@ -780,7 +830,7 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 
 // taskColumns lists the tasks columns in scanTask order.
 const taskColumns = `SELECT id, source_provider, source_ref, status, repository,
-	agent_profile, branch_name, attempt, created_at, updated_at FROM tasks`
+	agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -794,6 +844,7 @@ func scanTask(row rowScanner) (tasks.Task, error) {
 	var status, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
 		&status, &task.Repository, &task.AgentProfile, &task.BranchName,
+		&task.AgentSessionID, &task.SandboxID,
 		&task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
 	}

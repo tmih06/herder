@@ -314,6 +314,10 @@ func cmdTask(path string, args []string, w, ew io.Writer) int {
 		return taskInspect(store, rest, w, ew)
 	case "create":
 		return taskCreate(cfg, store, rest, w, ew)
+	case "start":
+		return taskStart(cfg, store, rest, w, ew)
+	case "attach":
+		return taskAttach(store, rest, w, ew)
 	case "transition":
 		return taskTransition(store, rest, w, ew)
 	case "event":
@@ -353,6 +357,8 @@ func taskInspect(store *storage.Store, args []string, w, ew io.Writer) int {
 		task.ID, task.Status, task.SourceProvider, task.SourceRef,
 		task.Repository, task.AgentProfile, task.BranchName, task.Attempt,
 		task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339))
+	fmt.Fprintf(w, "sandbox: %s\nsession: %s\n",
+		task.SandboxID, task.AgentSessionID)
 	events, err := store.ListEvents(task.ID)
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -574,6 +580,9 @@ usage: herder [--config PATH] <command> [args]
                           open a task for a configured repository
   task transition [--actor-type T] [--actor-id I] <id> <STATE>
                           move a task, appending a structured event
+  task start [--agent P] <id>
+                          launch the agent through Herdr into its sandbox
+  task attach <id>       drop into the real running agent (detach keeps it running)
   sandbox provision <task-id>
                           create or reuse the task's isolated container
   sandbox exec <id> -- <command...>
