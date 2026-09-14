@@ -34,7 +34,9 @@ case "$1 $2" in
 *) echo "unexpected herdr: $@" >&2; exit 1 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(bin, "herdr"), []byte(herdr), 0o755); err != nil {
+	//nolint:gosec // G306: temp-dir test fake needs the owner-exec bit to run;
+	// file and parent dir are owner-only, never a real install path.
+	if err := os.WriteFile(filepath.Join(bin, "herdr"), []byte(herdr), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var docker string
@@ -52,7 +54,9 @@ echo "Error: No such object: $2" >&2
 exit 1
 `
 	}
-	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o755); err != nil {
+	//nolint:gosec // G306: temp-dir test fake needs the owner-exec bit to run;
+	// file and parent dir are owner-only, never a real install path.
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(docker), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return state
