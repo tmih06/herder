@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/storage"
 )
 
 // runCmd runs the CLI with argv and returns exit code plus outputs.
@@ -30,6 +31,26 @@ func writeTestConfig(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// readTaskGoal opens the test store and returns the task's goal column:
+// task inspect does not print it, so flag coverage reads the row.
+func readTaskGoal(t *testing.T, cfgPath, id string) string {
+	t.Helper()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task.Goal
 }
 
 // TestUnknownCommand Unknown verbs exit 2 with usage.
@@ -120,6 +141,21 @@ func TestTaskLifecycleThroughCLI(t *testing.T) {
 	}
 }
 
+// TestTaskCreateGoalThroughCLI lands --goal on the created task so the
+// agent prompt can seed it.
+func TestTaskCreateGoalThroughCLI(t *testing.T) {
+	path := writeTestConfig(t)
+	code, id, errOut := runCmd(t, "--config", path, "task", "create",
+		"--repo", "acme/web", "--source-ref", "acme/web#7",
+		"--goal", "Ship the goal flag")
+	if code != 0 {
+		t.Fatalf("create exit = %d (%s)", code, errOut)
+	}
+	if goal := readTaskGoal(t, path, strings.TrimSpace(id)); goal != "Ship the goal flag" {
+		t.Errorf("goal = %q, want the --goal text", goal)
+	}
+}
+
 // TestTaskCreateUnknownRepo create against an unconfigured repo fails naming the repo.
 func TestTaskCreateUnknownRepo(t *testing.T) {
 	path := writeTestConfig(t)
@@ -153,7 +189,8 @@ func TestIngestAcceptsThroughCLI(t *testing.T) {
 	cfg := writeTestConfig(t)
 	code, out, _ := runCmd(t, "--config", cfg, "ingest",
 		"--delivery", "del-1", "--repo", "acme/web", "--issue", "7",
-		"--title", "Fix refresh race", "--label", "bug", "--label", "agent-ready")
+		"--title", "Fix refresh race", "--body", "The body spells the goal.",
+		"--label", "bug", "--label", "agent-ready")
 	if code != 0 {
 		t.Fatalf("ingest = %d, want 0: %s", code, out)
 	}
@@ -164,6 +201,10 @@ func TestIngestAcceptsThroughCLI(t *testing.T) {
 		t.Errorf("task list must show the claimed task, got:\n%s", out)
 	}
 	taskID := strings.TrimSpace(strings.Split(strings.Split(out, "task: ")[1], "\n")[0])
+	// The issue body seeds the claimed task's agent goal.
+	if goal := readTaskGoal(t, cfg, taskID); !strings.Contains(goal, "The body spells the goal.") {
+		t.Errorf("claimed task goal should carry the issue body, got %q", goal)
+	}
 	if _, out, _ := runCmd(t, "--config", cfg, "task", "inspect", taskID); !strings.Contains(out, "policy.decision") {
 		t.Errorf("task inspect must show the policy outcome, got:\n%s", out)
 	}

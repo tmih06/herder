@@ -274,7 +274,8 @@ type inspectJSON struct {
 	} `json:"Mounts"`
 }
 
-// Inspect reports one live sandbox or ErrNotFound.
+// Inspect reports one sandbox with its current status (running or
+// stopped) or ErrNotFound; callers gate on Sandbox.Status.
 func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("sandbox: inspect needs a sandbox id")

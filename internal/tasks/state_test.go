@@ -69,7 +69,7 @@ func TestInterventionLoop(t *testing.T) {
 // ApplyTransition must move the task and mint a structured, timestamped,
 // attributable event describing exactly that jump.
 func TestApplyTransitionEmitsEvent(t *testing.T) {
-	task := New("github", "acme/web#7", "acme/web", "codex-default")
+	task := New(NewInput{SourceProvider: "github", SourceRef: "acme/web#7", Repository: "acme/web", AgentProfile: "codex-default"})
 	event, err := ApplyTransition(&task, Eligible, "controller", "daemon")
 	if err != nil {
 		t.Fatalf("ApplyTransition = %v", err)
@@ -97,7 +97,7 @@ func TestApplyTransitionEmitsEvent(t *testing.T) {
 
 // A rejected jump must leave the task untouched and mint no event.
 func TestApplyTransitionRejectsIllegalJump(t *testing.T) {
-	task := New("github", "acme/web#7", "acme/web", "codex-default")
+	task := New(NewInput{SourceProvider: "github", SourceRef: "acme/web#7", Repository: "acme/web", AgentProfile: "codex-default"})
 	before := task
 	if _, err := ApplyTransition(&task, Running, "controller", "daemon"); err == nil {
 		t.Fatal("expected illegal jump to fail, got nil")

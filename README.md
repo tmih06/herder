@@ -68,6 +68,24 @@ mount) on a deterministic `herder/<issue>-<slug>` branch under
 `<statedir>/sandboxes/`. Re-provisioning a dirty workspace refuses rather
 than discards; exec output lands in `sandbox.exec` task events.
 
+## Agent workflow
+
+```bash
+./herder task start <task-id>           # launch the agent through Herdr into its sandbox
+./herder task start --agent NAME <id>   # override the task's claimed profile
+./herder task attach <task-id>          # drop into the real running agent (detach keeps it running)
+./herder task inspect <task-id>         # shows the sandbox + Herdr session binding
+```
+
+Start seeds the agent with the issue goal, source metadata, repository
+instructions (`AGENTS.md`, else `CLAUDE.md` from the checkout), allowed
+operations, and completion requirements (validation commands plus delivery
+policy). The host-visible wrapper carries `HERDR_AGENT=<kind>` so Herdr
+attributes the session to the right agent, and the task-sandbox-session
+link is stored durably: relaunching reuses a live session instead of
+orphaning a pane. An unresolvable profile or agent kind fails the task
+with an `agent.start_failed` event rather than hanging.
+
 ## Developing
 
 ```bash

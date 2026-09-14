@@ -177,7 +177,9 @@ func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(w, "herder: sandbox %s running (branch %s)\n", sb.ID, sb.Branch)
-	advanceToRunning(store, &task, ew)
+	if err := advanceToRunning(store, &task); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+	}
 	payload, _ := json.Marshal(map[string]string{
 		"sandbox": sb.ID, "branch": sb.Branch,
 		"workspace": sb.Workspace, "image": sb.Image,
@@ -191,9 +193,10 @@ func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 
 // advanceToRunning walks QUEUED -> PROVISIONING -> RUNNING so the durable
 // state reflects the live container. Any other state is left untouched:
-// re-provisioning an active task is normal, and the sandbox.provisioned
-// event records the run regardless.
-func advanceToRunning(store *storage.Store, task *tasks.Task, ew io.Writer) {
+// re-provisioning an active task is normal. Returns the first rejected
+// transition so callers can stop instead of reporting a started agent
+// for a task the store no longer considers launchable.
+func advanceToRunning(store *storage.Store, task *tasks.Task) error {
 	var path []tasks.State
 	switch task.Status {
 	case tasks.Queued:
@@ -201,15 +204,15 @@ func advanceToRunning(store *storage.Store, task *tasks.Task, ew io.Writer) {
 	case tasks.Provisioning:
 		path = []tasks.State{tasks.Running}
 	default:
-		return
+		return nil
 	}
 	for _, next := range path {
 		if _, err := store.Transition(task.ID, next, "controller", "cli"); err != nil {
-			fmt.Fprintf(ew, "herder: leaving task in %s (%v)\n", task.Status, err)
-			return
+			return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, next, err)
 		}
 		task.Status = next
 	}
+	return nil
 }
 
 // sandboxExec runs a command inside the sandbox, streams output, records

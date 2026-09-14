@@ -37,10 +37,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 	id TEXT PRIMARY KEY,
 	source_provider TEXT NOT NULL,
 	source_ref TEXT NOT NULL,
+	goal TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL,
 	repository TEXT NOT NULL,
 	agent_profile TEXT NOT NULL,
 	branch_name TEXT NOT NULL DEFAULT '',
+	agent_session_id TEXT NOT NULL DEFAULT '',
+	sandbox_id TEXT NOT NULL DEFAULT '',
 	attempt INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -75,6 +78,7 @@ type CreateInput struct {
 	Repository     string
 	AgentProfile   string
 	BranchName     string
+	Goal           string
 	ActorType      string
 	ActorID        string
 }
@@ -126,7 +130,27 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("storage: migrate schema: %w", err)
 	}
+	if err := migrateColumns(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db, path: expanded}, nil
+}
+
+// migrateColumns adds columns introduced after the first databases were
+// written: the task-sandbox-session link columns plus goal, which carries
+// the issue goal text seeded into the agent prompt (issue #4). Fresh
+// databases already carry the columns via schema; legacy files get one
+// ALTER each, and the duplicate-column error on a partially migrated
+// file is the success signal, not a failure.
+func migrateColumns(db *sql.DB) error {
+	for _, column := range []string{"agent_session_id", "sandbox_id", "goal"} {
+		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''")
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("storage: migrate columns: %w", err)
+		}
+	}
+	return nil
 }
 
 // walRetryBudget bounds how long setWALMode waits out a sibling's lock.
@@ -187,7 +211,13 @@ func (s *Store) Ping() error {
 
 // CreateTask inserts a DISCOVERED task and its task.created event atomically.
 func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
-	task := tasks.New(in.SourceProvider, in.SourceRef, in.Repository, in.AgentProfile)
+	task := tasks.New(tasks.NewInput{
+		SourceProvider: in.SourceProvider,
+		SourceRef:      in.SourceRef,
+		Repository:     in.Repository,
+		AgentProfile:   in.AgentProfile,
+		Goal:           in.Goal,
+	})
 	task.BranchName = in.BranchName
 	actorType, actorID := orDefault(in.ActorType, "controller"), orDefault(in.ActorID, "cli")
 	event := tasks.CreatedEvent(task, actorType, actorID)
@@ -196,13 +226,8 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 		return tasks.Task{}, fmt.Errorf("storage: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	const insertTask = `INSERT INTO tasks
-		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	if _, err := tx.Exec(insertTask, task.ID, task.SourceProvider, task.SourceRef,
-		string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
-		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt)); err != nil {
-		return tasks.Task{}, fmt.Errorf("storage: insert task: %w", err)
+	if _, err := insertTaskTx(tx, task, ""); err != nil {
+		return tasks.Task{}, err
 	}
 	if err := insertEvent(tx, event); err != nil {
 		return tasks.Task{}, err
@@ -276,6 +301,56 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	return event, nil
 }
 
+// SetBinding records the durable task <-> sandbox <-> session link (SPEC
+// section 18) without touching task status: sandbox provision stores the
+// container id, agent start stores the Herdr session name. Empty values
+// leave the stored column unchanged so callers update only what they know.
+// Unknown ids fail with ErrNotFound; updated_at moves so crash recovery
+// can tell a fresh link from a stale one.
+func (s *Store) SetBinding(id, sandboxID, sessionID string) error {
+	task, err := s.GetTask(id)
+	if err != nil {
+		return err
+	}
+	if sandboxID != "" {
+		task.SandboxID = sandboxID
+	}
+	if sessionID != "" {
+		task.AgentSessionID = sessionID
+	}
+	task.UpdatedAt = time.Now().UTC()
+	res, err := s.db.Exec(`UPDATE tasks SET sandbox_id = ?, agent_session_id = ?,
+		updated_at = ? WHERE id = ?`,
+		task.SandboxID, task.AgentSessionID, formatTime(task.UpdatedAt), id)
+	if err != nil {
+		return fmt.Errorf("storage: set binding: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearSessionBinding erases a stale agent session link after a failed
+// launch so crash recovery does not resurrect a dead session name.
+// SetBinding cannot express this: its empty-means-unchanged rule exists
+// for partial updates, not clears. Unknown ids fail with ErrNotFound;
+// updated_at moves so recovery can tell a fresh clear from a stale link.
+func (s *Store) ClearSessionBinding(id string) error {
+	if _, err := s.GetTask(id); err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE tasks SET agent_session_id = '', updated_at = ? WHERE id = ?`,
+		formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("storage: clear session binding: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // AppendEvent records a custom event (agent output, validation results,
 // delivery notes) against an existing task.
 func (s *Store) AppendEvent(taskID, eventType, actorType, actorID, payload string) (tasks.Event, error) {
@@ -340,6 +415,8 @@ type ClaimRequest struct {
 	Repository     string
 	AgentProfile   string
 	BranchName     string
+	// Goal carries the issue goal text seeded into the agent prompt.
+	Goal string
 	// MaxActive caps tasks in non-terminal states; the count and the
 	// insert share one transaction so the cap cannot be raced.
 	MaxActive int
@@ -457,17 +534,17 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 		}
 		return ClaimOutcome{Decision: DecisionPolicyDenied, Reason: reason}, nil
 	}
-	task := tasks.New(req.SourceProvider, req.SourceRef, req.Repository, req.AgentProfile)
+	task := tasks.New(tasks.NewInput{
+		SourceProvider: req.SourceProvider,
+		SourceRef:      req.SourceRef,
+		Repository:     req.Repository,
+		AgentProfile:   req.AgentProfile,
+		Goal:           req.Goal,
+	})
 	task.BranchName = req.BranchName
-	const insertTask = `INSERT INTO tasks
-		(id, source_provider, source_ref, status, repository, agent_profile, branch_name, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(source_provider, source_ref) DO NOTHING`
-	res, err := tx.Exec(insertTask, task.ID, task.SourceProvider, task.SourceRef,
-		string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
-		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
+	res, err := insertTaskTx(tx, task, ` ON CONFLICT(source_provider, source_ref) DO NOTHING`)
 	if err != nil {
-		return ClaimOutcome{}, fmt.Errorf("storage: insert task: %w", err)
+		return ClaimOutcome{}, err
 	}
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		survivor, serr := getTaskBySourceTx(tx, req.SourceProvider, req.SourceRef)
@@ -701,6 +778,26 @@ func getTaskBySourceTx(tx *sql.Tx, provider, ref string) (tasks.Task, error) {
 	return task, nil
 }
 
+// insertTaskTx inserts one task row inside the caller's transaction.
+// Purpose: CreateTask and claimOnce share one column list and argument
+// order so a schema change touches one place; conflictSuffix carries
+// claimOnce's ON CONFLICT clause (empty for CreateTask).
+// Inputs: open tx, the task to persist, and a leading-space conflict
+// suffix appended to the INSERT. Returns the Exec result so callers can
+// inspect RowsAffected, plus wrapped errors only.
+func insertTaskTx(tx *sql.Tx, task tasks.Task, conflictSuffix string) (sql.Result, error) {
+	const insert = `INSERT INTO tasks
+		(id, source_provider, source_ref, goal, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)`
+	res, err := tx.Exec(insert+conflictSuffix, task.ID, task.SourceProvider, task.SourceRef,
+		task.Goal, string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
+		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
+	if err != nil {
+		return nil, fmt.Errorf("storage: insert task: %w", err)
+	}
+	return res, nil
+}
+
 // insertDeliveryTx records one delivery row inside the caller's transaction.
 // Purpose: single choke point so claim, duplicate, and denial paths log
 // the same way. Returns wrapped errors only.
@@ -779,8 +876,8 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 }
 
 // taskColumns lists the tasks columns in scanTask order.
-const taskColumns = `SELECT id, source_provider, source_ref, status, repository,
-	agent_profile, branch_name, attempt, created_at, updated_at FROM tasks`
+const taskColumns = `SELECT id, source_provider, source_ref, goal, status, repository,
+	agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -793,7 +890,8 @@ func scanTask(row rowScanner) (tasks.Task, error) {
 	var task tasks.Task
 	var status, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
-		&status, &task.Repository, &task.AgentProfile, &task.BranchName,
+		&task.Goal, &status, &task.Repository, &task.AgentProfile, &task.BranchName,
+		&task.AgentSessionID, &task.SandboxID,
 		&task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
 	}
