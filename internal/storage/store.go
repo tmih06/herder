@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	branch_name TEXT NOT NULL DEFAULT '',
 	agent_session_id TEXT NOT NULL DEFAULT '',
 	sandbox_id TEXT NOT NULL DEFAULT '',
+	agent_state TEXT NOT NULL DEFAULT '',
 	attempt INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -139,12 +140,13 @@ func Open(path string) (*Store, error) {
 
 // migrateColumns adds columns introduced after the first databases were
 // written: the task-sandbox-session link columns plus goal, which carries
-// the issue goal text seeded into the agent prompt (issue #4). Fresh
-// databases already carry the columns via schema; legacy files get one
-// ALTER each, and the duplicate-column error on a partially migrated
+// the issue goal text seeded into the agent prompt (issue #4), and
+// agent_state, the normalized Herdr-reported worker condition (issue #5).
+// Fresh databases already carry the columns via schema; legacy files get
+// one ALTER each, and the duplicate-column error on a partially migrated
 // file is the success signal, not a failure.
 func migrateColumns(db *sql.DB) error {
-	for _, column := range []string{"agent_session_id", "sandbox_id", "goal"} {
+	for _, column := range []string{"agent_session_id", "sandbox_id", "goal", "agent_state"} {
 		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''")
 		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("storage: migrate columns: %w", err)
@@ -351,6 +353,116 @@ func (s *Store) ClearSessionBinding(id string) error {
 	return nil
 }
 
+// RecordAgentState stores the normalized Herdr-reported agent state on the
+// owning task and appends agent.state_changed when it moved (SPEC
+// sections 19, 58). Same-state reports are a no-op so the supervision
+// loop stays quiet between changes; the first observation always mints
+// the event. Unknown ids fail with ErrNotFound.
+func (s *Store) RecordAgentState(id, state, actorType, actorID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	task, err := getTaskTx(tx, id)
+	if err != nil {
+		return false, err
+	}
+	if task.AgentState == state {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec("UPDATE tasks SET agent_state = ?, updated_at = ? WHERE id = ?",
+		state, formatTime(now), id); err != nil {
+		return false, fmt.Errorf("storage: record agent state: %w", err)
+	}
+	if err := insertEvent(tx, tasks.Event{
+		TaskID: id, Type: tasks.EventAgentStateChanged,
+		ActorType: orDefault(actorType, "controller"), ActorID: orDefault(actorID, "supervisor"),
+		Payload:   tasks.EventPayload(map[string]string{"from": task.AgentState, "to": state}),
+		CreatedAt: now,
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("storage: commit: %w", err)
+	}
+	return true, nil
+}
+
+// Retry begins a fresh attempt on one task: RETRYING (when the current
+// state can retry), attempt counter incremented, dead session link and
+// agent state cleared, and a task.retry event — all atomically. QUEUED
+// and RETRYING tasks skip the transition but still count the attempt.
+// Terminal or non-retryable states fail with the state-machine error and
+// change nothing. Returns the updated task for the relaunch flow.
+func (s *Store) Retry(id, actorType, actorID string) (tasks.Task, error) {
+	return s.restartAttempt(id, "", tasks.EventRetry, actorType, actorID)
+}
+
+// Handoff moves one task to a different agent profile on a fresh attempt:
+// same atomic RETRYING + attempt increment as Retry, plus the profile
+// swap and an agent.handed_off event naming both profiles so the worker
+// change stays traceable (SPEC section 22). An empty or unchanged profile
+// still restarts the attempt; the event records what happened.
+func (s *Store) Handoff(id, newProfile, actorType, actorID string) (tasks.Task, error) {
+	return s.restartAttempt(id, newProfile, tasks.EventHandoff, actorType, actorID)
+}
+
+// restartAttempt runs the shared retry/handoff transaction: legal states
+// move to RETRYING, the attempt counter increments, the dead session link
+// and stale agent state clear (the caller stops the old session first),
+// and the typed event lands in the same commit. Inputs: task id, the
+// replacement profile (empty keeps the current one), the event type, and
+// actor attribution. Returns the updated task.
+func (s *Store) restartAttempt(id, newProfile, eventType, actorType, actorID string) (tasks.Task, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return tasks.Task{}, fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	task, err := getTaskTx(tx, id)
+	if err != nil {
+		return tasks.Task{}, err
+	}
+	now := time.Now().UTC()
+	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
+		event, err := tasks.ApplyTransition(&task, tasks.Retrying, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
+		if err != nil {
+			return tasks.Task{}, err
+		}
+		if err := insertEvent(tx, event); err != nil {
+			return tasks.Task{}, err
+		}
+	}
+	task.Attempt++
+	task.AgentSessionID = ""
+	task.AgentState = ""
+	task.UpdatedAt = now
+	payload := tasks.EventPayload(map[string]any{"attempt": task.Attempt})
+	if newProfile != "" {
+		payload = tasks.EventPayload(map[string]any{"attempt": task.Attempt,
+			"from_profile": task.AgentProfile, "to_profile": newProfile})
+		task.AgentProfile = newProfile
+	}
+	if _, err := tx.Exec(`UPDATE tasks SET status = ?, agent_profile = ?, agent_session_id = '',
+		agent_state = '', attempt = ?, updated_at = ? WHERE id = ?`,
+		string(task.Status), task.AgentProfile, task.Attempt, formatTime(task.UpdatedAt), id); err != nil {
+		return tasks.Task{}, fmt.Errorf("storage: restart attempt: %w", err)
+	}
+	if err := insertEvent(tx, tasks.Event{
+		TaskID: id, Type: eventType,
+		ActorType: orDefault(actorType, "controller"), ActorID: orDefault(actorID, "cli"),
+		Payload: payload, CreatedAt: now,
+	}); err != nil {
+		return tasks.Task{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return tasks.Task{}, fmt.Errorf("storage: commit: %w", err)
+	}
+	return task, nil
+}
+
 // AppendEvent records a custom event (agent output, validation results,
 // delivery notes) against an existing task.
 func (s *Store) AppendEvent(taskID, eventType, actorType, actorID, payload string) (tasks.Event, error) {
@@ -493,7 +605,7 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 				if err := insertEvent(tx, tasks.Event{
 					TaskID: task.ID, Type: tasks.EventWebhookDuplicate,
 					ActorType: actorType, ActorID: actorID,
-					Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+					Payload:   tasks.EventPayload(map[string]string{"delivery_id": req.DeliveryID, "reason": reason}),
 					CreatedAt: time.Now().UTC(),
 				}); err != nil {
 					return ClaimOutcome{}, err
@@ -829,7 +941,7 @@ func recordDuplicateTx(tx *sql.Tx, req ClaimRequest, survivor tasks.Task, reason
 	return insertEvent(tx, tasks.Event{
 		TaskID: survivor.ID, Type: tasks.EventWebhookDuplicate,
 		ActorType: actorType, ActorID: actorID,
-		Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+		Payload:   tasks.EventPayload(map[string]string{"delivery_id": req.DeliveryID, "reason": reason}),
 		CreatedAt: time.Now().UTC(),
 	})
 }
@@ -877,7 +989,7 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 
 // taskColumns lists the tasks columns in scanTask order.
 const taskColumns = `SELECT id, source_provider, source_ref, goal, status, repository,
-	agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at FROM tasks`
+	agent_profile, branch_name, agent_session_id, sandbox_id, agent_state, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -891,7 +1003,7 @@ func scanTask(row rowScanner) (tasks.Task, error) {
 	var status, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
 		&task.Goal, &status, &task.Repository, &task.AgentProfile, &task.BranchName,
-		&task.AgentSessionID, &task.SandboxID,
+		&task.AgentSessionID, &task.SandboxID, &task.AgentState,
 		&task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
 	}
