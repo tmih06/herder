@@ -30,12 +30,14 @@ import (
 const ProviderGitHub = "github"
 
 // IssueEvent is one labeled-issue trigger delivery: the durable identity
-// (delivery id), the issue coordinate, and the labels at delivery time.
+// (delivery id), the issue coordinate, the labels at delivery time, and
+// the title/body text that seeds the claimed task's agent goal.
 type IssueEvent struct {
 	DeliveryID  string
 	Repository  string
 	IssueNumber int
 	Title       string
+	Body        string
 	Labels      []string
 }
 
@@ -99,6 +101,8 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 			strings.Join(sortedLabels(ev.Labels), ", "),
 			strings.Join(repo.Trigger.Labels, ", ")))
 	}
+	// The goal is the issue's title plus body, whichever is present.
+	goal := strings.TrimSpace(ev.Title + "\n\n" + ev.Body)
 	branch := BranchName(ev.IssueNumber, ev.Title)
 	payload, err := json.Marshal(map[string]any{
 		"decision":       storage.DecisionAccepted,
@@ -120,6 +124,7 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 		Repository:     ev.Repository,
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
+		Goal:           goal,
 		MaxActive:      h.cfg.Scheduler.MaxWorkers,
 		PolicyPayload:  string(payload),
 		ActorType:      "controller",
@@ -225,6 +230,7 @@ type githubIssuesPayload struct {
 	Issue struct {
 		Number int    `json:"number"`
 		Title  string `json:"title"`
+		Body   string `json:"body"`
 		Labels []struct {
 			Name string `json:"name"`
 		} `json:"labels"`
@@ -263,6 +269,7 @@ func ParseGitHubIssuesEvent(deliveryID string, body []byte) (ev IssueEvent, igno
 		Repository:  payload.Repository.FullName,
 		IssueNumber: payload.Issue.Number,
 		Title:       payload.Issue.Title,
+		Body:        payload.Issue.Body,
 		Labels:      labels,
 	}
 	if strings.TrimSpace(ev.Repository) == "" || ev.IssueNumber < 1 {

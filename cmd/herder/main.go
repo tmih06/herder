@@ -314,6 +314,10 @@ func cmdTask(path string, args []string, w, ew io.Writer) int {
 		return taskInspect(store, rest, w, ew)
 	case "create":
 		return taskCreate(cfg, store, rest, w, ew)
+	case "start":
+		return taskStart(cfg, store, rest, w, ew)
+	case "attach":
+		return taskAttach(store, rest, w, ew)
 	case "transition":
 		return taskTransition(store, rest, w, ew)
 	case "event":
@@ -353,6 +357,8 @@ func taskInspect(store *storage.Store, args []string, w, ew io.Writer) int {
 		task.ID, task.Status, task.SourceProvider, task.SourceRef,
 		task.Repository, task.AgentProfile, task.BranchName, task.Attempt,
 		task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339))
+	fmt.Fprintf(w, "sandbox: %s\nsession: %s\n",
+		task.SandboxID, task.AgentSessionID)
 	events, err := store.ListEvents(task.ID)
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -376,13 +382,14 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 	provider := fs.String("source-provider", "github", "work provider name")
 	agent := fs.String("agent", "", "agent profile (default: repo default)")
 	branch := fs.String("branch", "", "working branch name")
+	goal := fs.String("goal", "", "issue goal text seeded into the agent prompt")
 	actorType := fs.String("actor-type", "controller", "event actor type")
 	actorID := fs.String("actor-id", "cli", "event actor id")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *repo == "" || *sourceRef == "" {
-		fmt.Fprintf(ew, "herder: usage: herder task create --repo R --source-ref REF [--agent P] [--branch B]\n")
+		fmt.Fprintf(ew, "herder: usage: herder task create --repo R --source-ref REF [--agent P] [--branch B] [--goal G]\n")
 		return 2
 	}
 	repoCfg, ok := cfg.Repositories[*repo]
@@ -402,7 +409,7 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 	}
 	created, err := store.CreateTask(storage.CreateInput{
 		SourceProvider: *provider, SourceRef: *sourceRef,
-		Repository: *repo, AgentProfile: profile, BranchName: *branch,
+		Repository: *repo, AgentProfile: profile, BranchName: *branch, Goal: *goal,
 		ActorType: *actorType, ActorID: *actorID,
 	})
 	if err != nil {
@@ -499,18 +506,19 @@ func ingestDelivery(path string, args []string, w, ew io.Writer) int {
 	repo := fs.String("repo", "", "repository name as in config (required)")
 	issue := fs.Int("issue", 0, "issue number (required)")
 	title := fs.String("title", "", "issue title for branch naming")
+	body := fs.String("body", "", "issue body text for the agent goal")
 	var labels labelList
 	fs.Var(&labels, "label", "issue label (repeat for several)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *delivery == "" || *repo == "" || *issue < 1 {
-		fmt.Fprintf(ew, "herder: usage: herder ingest --delivery ID --repo R --issue N [--title T] [--label L]...\n")
+		fmt.Fprintf(ew, "herder: usage: herder ingest --delivery ID --repo R --issue N [--title T] [--body B] [--label L]...\n")
 		return 2
 	}
 	out, err := ingest.New(cfg, store).Handle(ingest.IssueEvent{
 		DeliveryID: *delivery, Repository: *repo,
-		IssueNumber: *issue, Title: *title, Labels: labels,
+		IssueNumber: *issue, Title: *title, Body: *body, Labels: labels,
 	})
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -574,6 +582,9 @@ usage: herder [--config PATH] <command> [args]
                           open a task for a configured repository
   task transition [--actor-type T] [--actor-id I] <id> <STATE>
                           move a task, appending a structured event
+  task start [--agent P] <id>
+                          launch the agent through Herdr into its sandbox
+  task attach <id>       drop into the real running agent (detach keeps it running)
   sandbox provision <task-id>
                           create or reuse the task's isolated container
   sandbox exec <id> -- <command...>
