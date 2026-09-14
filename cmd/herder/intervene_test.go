@@ -271,3 +271,50 @@ func TestTaskHandoffUnknownProfileKeepsWorker(t *testing.T) {
 		t.Errorf("task should be untouched, got %s/%s", got.Status, got.AgentProfile)
 	}
 }
+
+// TestTaskRetryTerminalKeepsWorker proves a refused retry changes
+// nothing: the live session survives and the task keeps its state.
+func TestTaskRetryTerminalKeepsWorker(t *testing.T) {
+	state := writeFakeBins(t, "ready")
+	cfg := writeTestConfig(t)
+	id, session := startTask(t, cfg)
+	for _, s := range []string{"VALIDATING", "REVIEWING", "DELIVERING", "PR_OPEN", "DONE"} {
+		if code, _, errOut := runCmd(t, "--config", cfg, "task", "transition", id, s); code != 0 {
+			t.Fatalf("transition %s exit = %d (%s)", s, code, errOut)
+		}
+	}
+	code, _, errOut := runCmd(t, "--config", cfg, "task", "retry", id)
+	if code == 0 {
+		t.Fatal("retry on DONE must fail")
+	}
+	if !strings.Contains(errOut, "illegal transition") {
+		t.Errorf("refusal should name the illegal transition, got %q", errOut)
+	}
+	if _, err := os.Stat(filepath.Join(state, "started-"+session)); err != nil {
+		t.Errorf("refused retry killed the live session: %v", err)
+	}
+	if got := readTask(t, cfg, id); got.Status != tasks.Done || got.Attempt != 1 {
+		t.Errorf("refused retry must change nothing, got %s attempt %d", got.Status, got.Attempt)
+	}
+}
+
+// TestTaskPauseMissingContainerRefuses proves pause cannot claim a freeze
+// on a sandbox that does not exist: the task stays RUNNING.
+func TestTaskPauseMissingContainerRefuses(t *testing.T) {
+	state := writeFakeBins(t, "ready")
+	cfg := writeTestConfig(t)
+	id, _ := startTask(t, cfg)
+	if err := os.WriteFile(filepath.Join(state, "docker-status"), []byte("missing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut := runCmd(t, "--config", cfg, "task", "pause", id)
+	if code == 0 {
+		t.Fatal("pause on a missing container must fail")
+	}
+	if !strings.Contains(errOut, "cannot pause") {
+		t.Errorf("refusal should explain the missing sandbox, got %q", errOut)
+	}
+	if got := readTask(t, cfg, id).Status; got != tasks.Running {
+		t.Errorf("task after refused pause = %s, want RUNNING", got)
+	}
+}

@@ -360,13 +360,14 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 // Pause freezes every process in the container (docker pause, cgroup
 // freezer): task progress halts while the Herdr session and the agent
 // stay alive, which is exactly what `herder task pause` needs (SPEC
-// section 22). An unknown sandbox is a logged no-op like Stop.
+// section 22). Unlike Stop, a missing container is ErrNotFound — claiming
+// a freeze on nothing would lie about the task's state.
 func (p *DockerProvider) Pause(ctx context.Context, id string) error {
 	return p.freeze(ctx, id, "pause")
 }
 
 // Unpause thaws a paused container so the agent resumes mid-session.
-// An unknown sandbox is a logged no-op like Stop.
+// A missing container is ErrNotFound for the same reason as Pause.
 func (p *DockerProvider) Unpause(ctx context.Context, id string) error {
 	return p.freeze(ctx, id, "unpause")
 }
@@ -383,8 +384,7 @@ func (p *DockerProvider) freeze(ctx context.Context, id, verb string) error {
 	}
 	if out.ExitCode != 0 {
 		if isNoSuch(out.Stderr) {
-			p.logf("herder: sandbox %s already removed (%s no-op)", id, verb)
-			return nil
+			return fmt.Errorf("sandbox: %s %s: %w", verb, id, ErrNotFound)
 		}
 		return fmt.Errorf("sandbox: %s %s: %s", verb, id, firstLine(out.Stderr))
 	}

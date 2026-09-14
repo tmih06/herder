@@ -14,6 +14,7 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -379,7 +380,7 @@ func (s *Store) RecordAgentState(id, state, actorType, actorID string) (bool, er
 	if err := insertEvent(tx, tasks.Event{
 		TaskID: id, Type: tasks.EventAgentStateChanged,
 		ActorType: orDefault(actorType, "controller"), ActorID: orDefault(actorID, "supervisor"),
-		Payload:   fmt.Sprintf(`{"from":%q,"to":%q}`, task.AgentState, state),
+		Payload:   jsonPayload(map[string]string{"from": task.AgentState, "to": state}),
 		CreatedAt: now,
 	}); err != nil {
 		return false, err
@@ -439,10 +440,10 @@ func (s *Store) restartAttempt(id, newProfile, eventType, actorType, actorID str
 	task.AgentSessionID = ""
 	task.AgentState = ""
 	task.UpdatedAt = now
-	payload := fmt.Sprintf(`{"attempt":%d}`, task.Attempt)
+	payload := jsonPayload(map[string]any{"attempt": task.Attempt})
 	if newProfile != "" {
-		payload = fmt.Sprintf(`{"attempt":%d,"from_profile":%q,"to_profile":%q}`,
-			task.Attempt, task.AgentProfile, newProfile)
+		payload = jsonPayload(map[string]any{"attempt": task.Attempt,
+			"from_profile": task.AgentProfile, "to_profile": newProfile})
 		task.AgentProfile = newProfile
 	}
 	if _, err := tx.Exec(`UPDATE tasks SET status = ?, agent_profile = ?, agent_session_id = '',
@@ -944,6 +945,16 @@ func recordDuplicateTx(tx *sql.Tx, req ClaimRequest, survivor tasks.Task, reason
 		Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
 		CreatedAt: time.Now().UTC(),
 	})
+}
+
+// jsonPayload renders an event payload as real JSON: fmt %q quoting is
+// Go syntax, not JSON, and can store payloads that fail to parse.
+func jsonPayload(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // ListEvents returns a task's full history in append order.

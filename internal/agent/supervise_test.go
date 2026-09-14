@@ -214,6 +214,107 @@ func TestPollDoneNotifiesWithoutBlocking(t *testing.T) {
 	}
 }
 
+// TestPollReblocksAfterAnswer proves the unblock loop is honest: a human
+// answer moves the task to RUNNING, but an agent that still reports
+// blocked re-blocks it on the next poll instead of silently staying up.
+func TestPollReblocksAfterAnswer(t *testing.T) {
+	store, fake, sup := openSupervisedStore(t)
+	task := runningTask(t, store, "acme/web#8")
+	fake.statuses[task.AgentSessionID] = "blocked"
+	sup.PollOnce(context.Background())
+
+	// The human answers: tell-style unblock back to RUNNING while the
+	// agent's report has not changed yet.
+	if _, err := store.Transition(task.ID, tasks.Running, "human", "test"); err != nil {
+		t.Fatal(err)
+	}
+	sup.PollOnce(context.Background())
+
+	got, err := store.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != tasks.Blocked {
+		t.Errorf("still-blocked agent must re-block the task, got %s", got.Status)
+	}
+}
+
+// TestPollDoneOnBlockedUnblocksAndNotifies proves a done report on a
+// BLOCKED task both returns it to RUNNING and raises the notification —
+// the unblock must not swallow the done signal.
+func TestPollDoneOnBlockedUnblocksAndNotifies(t *testing.T) {
+	store, fake, sup := openSupervisedStore(t)
+	task := runningTask(t, store, "acme/web#9")
+	fake.statuses[task.AgentSessionID] = "blocked"
+	sup.PollOnce(context.Background())
+
+	fake.statuses[task.AgentSessionID] = "done"
+	sup.PollOnce(context.Background())
+
+	got, err := store.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != tasks.Running {
+		t.Errorf("done on blocked task = %s, want RUNNING", got.Status)
+	}
+	var notified bool
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "notification show") && strings.Contains(call, "done") {
+			notified = true
+		}
+	}
+	if !notified {
+		t.Errorf("done on a blocked task must still notify, calls: %v", fake.calls)
+	}
+}
+
+// TestPollExitedFiresOnce proves a dead session notifies once, not every
+// tick: the cleared binding removes the task from the poll set.
+func TestPollExitedFiresOnce(t *testing.T) {
+	store, fake, sup := openSupervisedStore(t)
+	task := runningTask(t, store, "acme/web#10")
+	fake.gone[task.AgentSessionID] = true
+
+	sup.PollOnce(context.Background())
+	sup.PollOnce(context.Background())
+
+	var exited, notified int
+	for _, e := range eventTypes(t, store, task.ID) {
+		if e == EventAgentExited {
+			exited++
+		}
+	}
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "notification show") {
+			notified++
+		}
+	}
+	if exited != 1 || notified != 1 {
+		t.Errorf("dead session must fire once: exited=%d notifications=%d", exited, notified)
+	}
+	got, err := store.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentSessionID != "" {
+		t.Errorf("dead binding should clear, got %q", got.AgentSessionID)
+	}
+}
+
+// TestGetHerdrOutageIsNotGone proves a Herdr failure that is not
+// agent_not_found stays a plain error: an unreachable daemon must not
+// masquerade as a dead session.
+func TestGetHerdrOutageIsNotGone(t *testing.T) {
+	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (RunResult, error) {
+		return RunResult{ExitCode: 1, Stderr: "dial unix /run/herdr.sock: connect: no such file"}, nil
+	}}
+	_, err := l.Get(context.Background(), "herder-task_x")
+	if err == nil || errors.Is(err, ErrSessionGone) {
+		t.Fatalf("Herdr outage = %v, want a plain error not ErrSessionGone", err)
+	}
+}
+
 // TestPollExitedSession proves a dead pane records unknown plus
 // agent.exited and notifies, without failing the task outright.
 func TestPollExitedSession(t *testing.T) {
@@ -338,14 +439,15 @@ func TestStopGoneSessionIsNoop(t *testing.T) {
 // anything foreign into unknown.
 func TestNormalizeState(t *testing.T) {
 	for reported, want := range map[string]string{
-		"working": tasks.AgentWorking,
-		"idle":    tasks.AgentIdle,
-		"blocked": tasks.AgentBlocked,
-		"done":    tasks.AgentDone,
-		"unknown": tasks.AgentUnknown,
-		"Working": tasks.AgentWorking,
-		"":        tasks.AgentUnknown,
-		"bored":   tasks.AgentUnknown,
+		"starting": tasks.AgentStarting,
+		"working":  tasks.AgentWorking,
+		"idle":     tasks.AgentIdle,
+		"blocked":  tasks.AgentBlocked,
+		"done":     tasks.AgentDone,
+		"unknown":  tasks.AgentUnknown,
+		"Working":  tasks.AgentWorking,
+		"":         tasks.AgentUnknown,
+		"bored":    tasks.AgentUnknown,
 	} {
 		if got := NormalizeState(reported); got != want {
 			t.Errorf("NormalizeState(%q) = %q, want %q", reported, got, want)

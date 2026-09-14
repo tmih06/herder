@@ -126,6 +126,8 @@ func taskLogs(store *storage.Store, args []string, w, ew io.Writer) int {
 // section 22): the container's processes stop on the cgroup freezer while
 // the Herdr pane and the agent stay alive for resume. Only RUNNING tasks
 // pause — QUEUED has nothing to freeze and BLOCKED is already halted.
+// The container must actually exist: claiming PAUSED on a vanished
+// sandbox would lie about the freeze.
 func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "pause", ew)
 	if code != 0 {
@@ -137,9 +139,13 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
-	if err := provider.Pause(ctx, sandbox.ContainerName(task.ID)); err != nil {
+	provider := newProvider(ew)
+	container := sandbox.ContainerName(task.ID)
+	if _, err := provider.Inspect(ctx, container); err != nil {
+		fmt.Fprintf(ew, "herder: cannot pause %s: %v\n", task.ID, err)
+		return 1
+	}
+	if err := provider.Pause(ctx, container); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -166,8 +172,7 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
+	provider := newProvider(ew)
 	if err := provider.Unpause(ctx, sandbox.ContainerName(task.ID)); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
@@ -182,15 +187,28 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 
 // taskStop ends the agent session and cancels the task (SPEC section 22):
 // the Herdr pane closes, the binding clears so attach cannot resolve a
-// dead session, and the task lands in CANCELLED. The sandbox and its
-// workspace stay for inspection — `sandbox destroy` owns their removal.
+// dead session, and the task lands in CANCELLED. A paused container thaws
+// first so the agent process actually dies with the pane instead of
+// staying frozen inside the sandbox. The sandbox and its workspace stay
+// for inspection — `sandbox destroy` owns their removal.
 func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "stop", ew)
 	if code != 0 {
 		return code
 	}
+	switch task.Status {
+	case tasks.Done, tasks.Cancelled, tasks.Failed:
+		fmt.Fprintf(ew, "herder: task %s already %s\n", task.ID, task.Status)
+		return 1
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
+	if task.Status == tasks.Paused {
+		if err := newProvider(ew).Unpause(ctx, sandbox.ContainerName(task.ID)); err != nil {
+			fmt.Fprintf(ew, "herder: thaw sandbox for stop: %v\n", err)
+			return 1
+		}
+	}
 	launcher := &agent.Launcher{}
 	if task.AgentSessionID != "" {
 		if err := launcher.Stop(ctx, task.AgentSessionID); err != nil {
@@ -227,22 +245,19 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	if code != 0 {
 		return code
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
-	defer cancel()
-	launcher := &agent.Launcher{}
-	if task.AgentSessionID != "" {
-		if err := launcher.Stop(ctx, task.AgentSessionID); err != nil {
-			fmt.Fprintf(ew, "herder: %v\n", err)
+	// Validate before touching the live worker: a refused transition must
+	// leave the running agent alone, not orphan it mid-flight.
+	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
+		if err := tasks.ValidateTransition(task.Status, tasks.Retrying); err != nil {
+			fmt.Fprintf(ew, "herder: retry task %s: %v\n", task.ID, err)
 			return 1
 		}
 	}
-	if task.Status == tasks.Paused {
-		provider := sandbox.NewDockerProvider()
-		provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
-		if err := provider.EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
-			fmt.Fprintf(ew, "herder: thaw sandbox for retry: %v\n", err)
-			return 1
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+	if err := stopWorker(ctx, &task, ew); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
 	}
 	updated, err := store.Retry(task.ID, "human", "cli")
 	if err != nil {
@@ -295,20 +310,17 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	launcher := &agent.Launcher{}
-	if task.AgentSessionID != "" {
-		if err := launcher.Stop(ctx, task.AgentSessionID); err != nil {
-			fmt.Fprintf(ew, "herder: %v\n", err)
+	// Same rule as retry: validate the transition before touching the
+	// live worker so a refused handoff leaves the agent alone.
+	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
+		if err := tasks.ValidateTransition(task.Status, tasks.Retrying); err != nil {
+			fmt.Fprintf(ew, "herder: handoff task %s: %v\n", task.ID, err)
 			return 1
 		}
 	}
-	if task.Status == tasks.Paused {
-		provider := sandbox.NewDockerProvider()
-		provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
-		if err := provider.EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
-			fmt.Fprintf(ew, "herder: thaw sandbox for handoff: %v\n", err)
-			return 1
-		}
+	if err := stopWorker(ctx, &task, ew); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
 	}
 	prior := task.AgentProfile
 	updated, err := store.Handoff(task.ID, *profile, "human", "cli")
@@ -342,4 +354,31 @@ func oneTask(store *storage.Store, args []string, verb string, ew io.Writer) (ta
 		return tasks.Task{}, 1
 	}
 	return task, 0
+}
+
+// newProvider builds the Docker provider with operator-facing logging,
+// shared by every intervention verb that touches a container.
+func newProvider(ew io.Writer) *sandbox.DockerProvider {
+	provider := sandbox.NewDockerProvider()
+	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
+	return provider
+}
+
+// stopWorker ends the live session and thaws a paused container so a
+// retry or handoff never inherits a frozen worker. The session close
+// happens before the thaw: a dead pane cannot act on a thawed sandbox.
+// Inputs: bounded ctx, the task, and the error writer for provider logs.
+// Returns the first failure; a dead session is already the goal.
+func stopWorker(ctx context.Context, task *tasks.Task, ew io.Writer) error {
+	if task.AgentSessionID != "" {
+		if err := (&agent.Launcher{}).Stop(ctx, task.AgentSessionID); err != nil {
+			return err
+		}
+	}
+	if task.Status == tasks.Paused {
+		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
+			return fmt.Errorf("thaw sandbox: %w", err)
+		}
+	}
+	return nil
 }

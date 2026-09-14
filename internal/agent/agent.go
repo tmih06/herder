@@ -312,30 +312,32 @@ func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error
 // normalized status Herdr detected plus the pane identity needed to stop
 // or attach the worker.
 type AgentInfo struct {
-	Status  string
-	PaneID  string
-	Agent   string
-	Session string
+	Status string
+	PaneID string
 }
 
 // Get resolves one live Herdr session: exit 0 from `agent get` parses the
-// agent record; a nonzero exit means the session is gone or never existed
-// (ErrSessionGone), and a transport failure is a wrapped error so callers
-// can tell "dead" from "Herdr unreachable".
+// agent record; an agent_not_found answer means the session is gone or
+// never existed (ErrSessionGone), while any other failure — including a
+// Herdr outage — is a plain error so callers can tell "dead" from
+// "Herdr unreachable".
 func (l *Launcher) Get(ctx context.Context, session string) (AgentInfo, error) {
 	out, err := l.runner()(ctx, "herdr", "agent", "get", session)
 	if err != nil {
 		return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
+		if strings.Contains(out.Stderr, "agent_not_found") ||
+			strings.Contains(out.Stdout, "agent_not_found") {
+			return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
+		}
+		return AgentInfo{}, fmt.Errorf("agent: get %s: %s", session, firstLine(out.Stderr))
 	}
 	var parsed struct {
 		Result struct {
 			Agent struct {
 				Status string `json:"agent_status"`
 				PaneID string `json:"pane_id"`
-				Agent  string `json:"agent"`
 			} `json:"agent"`
 		} `json:"result"`
 	}
@@ -343,10 +345,8 @@ func (l *Launcher) Get(ctx context.Context, session string) (AgentInfo, error) {
 		return AgentInfo{}, fmt.Errorf("agent: get %s: unreadable output", session)
 	}
 	return AgentInfo{
-		Status:  parsed.Result.Agent.Status,
-		PaneID:  parsed.Result.Agent.PaneID,
-		Agent:   parsed.Result.Agent.Agent,
-		Session: session,
+		Status: parsed.Result.Agent.Status,
+		PaneID: parsed.Result.Agent.PaneID,
 	}, nil
 }
 
@@ -440,7 +440,8 @@ func (l *Launcher) Notify(ctx context.Context, title, body string) error {
 // to unknown instead of leaking a foreign token into task state.
 func NormalizeState(reported string) string {
 	switch strings.ToLower(strings.TrimSpace(reported)) {
-	case tasks.AgentWorking, tasks.AgentIdle, tasks.AgentBlocked, tasks.AgentDone:
+	case tasks.AgentStarting, tasks.AgentWorking, tasks.AgentIdle,
+		tasks.AgentBlocked, tasks.AgentDone:
 		return strings.ToLower(strings.TrimSpace(reported))
 	default:
 		return tasks.AgentUnknown

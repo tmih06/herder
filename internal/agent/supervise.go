@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -111,9 +112,12 @@ func (s *Supervisor) PollOnce(ctx context.Context) {
 }
 
 // pollTask folds one session's Herdr report into the task: record the
-// normalized state, then react — blocked raises the notification and
-// moves the task to BLOCKED, recovery from blocked returns it to RUNNING,
-// done and exited notify without touching the task's lifecycle state.
+// normalized state, then react on the (state, task status) pair — blocked
+// on a RUNNING task raises the notification and moves it to BLOCKED,
+// anything else on a BLOCKED task returns it to RUNNING, done and exited
+// notify once without touching the lifecycle state. Reactions key on the
+// task status rather than the state change so a still-blocked agent
+// re-blocks after a human answer instead of silently staying RUNNING.
 func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 	session := task.AgentSessionID
 	info, err := s.Launcher.Get(ctx, session)
@@ -131,15 +135,17 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 		s.logf("herder: supervise: %s: record agent state: %v", task.ID, err)
 		return
 	}
-	if !changed {
+	// Reactions key on the (state, task status) pair, not the state change:
+	// a still-blocked agent re-blocks after a human answer, and a done
+	// report on a BLOCKED task both unblocks and notifies.
+	if state == tasks.AgentBlocked && task.Status == tasks.Running {
+		s.onBlocked(ctx, task, session)
 		return
 	}
-	switch {
-	case state == tasks.AgentBlocked && task.Status == tasks.Running:
-		s.onBlocked(ctx, task, session)
-	case state != tasks.AgentBlocked && task.Status == tasks.Blocked:
+	if state != tasks.AgentBlocked && task.Status == tasks.Blocked {
 		s.onUnblocked(task)
-	case state == tasks.AgentDone:
+	}
+	if state == tasks.AgentDone && changed {
 		s.notify(ctx, "Herder: agent done",
 			fmt.Sprintf("task %s (%s) reports done; validation is the next slice", task.ID, task.SourceRef))
 	}
@@ -160,7 +166,7 @@ func (s *Supervisor) onBlocked(ctx context.Context, task *tasks.Task, session st
 		return
 	}
 	s.appendEvent(task.ID, EventAgentBlocked, session,
-		fmt.Sprintf(`{"session":%q,"reason":%q}`, session, reason))
+		jsonPayload(map[string]string{"session": session, "reason": reason}))
 	s.notify(ctx, "Herder: agent blocked",
 		fmt.Sprintf("task %s (%s): %s", task.ID, task.SourceRef, reason))
 }
@@ -174,21 +180,26 @@ func (s *Supervisor) onUnblocked(task *tasks.Task) {
 }
 
 // onExited records a bound session that no longer answers: agent state
-// unknown plus agent.exited, and a notification so the human can retry or
-// stop the task. The task keeps its lifecycle state — a dead pane is a
-// fact about the worker, not a verdict on the work.
+// unknown plus agent.exited, a notification so the human can retry or
+// stop the task, and the dead binding cleared so attach/tell/logs stop
+// resolving a pane that is gone — which also dedupes the reaction, since
+// the next poll skips tasks with no session. The task keeps its
+// lifecycle state: a dead pane is a fact about the worker, not a verdict
+// on the work.
 func (s *Supervisor) onExited(ctx context.Context, task *tasks.Task) {
 	session := task.AgentSessionID
 	if _, err := s.Store.RecordAgentState(task.ID, tasks.AgentUnknown, "agent", session); err != nil {
 		s.logf("herder: supervise: %s: record agent state: %v", task.ID, err)
 	}
 	s.appendEvent(task.ID, EventAgentExited, session,
-		fmt.Sprintf(`{"session":%q}`, session))
+		jsonPayload(map[string]string{"session": session}))
+	if err := s.Store.ClearSessionBinding(task.ID); err != nil {
+		s.logf("herder: supervise: %s: clear dead binding: %v", task.ID, err)
+	}
 	s.notify(ctx, "Herder: agent session ended",
 		fmt.Sprintf("task %s (%s): session %s no longer exists", task.ID, task.SourceRef, session))
 }
 
-// appendEvent records one supervisor-minted event; failures only log
 // because the state change they annotate already committed.
 func (s *Supervisor) appendEvent(taskID, eventType, session, payload string) {
 	if _, err := s.Store.AppendEvent(taskID, eventType, "agent", session, payload); err != nil {
@@ -228,4 +239,14 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// jsonPayload renders an event payload as real JSON: fmt %q quoting is
+// Go syntax, not JSON, and can store payloads that fail to parse.
+func jsonPayload(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
