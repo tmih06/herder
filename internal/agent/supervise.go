@@ -18,9 +18,9 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tmih06/herder/internal/textutil"
 	"strings"
 	"time"
 
@@ -40,14 +40,6 @@ const blockedTailLines = 10
 // blockedReasonCap bounds the reason text stored in events and shown in
 // notifications.
 const blockedReasonCap = 300
-
-// Event types the supervisor mints on top of the tasks package's set.
-const (
-	// EventAgentBlocked records a blocked worker with its reason.
-	EventAgentBlocked = "agent.blocked"
-	// EventAgentExited records a bound session that stopped answering.
-	EventAgentExited = "agent.exited"
-)
 
 // Supervisor watches bound agent sessions and reflects them onto tasks.
 type Supervisor struct {
@@ -158,15 +150,15 @@ func (s *Supervisor) onBlocked(ctx context.Context, task *tasks.Task, session st
 	reason := "agent reports blocked"
 	if tail, err := s.Launcher.Read(ctx, session, blockedTailLines); err == nil {
 		if line := lastLine(tail); line != "" {
-			reason = truncate(line, blockedReasonCap)
+			reason = textutil.Truncate(line, blockedReasonCap)
 		}
 	}
 	if _, err := s.Store.Transition(task.ID, tasks.Blocked, "agent", session); err != nil {
 		s.logf("herder: supervise: %s: block task: %v", task.ID, err)
 		return
 	}
-	s.appendEvent(task.ID, EventAgentBlocked, session,
-		jsonPayload(map[string]string{"session": session, "reason": reason}))
+	s.appendEvent(task.ID, tasks.EventAgentBlocked, session,
+		tasks.EventPayload(map[string]string{"session": session, "reason": reason}))
 	s.notify(ctx, "Herder: agent blocked",
 		fmt.Sprintf("task %s (%s): %s", task.ID, task.SourceRef, reason))
 }
@@ -191,8 +183,8 @@ func (s *Supervisor) onExited(ctx context.Context, task *tasks.Task) {
 	if _, err := s.Store.RecordAgentState(task.ID, tasks.AgentUnknown, "agent", session); err != nil {
 		s.logf("herder: supervise: %s: record agent state: %v", task.ID, err)
 	}
-	s.appendEvent(task.ID, EventAgentExited, session,
-		jsonPayload(map[string]string{"session": session}))
+	s.appendEvent(task.ID, tasks.EventAgentExited, session,
+		tasks.EventPayload(map[string]string{"session": session}))
 	if err := s.Store.ClearSessionBinding(task.ID); err != nil {
 		s.logf("herder: supervise: %s: clear dead binding: %v", task.ID, err)
 	}
@@ -200,7 +192,8 @@ func (s *Supervisor) onExited(ctx context.Context, task *tasks.Task) {
 		fmt.Sprintf("task %s (%s): session %s no longer exists", task.ID, task.SourceRef, session))
 }
 
-// because the state change they annotate already committed.
+// appendEvent writes one supervision event; failures log instead of
+// propagating because the state change they annotate already committed.
 func (s *Supervisor) appendEvent(taskID, eventType, session, payload string) {
 	if _, err := s.Store.AppendEvent(taskID, eventType, "agent", session, payload); err != nil {
 		s.logf("herder: supervise: %s: record %s: %v", taskID, eventType, err)
@@ -231,22 +224,4 @@ func lastLine(s string) string {
 		}
 	}
 	return ""
-}
-
-// truncate caps s at n bytes with an ellipsis marker.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
-
-// jsonPayload renders an event payload as real JSON: fmt %q quoting is
-// Go syntax, not JSON, and can store payloads that fail to parse.
-func jsonPayload(v any) string {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return string(raw)
 }

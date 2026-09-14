@@ -14,7 +14,6 @@ package storage
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -380,7 +379,7 @@ func (s *Store) RecordAgentState(id, state, actorType, actorID string) (bool, er
 	if err := insertEvent(tx, tasks.Event{
 		TaskID: id, Type: tasks.EventAgentStateChanged,
 		ActorType: orDefault(actorType, "controller"), ActorID: orDefault(actorID, "supervisor"),
-		Payload:   jsonPayload(map[string]string{"from": task.AgentState, "to": state}),
+		Payload:   tasks.EventPayload(map[string]string{"from": task.AgentState, "to": state}),
 		CreatedAt: now,
 	}); err != nil {
 		return false, err
@@ -440,9 +439,9 @@ func (s *Store) restartAttempt(id, newProfile, eventType, actorType, actorID str
 	task.AgentSessionID = ""
 	task.AgentState = ""
 	task.UpdatedAt = now
-	payload := jsonPayload(map[string]any{"attempt": task.Attempt})
+	payload := tasks.EventPayload(map[string]any{"attempt": task.Attempt})
 	if newProfile != "" {
-		payload = jsonPayload(map[string]any{"attempt": task.Attempt,
+		payload = tasks.EventPayload(map[string]any{"attempt": task.Attempt,
 			"from_profile": task.AgentProfile, "to_profile": newProfile})
 		task.AgentProfile = newProfile
 	}
@@ -606,7 +605,7 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 				if err := insertEvent(tx, tasks.Event{
 					TaskID: task.ID, Type: tasks.EventWebhookDuplicate,
 					ActorType: actorType, ActorID: actorID,
-					Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+					Payload:   tasks.EventPayload(map[string]string{"delivery_id": req.DeliveryID, "reason": reason}),
 					CreatedAt: time.Now().UTC(),
 				}); err != nil {
 					return ClaimOutcome{}, err
@@ -942,19 +941,9 @@ func recordDuplicateTx(tx *sql.Tx, req ClaimRequest, survivor tasks.Task, reason
 	return insertEvent(tx, tasks.Event{
 		TaskID: survivor.ID, Type: tasks.EventWebhookDuplicate,
 		ActorType: actorType, ActorID: actorID,
-		Payload:   fmt.Sprintf(`{"delivery_id":%q,"reason":%q}`, req.DeliveryID, reason),
+		Payload:   tasks.EventPayload(map[string]string{"delivery_id": req.DeliveryID, "reason": reason}),
 		CreatedAt: time.Now().UTC(),
 	})
-}
-
-// jsonPayload renders an event payload as real JSON: fmt %q quoting is
-// Go syntax, not JSON, and can store payloads that fail to parse.
-func jsonPayload(v any) string {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return string(raw)
 }
 
 // ListEvents returns a task's full history in append order.

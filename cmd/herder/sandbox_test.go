@@ -7,6 +7,7 @@ import (
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // TestSandboxNeedsSubcommand bare `sandbox` exits 2 with usage.
@@ -135,10 +136,10 @@ func TestSandboxStopInspectUsage(t *testing.T) {
 
 // TestTruncateBoundsEventPayloads and marks the cut.
 func TestTruncateBoundsEventPayloads(t *testing.T) {
-	if got := truncate("abc", 10); got != "abc" {
+	if got := textutil.Truncate("abc", 10); got != "abc" {
 		t.Errorf("short input must pass through, got %q", got)
 	}
-	if got := truncate("0123456789x", 10); got != "0123456789...(truncated)" {
+	if got := textutil.Truncate("0123456789x", 10); got != "0123456789...(truncated)" {
 		t.Errorf("long input must be cut and marked, got %q", got)
 	}
 }

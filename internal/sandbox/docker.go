@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tmih06/herder/internal/textutil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -116,7 +117,7 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	if out, err := p.run(ctx, "git", "-C", workspace, "checkout", "-B", spec.Branch); err != nil {
 		return nil, err
 	} else if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: checkout %s: %s", spec.Branch, firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: checkout %s: %s", spec.Branch, textutil.FirstLine(out.Stderr))
 	}
 	state, err := p.containerState(ctx, name)
 	if err != nil {
@@ -131,7 +132,7 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 		if out, err := p.run(ctx, "docker", "start", name); err != nil {
 			return nil, err
 		} else if out.ExitCode != 0 {
-			return nil, fmt.Errorf("sandbox: start %s: %s", name, firstLine(out.Stderr))
+			return nil, fmt.Errorf("sandbox: start %s: %s", name, textutil.FirstLine(out.Stderr))
 		}
 	}
 	return &Sandbox{
@@ -154,7 +155,7 @@ func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace st
 	if out, err := p.run(ctx, "git", "clone", remote, workspace); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
-		return fmt.Errorf("sandbox: clone %s: %s", remote, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: clone %s: %s", remote, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -166,7 +167,7 @@ func (p *DockerProvider) dirtyFiles(ctx context.Context, workspace string) ([]st
 		return nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: git status: %s", firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: git status: %s", textutil.FirstLine(out.Stderr))
 	}
 	var files []string
 	for _, line := range strings.Split(out.Stdout, "\n") {
@@ -191,7 +192,7 @@ func (p *DockerProvider) containerState(ctx context.Context, name string) (strin
 		if isNoSuch(out.Stderr) {
 			return "", nil
 		}
-		return "", fmt.Errorf("sandbox: inspect %s: %s", name, firstLine(out.Stderr))
+		return "", fmt.Errorf("sandbox: inspect %s: %s", name, textutil.FirstLine(out.Stderr))
 	}
 	return strings.TrimSpace(out.Stdout), nil
 }
@@ -228,7 +229,7 @@ func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace 
 		return err
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sandbox: create %s: %s", name, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: create %s: %s", name, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -288,7 +289,7 @@ func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, erro
 		if isNoSuch(out.Stderr) {
 			return nil, fmt.Errorf("sandbox: inspect %s: %w", id, ErrNotFound)
 		}
-		return nil, fmt.Errorf("sandbox: inspect %s: %s", id, firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: inspect %s: %s", id, textutil.FirstLine(out.Stderr))
 	}
 	var parsed []inspectJSON
 	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil || len(parsed) == 0 {
@@ -316,7 +317,7 @@ func (p *DockerProvider) List(ctx context.Context) ([]Sandbox, error) {
 		return nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: list: %s", firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: list: %s", textutil.FirstLine(out.Stderr))
 	}
 	var sandboxes []Sandbox
 	for _, line := range strings.Split(out.Stdout, "\n") {
@@ -352,7 +353,7 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 			p.logf("herder: sandbox %s already removed (stop no-op)", id)
 			return nil
 		}
-		return fmt.Errorf("sandbox: stop %s: %s", id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: stop %s: %s", id, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -386,7 +387,7 @@ func (p *DockerProvider) freeze(ctx context.Context, id, verb string) error {
 		if isNoSuch(out.Stderr) {
 			return fmt.Errorf("sandbox: %s %s: %w", verb, id, ErrNotFound)
 		}
-		return fmt.Errorf("sandbox: %s %s: %s", verb, id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: %s %s: %s", verb, id, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -421,7 +422,7 @@ func (p *DockerProvider) EnsureRunning(ctx context.Context, id string) error {
 		if isNoSuch(out.Stderr) {
 			return fmt.Errorf("sandbox: ensure-running %s: %w", id, ErrNotFound)
 		}
-		return fmt.Errorf("sandbox: start %s: %s", id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: start %s: %s", id, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -452,7 +453,7 @@ func (p *DockerProvider) Destroy(ctx context.Context, id string) error {
 			p.logf("herder: sandbox %s already removed (destroy no-op)", id)
 			return nil
 		}
-		return fmt.Errorf("sandbox: destroy %s: %s", id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: destroy %s: %s", id, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -462,13 +463,4 @@ func isNoSuch(stderr string) bool {
 	lower := strings.ToLower(stderr)
 	return strings.Contains(lower, "no such container") ||
 		strings.Contains(lower, "no such object")
-}
-
-// firstLine keeps error messages to one actionable line.
-func firstLine(s string) string {
-	line, _, _ := strings.Cut(strings.TrimSpace(s), "\n")
-	if line == "" {
-		return "command failed"
-	}
-	return line
 }

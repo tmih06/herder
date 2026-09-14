@@ -16,6 +16,7 @@ package tasks
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -80,6 +81,14 @@ const (
 	// EventHandoff records a worker change that preserves task history and
 	// sandbox work (SPEC section 22: handoff).
 	EventHandoff = "agent.handed_off"
+	// EventAgentBlocked records a blocked worker with its reason.
+	EventAgentBlocked = "agent.blocked"
+	// EventAgentExited records a bound session that stopped answering.
+	EventAgentExited = "agent.exited"
+	// EventAgentPrompted records a human message sent to the live worker.
+	EventAgentPrompted = "agent.prompted"
+	// EventAgentStopped records a human-driven session close.
+	EventAgentStopped = "agent.stopped"
 )
 
 // State is a task lifecycle state.
@@ -218,7 +227,7 @@ func ApplyTransition(task *Task, to State, actorType, actorID string) (Event, er
 		Type:      EventTransition,
 		ActorType: actorType,
 		ActorID:   actorID,
-		Payload:   fmt.Sprintf(`{"from":%q,"to":%q}`, string(from), string(to)),
+		Payload:   EventPayload(map[string]string{"from": string(from), "to": string(to)}),
 		CreatedAt: now,
 	}, nil
 }
@@ -233,10 +242,21 @@ func CreatedEvent(task Task, actorType, actorID string) Event {
 		Type:      EventCreated,
 		ActorType: actorType,
 		ActorID:   actorID,
-		Payload: fmt.Sprintf(`{"source_ref":%q,"repository":%q,"agent_profile":%q}`,
-			task.SourceRef, task.Repository, task.AgentProfile),
+		Payload: EventPayload(map[string]string{"source_ref": task.SourceRef,
+			"repository": task.Repository, "agent_profile": task.AgentProfile}),
 		CreatedAt: task.CreatedAt,
 	}
+}
+
+// EventPayload renders an event payload as real JSON: fmt %q quoting is
+// Go syntax, not JSON, and can store payloads that fail to parse.
+// Returns "{}" only when the value itself cannot marshal.
+func EventPayload(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // hexID returns n random bytes as hex for task identity.

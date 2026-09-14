@@ -23,6 +23,7 @@ import (
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // interveneTimeout bounds one intervention: Herdr and Docker calls are
@@ -69,8 +70,8 @@ func taskTell(store *storage.Store, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
-	if err := emitEvent(store, task.ID, "agent.prompted", map[string]string{
-		"session": task.AgentSessionID, "message": truncate(message, promptCap),
+	if err := emitEvent(store, task.ID, tasks.EventAgentPrompted, map[string]string{
+		"session": task.AgentSessionID, "message": textutil.Truncate(message, promptCap),
 	}, ew); err != nil {
 		return 1
 	}
@@ -203,19 +204,12 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	if task.Status == tasks.Paused {
-		if err := newProvider(ew).Unpause(ctx, sandbox.ContainerName(task.ID)); err != nil {
-			fmt.Fprintf(ew, "herder: thaw sandbox for stop: %v\n", err)
-			return 1
-		}
+	if err := stopWorker(ctx, &task, ew); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
 	}
-	launcher := &agent.Launcher{}
 	if task.AgentSessionID != "" {
-		if err := launcher.Stop(ctx, task.AgentSessionID); err != nil {
-			fmt.Fprintf(ew, "herder: %v\n", err)
-			return 1
-		}
-		if err := emitEvent(store, task.ID, "agent.stopped", map[string]string{
+		if err := emitEvent(store, task.ID, tasks.EventAgentStopped, map[string]string{
 			"session": task.AgentSessionID,
 		}, ew); err != nil {
 			return 1
@@ -245,13 +239,8 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	if code != 0 {
 		return code
 	}
-	// Validate before touching the live worker: a refused transition must
-	// leave the running agent alone, not orphan it mid-flight.
-	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
-		if err := tasks.ValidateTransition(task.Status, tasks.Retrying); err != nil {
-			fmt.Fprintf(ew, "herder: retry task %s: %v\n", task.ID, err)
-			return 1
-		}
+	if code := guardRestart(&task, "retry", ew); code != 0 {
+		return code
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
@@ -264,12 +253,8 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		fmt.Fprintf(ew, "herder: retry task %s: %v\n", task.ID, err)
 		return 1
 	}
-	if updated.Status == tasks.Retrying {
-		if _, err := store.Transition(updated.ID, tasks.Queued, "controller", "cli"); err != nil {
-			fmt.Fprintf(ew, "herder: requeue task %s: %v\n", updated.ID, err)
-			return 1
-		}
-		updated.Status = tasks.Queued
+	if code := requeue(store, &updated, ew); code != 0 {
+		return code
 	}
 	fmt.Fprintf(w, "herder: task %s retrying (attempt %d)\n", updated.ID, updated.Attempt)
 	return launchTask(ctx, cfg, store, &updated, "", "", w, ew)
@@ -310,13 +295,8 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	// Same rule as retry: validate the transition before touching the
-	// live worker so a refused handoff leaves the agent alone.
-	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
-		if err := tasks.ValidateTransition(task.Status, tasks.Retrying); err != nil {
-			fmt.Fprintf(ew, "herder: handoff task %s: %v\n", task.ID, err)
-			return 1
-		}
+	if code := guardRestart(&task, "handoff", ew); code != 0 {
+		return code
 	}
 	if err := stopWorker(ctx, &task, ew); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -328,12 +308,8 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 		fmt.Fprintf(ew, "herder: handoff task %s: %v\n", task.ID, err)
 		return 1
 	}
-	if updated.Status == tasks.Retrying {
-		if _, err := store.Transition(updated.ID, tasks.Queued, "controller", "cli"); err != nil {
-			fmt.Fprintf(ew, "herder: requeue task %s: %v\n", updated.ID, err)
-			return 1
-		}
-		updated.Status = tasks.Queued
+	if code := requeue(store, &updated, ew); code != 0 {
+		return code
 	}
 	fmt.Fprintf(w, "herder: task %s handed off %s -> %s (attempt %d)\n",
 		updated.ID, prior, *profile, updated.Attempt)
@@ -365,20 +341,53 @@ func newProvider(ew io.Writer) *sandbox.DockerProvider {
 }
 
 // stopWorker ends the live session and thaws a paused container so a
-// retry or handoff never inherits a frozen worker. The session close
-// happens before the thaw: a dead pane cannot act on a thawed sandbox.
+// stop, retry, or handoff never leaves a frozen agent behind. The thaw
+// happens before the pane close: a frozen agent survives `pane close`
+// and would wake on unpause as an orphan running the same task.
 // Inputs: bounded ctx, the task, and the error writer for provider logs.
 // Returns the first failure; a dead session is already the goal.
 func stopWorker(ctx context.Context, task *tasks.Task, ew io.Writer) error {
-	if task.AgentSessionID != "" {
-		if err := (&agent.Launcher{}).Stop(ctx, task.AgentSessionID); err != nil {
-			return err
-		}
-	}
 	if task.Status == tasks.Paused {
 		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
 			return fmt.Errorf("thaw sandbox: %w", err)
 		}
 	}
+	if task.AgentSessionID != "" {
+		if err := (&agent.Launcher{}).Stop(ctx, task.AgentSessionID); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// guardRestart validates the RETRYING transition shared by retry and
+// handoff before either touches the live worker: a refused command must
+// leave the running agent alone, not orphan it mid-flight. QUEUED and
+// RETRYING tasks pass without validating — they have no live worker to
+// protect and the store's Retry/Handoff accepts them as-is.
+// Returns the exit code to propagate (0 means proceed).
+func guardRestart(task *tasks.Task, verb string, ew io.Writer) int {
+	if task.Status == tasks.Queued || task.Status == tasks.Retrying {
+		return 0
+	}
+	if err := tasks.ValidateTransition(task.Status, tasks.Retrying); err != nil {
+		fmt.Fprintf(ew, "herder: %s task %s: %v\n", verb, task.ID, err)
+		return 1
+	}
+	return 0
+}
+
+// requeue lands a RETRYING task back into QUEUED after Retry or Handoff
+// minted the fresh attempt, so the launch flow runs again on the same
+// sandbox and workspace. Returns the exit code to propagate.
+func requeue(store *storage.Store, task *tasks.Task, ew io.Writer) int {
+	if task.Status != tasks.Retrying {
+		return 0
+	}
+	if _, err := store.Transition(task.ID, tasks.Queued, "controller", "cli"); err != nil {
+		fmt.Fprintf(ew, "herder: requeue task %s: %v\n", task.ID, err)
+		return 1
+	}
+	task.Status = tasks.Queued
+	return 0
 }

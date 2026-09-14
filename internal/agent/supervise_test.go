@@ -146,7 +146,7 @@ func TestPollBlockedNotifies(t *testing.T) {
 		t.Errorf("agent state = %q, want blocked", got.AgentState)
 	}
 	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, EventAgentBlocked) {
+	if !hasEvent(types, tasks.EventAgentBlocked) {
 		t.Error("agent.blocked event missing")
 	}
 	var notified bool
@@ -281,7 +281,7 @@ func TestPollExitedFiresOnce(t *testing.T) {
 
 	var exited, notified int
 	for _, e := range eventTypes(t, store, task.ID) {
-		if e == EventAgentExited {
+		if e == tasks.EventAgentExited {
 			exited++
 		}
 	}
@@ -334,7 +334,7 @@ func TestPollExitedSession(t *testing.T) {
 	if got.Status != tasks.Running {
 		t.Errorf("exited session must not move the task, got %s", got.Status)
 	}
-	if !hasEvent(eventTypes(t, store, task.ID), EventAgentExited) {
+	if !hasEvent(eventTypes(t, store, task.ID), tasks.EventAgentExited) {
 		t.Error("agent.exited event missing")
 	}
 }

@@ -127,9 +127,10 @@ type Provider interface {
 	// Stop halts the container; unknown ids are a logged no-op.
 	Stop(ctx context.Context, id string) error
 	// Pause freezes the container's processes without killing them;
-	// unknown ids are a logged no-op.
+	// ErrNotFound when the container is gone — claiming a freeze on
+	// nothing would lie.
 	Pause(ctx context.Context, id string) error
-	// Unpause thaws a paused container; unknown ids are a logged no-op.
+	// Unpause thaws a paused container; ErrNotFound when it is gone.
 	Unpause(ctx context.Context, id string) error
 	// EnsureRunning converges a sandbox toward running (unpause or start)
 	// without touching the workspace; ErrNotFound when it is gone.

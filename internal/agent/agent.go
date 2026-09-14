@@ -31,6 +31,7 @@ import (
 
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // instructionCap bounds repository instructions embedded in the prompt: the
@@ -280,7 +281,7 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		return StartResult{}, fmt.Errorf("agent: start %s: %w", in.Session, err)
 	}
 	if out.ExitCode != 0 {
-		return StartResult{}, fmt.Errorf("agent: start %s: %s", in.Session, firstLine(out.Stderr))
+		return StartResult{}, fmt.Errorf("agent: start %s: %s", in.Session, textutil.FirstLine(out.Stderr))
 	}
 	paneID, workspaceID := parseStartResult(out.Stdout)
 	if err := l.SendPrompt(ctx, in.Session, in.Prompt); err != nil {
@@ -303,7 +304,7 @@ func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error
 		return fmt.Errorf("agent: send prompt to %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("agent: send prompt to %s: %s", session, firstLine(out.Stderr))
+		return fmt.Errorf("agent: send prompt to %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -331,7 +332,7 @@ func (l *Launcher) Get(ctx context.Context, session string) (AgentInfo, error) {
 			strings.Contains(out.Stdout, "agent_not_found") {
 			return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
 		}
-		return AgentInfo{}, fmt.Errorf("agent: get %s: %s", session, firstLine(out.Stderr))
+		return AgentInfo{}, fmt.Errorf("agent: get %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	var parsed struct {
 		Result struct {
@@ -375,7 +376,7 @@ func (l *Launcher) Read(ctx context.Context, session string, lines int) (string,
 		return "", fmt.Errorf("agent: read %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return "", fmt.Errorf("agent: read %s: %s", session, firstLine(out.Stderr))
+		return "", fmt.Errorf("agent: read %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	var parsed struct {
 		Result struct {
@@ -410,7 +411,7 @@ func (l *Launcher) Stop(ctx context.Context, session string) error {
 		return fmt.Errorf("agent: stop %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("agent: stop %s: %s", session, firstLine(out.Stderr))
+		return fmt.Errorf("agent: stop %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -429,7 +430,7 @@ func (l *Launcher) Notify(ctx context.Context, title, body string) error {
 		return fmt.Errorf("agent: notify %q: %w", title, err)
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("agent: notify %q: %s", title, firstLine(out.Stderr))
+		return fmt.Errorf("agent: notify %q: %s", title, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -479,12 +480,4 @@ func (l *Launcher) runner() Runner {
 		return l.Runner
 	}
 	return DefaultRunner
-}
-
-// firstLine keeps launch errors to one actionable line.
-func firstLine(s string) string {
-	if line, _, ok := strings.Cut(s, "\n"); ok {
-		return strings.TrimSpace(line)
-	}
-	return strings.TrimSpace(s)
 }
