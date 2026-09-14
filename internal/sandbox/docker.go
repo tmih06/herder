@@ -357,6 +357,75 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 	return nil
 }
 
+// Pause freezes every process in the container (docker pause, cgroup
+// freezer): task progress halts while the Herdr session and the agent
+// stay alive, which is exactly what `herder task pause` needs (SPEC
+// section 22). An unknown sandbox is a logged no-op like Stop.
+func (p *DockerProvider) Pause(ctx context.Context, id string) error {
+	return p.freeze(ctx, id, "pause")
+}
+
+// Unpause thaws a paused container so the agent resumes mid-session.
+// An unknown sandbox is a logged no-op like Stop.
+func (p *DockerProvider) Unpause(ctx context.Context, id string) error {
+	return p.freeze(ctx, id, "unpause")
+}
+
+// freeze runs docker pause/unpause behind one implementation: both are
+// single-word subcommands with identical error shape.
+func (p *DockerProvider) freeze(ctx context.Context, id, verb string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("sandbox: %s needs a sandbox id", verb)
+	}
+	out, err := p.run(ctx, "docker", verb, id)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		if isNoSuch(out.Stderr) {
+			p.logf("herder: sandbox %s already removed (%s no-op)", id, verb)
+			return nil
+		}
+		return fmt.Errorf("sandbox: %s %s: %s", verb, id, firstLine(out.Stderr))
+	}
+	return nil
+}
+
+// EnsureRunning converges a sandbox toward running without touching the
+// workspace: paused containers unpause, stopped ones start, running ones
+// are a no-op. Unlike Provision it never inspects or resets the checkout,
+// so retry/handoff can revive a worker's container without tripping the
+// dirty-state guard on the previous attempt's uncommitted work.
+// ErrNotFound means the container is gone and the caller must provision.
+func (p *DockerProvider) EnsureRunning(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("sandbox: ensure-running needs a sandbox id")
+	}
+	state, err := p.containerState(ctx, id)
+	if err != nil {
+		return err
+	}
+	switch state {
+	case "running":
+		return nil
+	case "paused":
+		return p.Unpause(ctx, id)
+	case "":
+		return fmt.Errorf("sandbox: ensure-running %s: %w", id, ErrNotFound)
+	}
+	out, err := p.run(ctx, "docker", "start", id)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		if isNoSuch(out.Stderr) {
+			return fmt.Errorf("sandbox: ensure-running %s: %w", id, ErrNotFound)
+		}
+		return fmt.Errorf("sandbox: start %s: %s", id, firstLine(out.Stderr))
+	}
+	return nil
+}
+
 // Destroy removes the container; an unknown or already-removed sandbox
 // is a logged no-op rather than an error cascade.
 func (p *DockerProvider) Destroy(ctx context.Context, id string) error {

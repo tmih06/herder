@@ -126,6 +126,14 @@ type Provider interface {
 	List(ctx context.Context) ([]Sandbox, error)
 	// Stop halts the container; unknown ids are a logged no-op.
 	Stop(ctx context.Context, id string) error
+	// Pause freezes the container's processes without killing them;
+	// unknown ids are a logged no-op.
+	Pause(ctx context.Context, id string) error
+	// Unpause thaws a paused container; unknown ids are a logged no-op.
+	Unpause(ctx context.Context, id string) error
+	// EnsureRunning converges a sandbox toward running (unpause or start)
+	// without touching the workspace; ErrNotFound when it is gone.
+	EnsureRunning(ctx context.Context, id string) error
 	// Destroy removes the container; unknown ids are a logged no-op.
 	Destroy(ctx context.Context, id string) error
 }

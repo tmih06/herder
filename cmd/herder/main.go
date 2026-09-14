@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/api"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/health"
@@ -188,6 +189,13 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	fmt.Fprintf(w, "herder: state %s (%d tasks)\n", store.Path(), len(initial))
 	fmt.Fprintf(w, "herder: listening on http://%s\n", cfg.Server.Listen)
 	srv := api.New(cfg, store, path)
+	supCtx, stopSupervisor := context.WithCancel(context.Background())
+	defer stopSupervisor()
+	supervisor := &agent.Supervisor{
+		Store: store, Launcher: &agent.Launcher{},
+		Logf: func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) },
+	}
+	go supervisor.Run(supCtx)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	sigCh := make(chan os.Signal, 1)
@@ -258,7 +266,8 @@ func cmdStatus(path string, w, ew io.Writer) int {
 	}
 	fmt.Fprintf(w, "%d tasks\n", len(payload.Tasks))
 	for _, t := range payload.Tasks {
-		fmt.Fprintf(w, "- %s %s %s %s %s\n", t.ID, t.Status, t.SourceRef, t.Repository, t.AgentProfile)
+		fmt.Fprintf(w, "- %s %s agent=%s %s %s %s\n",
+			t.ID, t.Status, orDash(t.AgentState), t.SourceRef, t.Repository, t.AgentProfile)
 	}
 	return 0
 }
@@ -291,10 +300,11 @@ func cmdDoctor(path string, w, ew io.Writer) int {
 }
 
 // cmdTask implements `herder task list|inspect|create|transition|event`
-// against the SQLite file directly.
+// plus the supervision verbs (start, attach, tell, logs, pause, resume,
+// stop, retry, handoff) against the SQLite file directly.
 func cmdTask(path string, args []string, w, ew io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintf(ew, "herder: usage: herder task list|inspect|create|transition|event ...\n")
+		fmt.Fprintf(ew, "herder: usage: herder task list|inspect|create|start|attach|tell|logs|pause|resume|stop|retry|handoff|transition|event ...\n")
 		return 2
 	}
 	cfg := loadConfig(path, ew)
@@ -318,6 +328,20 @@ func cmdTask(path string, args []string, w, ew io.Writer) int {
 		return taskStart(cfg, store, rest, w, ew)
 	case "attach":
 		return taskAttach(store, rest, w, ew)
+	case "tell":
+		return taskTell(store, rest, w, ew)
+	case "logs":
+		return taskLogs(store, rest, w, ew)
+	case "pause":
+		return taskPause(store, rest, w, ew)
+	case "resume":
+		return taskResume(store, rest, w, ew)
+	case "stop":
+		return taskStop(store, rest, w, ew)
+	case "retry":
+		return taskRetry(cfg, store, rest, w, ew)
+	case "handoff":
+		return taskHandoff(cfg, store, rest, w, ew)
 	case "transition":
 		return taskTransition(store, rest, w, ew)
 	case "event":
@@ -328,7 +352,8 @@ func cmdTask(path string, args []string, w, ew io.Writer) int {
 	}
 }
 
-// taskList prints every task oldest-first.
+// taskList prints every task oldest-first with its normalized agent
+// state: blocked and idle workers surface here for human attention.
 func taskList(store *storage.Store, w, ew io.Writer) int {
 	found, err := store.ListTasks()
 	if err != nil {
@@ -337,9 +362,18 @@ func taskList(store *storage.Store, w, ew io.Writer) int {
 	}
 	fmt.Fprintf(w, "%d tasks\n", len(found))
 	for _, t := range found {
-		fmt.Fprintf(w, "- %s %s %s %s %s\n", t.ID, t.Status, t.SourceRef, t.Repository, t.AgentProfile)
+		fmt.Fprintf(w, "- %s %s agent=%s %s %s %s\n",
+			t.ID, t.Status, orDash(t.AgentState), t.SourceRef, t.Repository, t.AgentProfile)
 	}
 	return 0
+}
+
+// orDash renders an unset agent state for list output.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // taskInspect prints one task plus its full event history.
@@ -353,9 +387,9 @@ func taskInspect(store *storage.Store, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: task %q not found\n", args[0])
 		return 1
 	}
-	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nbranch: %s\nattempt: %d\ncreated: %s\nupdated: %s\n",
+	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nagent_state: %s\nbranch: %s\nattempt: %d\ncreated: %s\nupdated: %s\n",
 		task.ID, task.Status, task.SourceProvider, task.SourceRef,
-		task.Repository, task.AgentProfile, task.BranchName, task.Attempt,
+		task.Repository, task.AgentProfile, orDash(task.AgentState), task.BranchName, task.Attempt,
 		task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339))
 	fmt.Fprintf(w, "sandbox: %s\nsession: %s\n",
 		task.SandboxID, task.AgentSessionID)
@@ -585,6 +619,15 @@ usage: herder [--config PATH] <command> [args]
   task start [--agent P] <id>
                           launch the agent through Herdr into its sandbox
   task attach <id>       drop into the real running agent (detach keeps it running)
+  task tell <id> <msg...>
+                          send a message to the live agent (unblocks BLOCKED)
+  task logs [--lines N] <id>
+                          print the agent's recent output
+  task pause|resume <id>  freeze the sandbox or thaw it (session stays alive)
+  task stop <id>          end the agent session and cancel the task
+  task retry <id>         fresh attempt on the same sandbox (attempt +1)
+  task handoff --agent P <id>
+                          move the task to a different agent, work preserved
   sandbox provision <task-id>
                           create or reuse the task's isolated container
   sandbox exec <id> -- <command...>
