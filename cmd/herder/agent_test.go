@@ -207,6 +207,36 @@ func TestTaskStartUnknownProfileFailsTask(t *testing.T) {
 	}
 }
 
+// TestTaskStartStaleProfileFailsTask proves a task whose claimed profile no
+// longer exists fails with a clear event instead of hanging: the operator
+// cannot retry into a launch, so FAILED plus agent.start_failed is the
+// honest state.
+func TestTaskStartStaleProfileFailsTask(t *testing.T) {
+	writeFakeBins(t, "ready")
+	path := writeTestConfig(t)
+	id := queueTask(t, path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := strings.ReplaceAll(string(raw), "codex-default", "claude-default")
+	stale = strings.ReplaceAll(stale, "kind: codex", "kind: claude")
+	if err := os.WriteFile(path, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut := runCmd(t, "--config", path, "task", "start", id)
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(errOut, "codex-default") {
+		t.Errorf("stderr should name the stale profile, got %q", errOut)
+	}
+	if code, inspect, _ := runCmd(t, "--config", path, "task", "inspect", id); code != 0 ||
+		!strings.Contains(inspect, "FAILED") || !strings.Contains(inspect, "agent.start_failed") {
+		t.Errorf("stale profile should fail the task with an event, got:\n%s", inspect)
+	}
+}
+
 // TestTaskAttachNeedsSession points at task start when nothing runs.
 func TestTaskAttachNeedsSession(t *testing.T) {
 	path := writeTestConfig(t)

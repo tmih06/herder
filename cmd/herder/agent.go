@@ -76,20 +76,19 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	if !ok {
 		return failTaskStart(store, &task, fmt.Sprintf("repository %q not in config", task.Repository), ew)
 	}
-	profileName := *override
-	if profileName != "" {
-		if _, ok := cfg.Agents[profileName]; !ok {
-			fmt.Fprintf(ew, "herder: agent profile %q unknown\n", profileName)
+	// One policy owns profile selection (agent.ResolveProfile): explicit
+	// override, then the task's claimed profile, then the repo default. An
+	// unknown override is an operator typo and leaves the task alone; an
+	// unresolvable task profile fails the task with a clear event.
+	profileName, prof, ok := agent.ResolveProfile(cfg, task.Repository, task.AgentProfile, *override)
+	if !ok {
+		if *override != "" {
+			fmt.Fprintf(ew, "herder: agent profile %q unknown\n", *override)
 			return 1
 		}
-	} else {
-		profileName, _, ok = agent.ResolveProfile(cfg, task.Repository, task.AgentProfile, "")
-		if !ok {
-			return failTaskStart(store, &task,
-				fmt.Sprintf("agent profile %q unknown and no usable default", task.AgentProfile), ew)
-		}
+		return failTaskStart(store, &task,
+			fmt.Sprintf("agent profile %q unknown and no usable default", task.AgentProfile), ew)
 	}
-	prof := cfg.Agents[profileName]
 	if _, ok := agent.CommandForKind(prof.Kind); !ok {
 		return failTaskStart(store, &task, fmt.Sprintf("unknown agent kind %q", prof.Kind), ew)
 	}
@@ -127,13 +126,11 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		return failTaskStart(store, &task, err.Error(), ew)
 	}
 	advanceToRunning(store, &task, ew)
-	payload, _ := json.Marshal(map[string]string{
+	if err := emitStarted(store, task.ID, map[string]string{
 		"session": session, "kind": prof.Kind, "profile": profileName,
 		"sandbox": container, "pane": res.PaneID, "workspace_id": res.WorkspaceID,
 		"branch": task.BranchName,
-	})
-	if _, err := store.AppendEvent(task.ID, "agent.started", "controller", "cli", string(payload)); err != nil {
-		fmt.Fprintf(ew, "herder: record agent event: %v\n", err)
+	}, ew); err != nil {
 		return 1
 	}
 	fmt.Fprintf(w, "herder: agent %s started for %s in session %s (pane %s)\n",
@@ -149,15 +146,26 @@ func reuseSession(store *storage.Store, task *tasks.Task, container, session, ki
 		return 1
 	}
 	advanceToRunning(store, task, ew)
-	payload, _ := json.Marshal(map[string]any{
+	if err := emitStarted(store, task.ID, map[string]any{
 		"session": session, "kind": kind, "profile": profile,
 		"sandbox": container, "reused": true,
-	})
-	if _, err := store.AppendEvent(task.ID, "agent.started", "controller", "cli", string(payload)); err != nil {
-		fmt.Fprintf(ew, "herder: record agent event: %v\n", err)
+	}, ew); err != nil {
 		return 1
 	}
 	return 0
+}
+
+// emitStarted appends one agent.started event with a JSON payload.
+// Purpose: launch and reuse report the same event type from one place so
+// the payload shape cannot drift between the two paths. Returns the append
+// error after naming it on ew.
+func emitStarted(store *storage.Store, taskID string, payload any, ew io.Writer) error {
+	raw, _ := json.Marshal(payload)
+	if _, err := store.AppendEvent(taskID, "agent.started", "controller", "cli", string(raw)); err != nil {
+		fmt.Fprintf(ew, "herder: record agent event: %v\n", err)
+		return err
+	}
+	return nil
 }
 
 // failTaskStart moves the task to FAILED and records agent.start_failed
