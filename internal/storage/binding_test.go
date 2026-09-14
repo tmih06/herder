@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -18,12 +19,16 @@ func TestSetBindingRoundTrip(t *testing.T) {
 	task, err := store.CreateTask(CreateInput{
 		SourceProvider: "github", SourceRef: "acme/web#7",
 		Repository: "acme/web", AgentProfile: "codex-default",
+		Goal: "Fix the flaky login retry",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if task.AgentSessionID != "" || task.SandboxID != "" {
 		t.Fatalf("new task should carry no binding, got %+v", task)
+	}
+	if task.Goal != "Fix the flaky login retry" {
+		t.Fatalf("new task should carry the issue goal, got %+v", task)
 	}
 
 	if err := store.SetBinding(task.ID, "herder-task_abc", "herder-task_abc"); err != nil {
@@ -36,6 +41,9 @@ func TestSetBindingRoundTrip(t *testing.T) {
 	if got.SandboxID != "herder-task_abc" || got.AgentSessionID != "herder-task_abc" {
 		t.Errorf("binding = sandbox %q session %q, want both herder-task_abc",
 			got.SandboxID, got.AgentSessionID)
+	}
+	if got.Goal != "Fix the flaky login retry" {
+		t.Errorf("goal = %q, want the issue goal to round-trip", got.Goal)
 	}
 
 	if err := store.SetBinding(task.ID, "", "herder-task_xyz"); err != nil {
@@ -54,6 +62,48 @@ func TestSetBindingRoundTrip(t *testing.T) {
 
 	if err := store.SetBinding("task_missing", "sbx", "sess"); err == nil {
 		t.Error("binding an unknown task should fail")
+	}
+}
+
+// TestClearSessionBinding proves the failed-launch cleanup drops only the
+// session half of the task link: the sandbox stays bound for recovery,
+// clearing an unbound task is a no-op, and unknown ids report ErrNotFound.
+func TestClearSessionBinding(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "herder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTask(CreateInput{
+		SourceProvider: "github", SourceRef: "acme/web#7",
+		Repository: "acme/web", AgentProfile: "codex-default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBinding(task.ID, "sbx-1", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearSessionBinding(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentSessionID != "" {
+		t.Errorf("session = %q, want cleared", got.AgentSessionID)
+	}
+	if got.SandboxID != "sbx-1" {
+		t.Errorf("sandbox = %q, want the clear to leave sbx-1", got.SandboxID)
+	}
+
+	if err := store.ClearSessionBinding(task.ID); err != nil {
+		t.Errorf("clearing an already-empty session should be a no-op, got %v", err)
+	}
+	if err := store.ClearSessionBinding("task_missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("clearing an unknown task = %v, want ErrNotFound", err)
 	}
 }
 
@@ -93,8 +143,9 @@ func TestBindingSurvivesReopen(t *testing.T) {
 	}
 }
 
-// TestLegacyDBMigration proves databases written before the binding columns
-// existed still open, read back with empty bindings, and accept new ones.
+// TestLegacyDBMigration proves databases written before the binding and
+// goal columns existed still open, read back with empty values, and
+// accept new ones.
 func TestLegacyDBMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "herder.db")
 	raw, err := sql.Open("sqlite", path)
@@ -135,10 +186,25 @@ func TestLegacyDBMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AgentSessionID != "" || got.SandboxID != "" {
-		t.Errorf("legacy task bindings should read empty, got %+v", got)
+	if got.AgentSessionID != "" || got.SandboxID != "" || got.Goal != "" {
+		t.Errorf("legacy task bindings and goal should read empty, got %+v", got)
 	}
 	if err := store.SetBinding("task_legacy", "sbx-9", "sess-9"); err != nil {
 		t.Fatalf("migrated db should accept bindings: %v", err)
+	}
+	created, err := store.CreateTask(CreateInput{
+		SourceProvider: "github", SourceRef: "acme/web#9",
+		Repository: "acme/web", AgentProfile: "codex-default",
+		Goal: "Ship the goal column",
+	})
+	if err != nil {
+		t.Fatalf("migrated db should accept a goal: %v", err)
+	}
+	got, err = store.GetTask(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Goal != "Ship the goal column" {
+		t.Errorf("migrated db should return the goal, got %q", got.Goal)
 	}
 }

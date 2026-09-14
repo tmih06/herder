@@ -89,7 +89,8 @@ var allowed = map[State][]State{
 	TimedOut:        {Retrying, Cancelled},
 }
 
-// Task is the in-memory form of one row in tasks. AgentSessionID names the
+// Task is the in-memory form of one row in tasks. Goal carries the issue
+// goal text seeded into the agent prompt. AgentSessionID names the
 // live Herdr agent session (empty until the agent launches) and SandboxID
 // names the worker container; together they are the durable
 // task <-> sandbox <-> session link from SPEC section 18.
@@ -97,6 +98,7 @@ type Task struct {
 	ID             string
 	SourceProvider string
 	SourceRef      string
+	Goal           string
 	Status         State
 	Repository     string
 	AgentProfile   string
@@ -119,16 +121,30 @@ type Event struct {
 	CreatedAt time.Time
 }
 
+// NewInput carries the fields New needs to seed a task: source identity,
+// repository, agent profile, and the issue goal text seeded into the
+// agent prompt.
+type NewInput struct {
+	SourceProvider string
+	SourceRef      string
+	Repository     string
+	AgentProfile   string
+	Goal           string
+}
+
 // New builds a DISCOVERED task with fresh identity and timestamps.
-func New(sourceProvider, sourceRef, repository, agentProfile string) Task {
+// Inputs: a NewInput carrying source identity, repository, agent
+// profile, and the issue goal text seeded into the agent prompt.
+func New(in NewInput) Task {
 	now := time.Now().UTC()
 	return Task{
 		ID:             "task_" + hexID(8),
-		SourceProvider: sourceProvider,
-		SourceRef:      sourceRef,
+		SourceProvider: in.SourceProvider,
+		SourceRef:      in.SourceRef,
+		Goal:           in.Goal,
 		Status:         Discovered,
-		Repository:     repository,
-		AgentProfile:   agentProfile,
+		Repository:     in.Repository,
+		AgentProfile:   in.AgentProfile,
 		Attempt:        1,
 		CreatedAt:      now,
 		UpdatedAt:      now,

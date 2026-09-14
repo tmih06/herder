@@ -23,8 +23,10 @@ func testConfig() *config.Config {
 			},
 		},
 		Agents: map[string]config.AgentConfig{
-			"codex-default": {Kind: "codex", Timeout: "2h",
-				Resources: map[string]string{"cpu": "2", "memory": "4Gi"}},
+			"codex-default": {
+				Kind: "codex", Timeout: "2h",
+				Resources: map[string]string{"cpu": "2", "memory": "4Gi"},
+			},
 			"claude-review": {Kind: "claude"},
 		},
 	}
@@ -35,6 +37,7 @@ func testTask() tasks.Task {
 		ID: "task_abc123", SourceProvider: "github", SourceRef: "acme/web#7",
 		Status: tasks.Queued, Repository: "acme/web",
 		AgentProfile: "codex-default", BranchName: "herder/7",
+		Goal: "Fix OAuth refresh race\n\nRefresh tokens rotate mid-request.",
 	}
 }
 
@@ -67,7 +70,6 @@ func TestResolveProfile(t *testing.T) {
 func TestBuildPrompt(t *testing.T) {
 	prompt := BuildPrompt(PromptInput{
 		Task: testTask(), AgentKind: "codex", ProfileName: "codex-default",
-		Repository:       "acme/web",
 		Repo:             testConfig().Repositories["acme/web"],
 		RepoInstructions: "Always run gofmt.",
 		SandboxID:        "herder-task_abc123",
@@ -75,6 +77,7 @@ func TestBuildPrompt(t *testing.T) {
 	})
 	for _, want := range []string{
 		"acme/web#7", "herder/7", "task_abc123", "codex",
+		"Fix OAuth refresh race", "Refresh tokens rotate mid-request.",
 		"Always run gofmt.", "go test ./...",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -94,7 +97,7 @@ func TestBuildPrompt(t *testing.T) {
 func TestBuildPromptWithoutInstructions(t *testing.T) {
 	prompt := BuildPrompt(PromptInput{
 		Task: testTask(), AgentKind: "codex", ProfileName: "codex-default",
-		Repository: "acme/web", Repo: testConfig().Repositories["acme/web"],
+		Repo: testConfig().Repositories["acme/web"],
 	})
 	if !strings.Contains(prompt, "go test ./...") {
 		t.Errorf("prompt should carry validation commands, got:\n%s", prompt)
@@ -118,7 +121,6 @@ func TestSessionNameIsStable(t *testing.T) {
 func TestStartArgv(t *testing.T) {
 	var calls [][]string
 	l := &Launcher{
-		HerdrBin: "herdr",
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
 			calls = append(calls, append([]string{name}, args...))
 			if len(args) > 1 && args[1] == "start" {
@@ -198,12 +200,12 @@ func TestStartSurfacesHerdrFailure(t *testing.T) {
 
 // TestParseStartResult extracts pane/workspace ids for the durable event.
 func TestParseStartResult(t *testing.T) {
-	pane, workspace := ParseStartResult(`{"id":"cli:agent:start","result":{"agent":{
+	pane, workspace := parseStartResult(`{"id":"cli:agent:start","result":{"agent":{
 		"pane_id":"w5:p7","workspace_id":"w5","name":"herder-task_x"}}}`)
 	if pane != "w5:p7" || workspace != "w5" {
 		t.Errorf("got pane %q workspace %q, want w5:p7/w5", pane, workspace)
 	}
-	if pane, _ := ParseStartResult("not json"); pane != "" {
+	if pane, _ := parseStartResult("not json"); pane != "" {
 		t.Errorf("unparseable output should yield empty ids, got %q", pane)
 	}
 }

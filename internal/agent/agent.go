@@ -97,12 +97,12 @@ func ResolveProfile(cfg *config.Config, repoName, taskProfile, override string) 
 	return repo.Agent.Default, prof, true
 }
 
+// PromptInput bundles everything BuildPrompt needs:
 // the resolved agent, repo policy, and the live sandbox handles.
 type PromptInput struct {
 	Task             tasks.Task
 	AgentKind        string
 	ProfileName      string
-	Repository       string
 	Repo             config.RepositoryConfig
 	RepoInstructions string
 	SandboxID        string
@@ -119,13 +119,16 @@ func BuildPrompt(in PromptInput) string {
 	fmt.Fprintf(&b, "# Herder task %s\n\n", in.Task.ID)
 	fmt.Fprintf(&b, "You are a coding agent working a Herder task inside an isolated sandbox.\n\n")
 	b.WriteString("## Goal\n\n")
+	if goal := strings.TrimSpace(in.Task.Goal); goal != "" {
+		fmt.Fprintf(&b, "%s\n\n", goal)
+	}
 	fmt.Fprintf(&b, "Implement the work for issue %s (%s) in repository %s.\n",
-		in.Task.SourceRef, in.Task.SourceProvider, in.Repository)
+		in.Task.SourceRef, in.Task.SourceProvider, in.Task.Repository)
 	fmt.Fprintf(&b, "Work on branch %s. Keep the change focused on the issue.\n\n", in.Task.BranchName)
 	b.WriteString("## Issue metadata\n\n")
 	fmt.Fprintf(&b, "- Task: %s (attempt %d)\n", in.Task.ID, in.Task.Attempt)
 	fmt.Fprintf(&b, "- Source: %s:%s\n", in.Task.SourceProvider, in.Task.SourceRef)
-	fmt.Fprintf(&b, "- Repository: %s\n", in.Repository)
+	fmt.Fprintf(&b, "- Repository: %s\n", in.Task.Repository)
 	fmt.Fprintf(&b, "- Agent profile: %s (kind %s)\n", in.ProfileName, in.AgentKind)
 	if in.SandboxID != "" {
 		fmt.Fprintf(&b, "- Sandbox: %s\n", in.SandboxID)
@@ -220,10 +223,9 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 	return RunResult{ExitCode: 0, Stdout: stdout.String(), Stderr: stderr.String()}, nil
 }
 
-// Launcher starts agents and probes sessions through the Herdr CLI.
+// Launcher starts agents, seeds prompts, and probes sessions through the
+// Herdr CLI.
 type Launcher struct {
-	// HerdrBin is the Herdr binary; empty means PATH "herdr".
-	HerdrBin string
 	// Runner executes subprocesses; nil means DefaultRunner.
 	Runner Runner
 }
@@ -256,38 +258,51 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 	if !ok {
 		return StartResult{}, fmt.Errorf("agent: unknown agent kind %q (want codex, claude, opencode, gemini)", in.AgentKind)
 	}
-	bin, run := l.bin(), l.runner()
-	start := []string{"agent", "start", in.Session,
+	run := l.runner()
+	start := []string{
+		"agent", "start", in.Session,
 		"--cwd", in.Workspace, "--env", "HERDR_AGENT=" + in.AgentKind,
 		"--no-focus", "--",
-		"docker", "exec", "-it", in.Container, cmd}
-	out, err := run(ctx, bin, start...)
+		"docker", "exec", "-it", in.Container, cmd,
+	}
+	out, err := run(ctx, "herdr", start...)
 	if err != nil {
 		return StartResult{}, fmt.Errorf("agent: start %s: %w", in.Session, err)
 	}
 	if out.ExitCode != 0 {
 		return StartResult{}, fmt.Errorf("agent: start %s: %s", in.Session, firstLine(out.Stderr))
 	}
-	paneID, workspaceID := ParseStartResult(out.Stdout)
-	prompt := in.Prompt
+	paneID, workspaceID := parseStartResult(out.Stdout)
+	if err := l.SendPrompt(ctx, in.Session, in.Prompt); err != nil {
+		return StartResult{}, err
+	}
+	return StartResult{PaneID: paneID, WorkspaceID: workspaceID}, nil
+}
+
+// SendPrompt delivers the seeded prompt to a live Herdr session via
+// `agent send`. Purpose: keep the send contract — trailing-newline
+// normalization and error wording — in one place so Start and any later
+// re-seed caller share it. Inputs: session name and prompt text. Returns
+// a wrapped transport error, or the first stderr line on a nonzero exit.
+func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error {
 	if !strings.HasSuffix(prompt, "\n") {
 		prompt += "\n"
 	}
-	out, err = run(ctx, bin, "agent", "send", in.Session, prompt)
+	out, err := l.runner()(ctx, "herdr", "agent", "send", session, prompt)
 	if err != nil {
-		return StartResult{}, fmt.Errorf("agent: send prompt to %s: %w", in.Session, err)
+		return fmt.Errorf("agent: send prompt to %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return StartResult{}, fmt.Errorf("agent: send prompt to %s: %s", in.Session, firstLine(out.Stderr))
+		return fmt.Errorf("agent: send prompt to %s: %s", session, firstLine(out.Stderr))
 	}
-	return StartResult{PaneID: paneID, WorkspaceID: workspaceID}, nil
+	return nil
 }
 
 // IsLive reports whether a Herdr session still answers: exit 0 from
 // `agent get` means the pane exists and Herdr tracks it. Transport errors
 // read as not-live; the subsequent Start surfaces the real cause.
 func (l *Launcher) IsLive(ctx context.Context, session string) bool {
-	out, err := l.runner()(ctx, l.bin(), "agent", "get", session)
+	out, err := l.runner()(ctx, "herdr", "agent", "get", session)
 	return err == nil && out.ExitCode == 0
 }
 
@@ -298,10 +313,10 @@ func AttachArgv(session string) []string {
 	return []string{"herdr", "agent", "attach", session}
 }
 
-// ParseStartResult extracts pane/workspace ids from `agent start` JSON for
+// parseStartResult extracts pane/workspace ids from `agent start` JSON for
 // the durable agent.started event. Unparseable output yields empty ids:
 // the launch still succeeded, only the linkage detail is missing.
-func ParseStartResult(stdout string) (paneID, workspaceID string) {
+func parseStartResult(stdout string) (paneID, workspaceID string) {
 	var parsed struct {
 		Result struct {
 			Agent struct {
@@ -314,14 +329,6 @@ func ParseStartResult(stdout string) (paneID, workspaceID string) {
 		return "", ""
 	}
 	return parsed.Result.Agent.PaneID, parsed.Result.Agent.WorkspaceID
-}
-
-// bin resolves the Herdr binary name.
-func (l *Launcher) bin() string {
-	if strings.TrimSpace(l.HerdrBin) != "" {
-		return l.HerdrBin
-	}
-	return "herdr"
 }
 
 // runner resolves the injectable Runner default.

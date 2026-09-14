@@ -43,10 +43,12 @@ const startTimeout = 2 * time.Minute
 // taskStart launches the task's agent through Herdr into its ready sandbox
 // and records the durable task-sandbox-session link. Purpose: turn a queued
 // task into a watchable session (issue #4 acceptance core). Flow: state
-// gate -> resolve profile -> sandbox ready -> reuse live session or launch
-// -> bind -> RUNNING -> agent.started event. Unknown task profiles or agent
-// kinds fail the task with agent.start_failed instead of hanging; an
-// unknown --agent override is an operator typo and leaves the task alone.
+// gate -> resolve profile -> sandbox inspect reports running -> build the
+// seed prompt -> reuse a live session (re-seeded unless the task already
+// runs) or launch -> bind -> RUNNING -> agent.started event. Unknown task
+// profiles or agent kinds fail the task with agent.start_failed instead of
+// hanging; an unknown --agent override is an operator typo and leaves the
+// task alone.
 func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(ew)
@@ -74,9 +76,14 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 			task.ID, task.Status)
 		return 1
 	}
+	// The bounded ctx and launcher exist before the first failTaskStart so
+	// every failure path can probe session liveness before clearing a link.
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+	launcher := &agent.Launcher{}
 	repo, ok := cfg.Repositories[task.Repository]
 	if !ok {
-		return failTaskStart(store, &task, fmt.Sprintf("repository %q not in config", task.Repository), ew)
+		return failTaskStart(ctx, launcher, store, &task, fmt.Sprintf("repository %q not in config", task.Repository), ew)
 	}
 	// One policy owns profile selection (agent.ResolveProfile): explicit
 	// override, then the task's claimed profile, then the repo default. An
@@ -88,47 +95,58 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 			fmt.Fprintf(ew, "herder: agent profile %q unknown\n", *override)
 			return 1
 		}
-		return failTaskStart(store, &task,
+		return failTaskStart(ctx, launcher, store, &task,
 			fmt.Sprintf("agent profile %q unknown and no usable default", task.AgentProfile), ew)
 	}
 	if _, ok := agent.CommandForKind(prof.Kind); !ok {
-		return failTaskStart(store, &task, fmt.Sprintf("unknown agent kind %q", prof.Kind), ew)
+		return failTaskStart(ctx, launcher, store, &task, fmt.Sprintf("unknown agent kind %q", prof.Kind), ew)
 	}
 	container := sandbox.ContainerName(task.ID)
-	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
-	defer cancel()
-	if _, err := provider.Inspect(ctx, container); err != nil {
+	sb, err := provider.Inspect(ctx, container)
+	if err != nil {
 		fmt.Fprintf(ew, "herder: sandbox %s not ready: run `herder sandbox provision %s` first (%v)\n",
 			container, task.ID, err)
 		return 1
 	}
-	workspace := sandbox.WorkspacePath(sandboxRoot(cfg.Database.Path), task.ID)
-	session := agent.SessionName(task.ID)
-	launcher := &agent.Launcher{}
-	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.AgentSessionID) {
-		return reuseSession(store, &task, container, session, prof.Kind, profileName, ew)
-	}
-	if err := store.SetBinding(task.ID, container, session); err != nil {
-		fmt.Fprintf(ew, "herder: record session binding: %v\n", err)
+	if sb.Status != "running" {
+		fmt.Fprintf(ew, "herder: sandbox %s not ready: status %s (run `herder sandbox provision %s` first)\n",
+			container, sb.Status, task.ID)
 		return 1
 	}
+	workspace := sandbox.WorkspacePath(sandboxRoot(cfg.Database.Path), task.ID)
+	session := agent.SessionName(task.ID)
 	// The deterministic worker branch: claimed when set, else herder/<issue>.
+	// The prompt is built before the reuse/launch decision because a reused
+	// session on a not-yet-running task is re-seeded with the same contract.
 	task.BranchName = branchForTask(task)
 	prompt := agent.BuildPrompt(agent.PromptInput{
 		Task: task, AgentKind: prof.Kind, ProfileName: profileName,
-		Repository: task.Repository, Repo: repo,
+		Repo:             repo,
 		RepoInstructions: agent.LoadRepoInstructions(workspace),
 		SandboxID:        container, Workspace: workspace,
 	})
+	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.AgentSessionID) {
+		return reuseSession(ctx, launcher, store, &task, prompt, map[string]any{
+			"session": task.AgentSessionID, "kind": prof.Kind, "profile": profileName,
+			"sandbox": container, "reused": true,
+		}, ew)
+	}
 	res, err := launcher.Start(ctx, agent.StartInput{
 		Session: session, AgentKind: prof.Kind,
 		Workspace: workspace, Container: container, Prompt: prompt,
 	})
 	if err != nil {
-		return failTaskStart(store, &task, err.Error(), ew)
+		return failTaskStart(ctx, launcher, store, &task, err.Error(), ew)
+	}
+	// Bind only after the pane exists: a failed Start leaves no session
+	// name behind for attach to resolve. A bind failure still fails the
+	// task, and the reason names the orphaned session for manual recovery.
+	if err := store.SetBinding(task.ID, container, session); err != nil {
+		return failTaskStart(ctx, launcher, store, &task,
+			fmt.Sprintf("session %s started but binding failed: %v", session, err), ew)
 	}
 	advanceToRunning(store, &task, ew)
-	if err := emitStarted(store, task.ID, map[string]string{
+	if err := emitEvent(store, task.ID, "agent.started", map[string]string{
 		"session": session, "kind": prof.Kind, "profile": profileName,
 		"sandbox": container, "pane": res.PaneID, "workspace_id": res.WorkspaceID,
 		"branch": task.BranchName,
@@ -141,29 +159,34 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 }
 
 // reuseSession records a converged relaunch: the stored session still
-// answers, so no new pane is opened and the task just ensures RUNNING.
-func reuseSession(store *storage.Store, task *tasks.Task, container, session, kind, profile string, ew io.Writer) int {
-	if err := store.SetBinding(task.ID, container, ""); err != nil {
+// answers, so no new pane is opened. A not-yet-running task is re-seeded
+// via SendPrompt so the reused pane carries the current goal (crash
+// recovery); a RUNNING task's mid-work agent is left alone. A failed send
+// fails the task like a failed launch. Then the task just ensures RUNNING.
+func reuseSession(ctx context.Context, launcher *agent.Launcher, store *storage.Store, task *tasks.Task, prompt string, payload map[string]any, ew io.Writer) int {
+	if err := store.SetBinding(task.ID, sandbox.ContainerName(task.ID), ""); err != nil {
 		fmt.Fprintf(ew, "herder: record sandbox binding: %v\n", err)
 		return 1
 	}
+	if task.Status != tasks.Running {
+		if err := launcher.SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
+			return failTaskStart(ctx, launcher, store, task, err.Error(), ew)
+		}
+	}
 	advanceToRunning(store, task, ew)
-	if err := emitStarted(store, task.ID, map[string]any{
-		"session": session, "kind": kind, "profile": profile,
-		"sandbox": container, "reused": true,
-	}, ew); err != nil {
+	if err := emitEvent(store, task.ID, "agent.started", payload, ew); err != nil {
 		return 1
 	}
 	return 0
 }
 
-// emitStarted appends one agent.started event with a JSON payload.
-// Purpose: launch and reuse report the same event type from one place so
-// the payload shape cannot drift between the two paths. Returns the append
-// error after naming it on ew.
-func emitStarted(store *storage.Store, taskID string, payload any, ew io.Writer) error {
+// emitEvent appends one agent lifecycle event with a JSON payload.
+// Purpose: launch, reuse, and failure report their event types from one
+// place so the marshal and error naming cannot drift between paths.
+// Returns the append error after naming it on ew.
+func emitEvent(store *storage.Store, taskID, eventType string, payload any, ew io.Writer) error {
 	raw, _ := json.Marshal(payload)
-	if _, err := store.AppendEvent(taskID, "agent.started", "controller", "cli", string(raw)); err != nil {
+	if _, err := store.AppendEvent(taskID, eventType, "controller", "cli", string(raw)); err != nil {
 		fmt.Fprintf(ew, "herder: record agent event: %v\n", err)
 		return err
 	}
@@ -172,14 +195,20 @@ func emitStarted(store *storage.Store, taskID string, payload any, ew io.Writer)
 
 // failTaskStart moves the task to FAILED and records agent.start_failed
 // with the reason, so an unlaunchable task is a clear event, not a hang.
-func failTaskStart(store *storage.Store, task *tasks.Task, reason string, ew io.Writer) int {
+// A dead session's stale binding is cleared first so task attach reports
+// no session instead of execing a dead pane; a live session keeps its
+// binding so attach can still land on it.
+func failTaskStart(ctx context.Context, launcher *agent.Launcher, store *storage.Store, task *tasks.Task, reason string, ew io.Writer) int {
+	if task.AgentSessionID != "" && !launcher.IsLive(ctx, task.AgentSessionID) {
+		if err := store.ClearSessionBinding(task.ID); err != nil {
+			fmt.Fprintf(ew, "herder: clear stale session binding: %v\n", err)
+		}
+	}
 	if _, err := store.Transition(task.ID, tasks.Failed, "controller", "cli"); err != nil {
 		fmt.Fprintf(ew, "herder: fail task %s: %v\n", task.ID, err)
 		return 1
 	}
-	payload, _ := json.Marshal(map[string]string{"reason": reason})
-	if _, err := store.AppendEvent(task.ID, "agent.start_failed", "controller", "cli", string(payload)); err != nil {
-		fmt.Fprintf(ew, "herder: record agent event: %v\n", err)
+	if err := emitEvent(store, task.ID, "agent.start_failed", map[string]string{"reason": reason}, ew); err != nil {
 		return 1
 	}
 	fmt.Fprintf(ew, "herder: task %s failed: %s\n", task.ID, reason)

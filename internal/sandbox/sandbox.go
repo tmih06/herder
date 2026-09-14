@@ -119,7 +119,8 @@ type Provider interface {
 	Provision(ctx context.Context, spec Spec) (*Sandbox, error)
 	// Exec runs a command inside the sandbox, reporting output and exit.
 	Exec(ctx context.Context, id string, cmd []string) (*Result, error)
-	// Inspect reports one live sandbox or ErrNotFound.
+	// Inspect reports one sandbox with its current status (running or
+	// stopped) or ErrNotFound; callers gate on Sandbox.Status.
 	Inspect(ctx context.Context, id string) (*Sandbox, error)
 	// List reports every Herder-managed sandbox.
 	List(ctx context.Context) ([]Sandbox, error)

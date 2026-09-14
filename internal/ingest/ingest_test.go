@@ -34,6 +34,7 @@ func eligibleEvent(delivery string, issue int) ingest.IssueEvent {
 		Repository:  "tmih06/meltiply",
 		IssueNumber: issue,
 		Title:       "Fix OAuth refresh race",
+		Body:        "Refresh tokens race on expiry",
 		Labels:      []string{"bug", "agent-ready"},
 	}
 }
@@ -61,6 +62,10 @@ func TestHandleAccepts(t *testing.T) {
 	}
 	if out.Task.AgentProfile != "codex-default" {
 		t.Errorf("agent = %q, want repo default", out.Task.AgentProfile)
+	}
+	if !strings.Contains(out.Task.Goal, "Fix OAuth refresh race") ||
+		!strings.Contains(out.Task.Goal, "Refresh tokens race on expiry") {
+		t.Errorf("goal = %q, want title and body", out.Task.Goal)
 	}
 
 	events, err := store.ListEvents(out.TaskID)
@@ -301,6 +306,7 @@ func TestParseGitHubIssuesEvent(t *testing.T) {
 	body := `{"action":"labeled",
 		"label":{"name":"agent-ready"},
 		"issue":{"number":182,"title":"Fix OAuth refresh race",
+			"body":"Refresh tokens race on expiry",
 			"labels":[{"name":"bug"},{"name":"agent-ready"}]},
 		"repository":{"full_name":"tmih06/meltiply"}}`
 	ev, ignored, err := ingest.ParseGitHubIssuesEvent("del-1", []byte(body))
@@ -309,6 +315,9 @@ func TestParseGitHubIssuesEvent(t *testing.T) {
 	}
 	if ev.Repository != "tmih06/meltiply" || ev.IssueNumber != 182 || ev.DeliveryID != "del-1" {
 		t.Errorf("event mistranslated: %+v", ev)
+	}
+	if ev.Body != "Refresh tokens race on expiry" {
+		t.Errorf("body = %q, want issue body", ev.Body)
 	}
 	for _, want := range []string{"bug", "agent-ready"} {
 		found := false
