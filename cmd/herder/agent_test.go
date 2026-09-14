@@ -398,6 +398,42 @@ func TestTaskStartFailedReseedKeepsLiveBinding(t *testing.T) {
 	}
 }
 
+// TestTaskStartSendFailureKeepsLiveBinding proves a send-side failure
+// after a successful launch is not an orphan: the pane exists, so the
+// optimistic binding survives failTaskStart's liveness probe and the
+// task fails with the link intact for attach and a later re-seed.
+func TestTaskStartSendFailureKeepsLiveBinding(t *testing.T) {
+	state := writeFakeBins(t, "ready")
+	path := writeTestConfig(t)
+	id := queueTask(t, path)
+	setHerdrMode(t, state, "send-fails")
+
+	code, _, errOut := runCmd(t, "--config", path, "task", "start", id)
+	if code != 1 {
+		t.Errorf("start exit = %d, want 1", code)
+	}
+	if !strings.Contains(errOut, "send refused") {
+		t.Errorf("stderr should carry the Herdr refusal, got %q", errOut)
+	}
+	// The pane was created before the send failed: one start, one send.
+	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
+	if n := strings.Count(string(calls), "agent start"); n != 1 {
+		t.Errorf("send failure follows a successful start (1 start), got %d in %q", n, calls)
+	}
+	code, inspect, _ := runCmd(t, "--config", path, "task", "inspect", id)
+	if code != 0 {
+		t.Fatalf("inspect exit = %d, want 0", code)
+	}
+	for _, want := range []string{"FAILED", "agent.start_failed", "send refused"} {
+		if !strings.Contains(inspect, want) {
+			t.Errorf("inspect should show %q, got:\n%s", want, inspect)
+		}
+	}
+	if !strings.Contains(inspect, "session: herder-"+id) {
+		t.Errorf("live pane's binding should survive the send failure, got:\n%s", inspect)
+	}
+}
+
 // TestTaskStartFailedLaunchClearsDeadBinding proves a stale binding to a
 // dead session is cleaned up: `agent get` finds no live session so start
 // falls through to launch, the launch is refused, and the dead session's

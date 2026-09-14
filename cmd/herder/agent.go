@@ -136,6 +136,12 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		Workspace: workspace, Container: container, Prompt: prompt,
 	})
 	if err != nil {
+		// Record the binding optimistically so a session that did start
+		// (send-side failure) stays attachable and retry re-seeds it;
+		// failTaskStart clears it when the session never came up.
+		if bindErr := store.SetBinding(task.ID, container, session); bindErr == nil {
+			task.AgentSessionID = session
+		}
 		return failTaskStart(ctx, launcher, store, &task, err.Error(), ew)
 	}
 	// Bind only after the pane exists: a failed Start leaves no session
@@ -145,7 +151,10 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		return failTaskStart(ctx, launcher, store, &task,
 			fmt.Sprintf("session %s started but binding failed: %v", session, err), ew)
 	}
-	advanceToRunning(store, &task, ew)
+	if err := advanceToRunning(store, &task); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
 	if err := emitEvent(store, task.ID, "agent.started", map[string]string{
 		"session": session, "kind": prof.Kind, "profile": profileName,
 		"sandbox": container, "pane": res.PaneID, "workspace_id": res.WorkspaceID,
@@ -173,7 +182,10 @@ func reuseSession(ctx context.Context, launcher *agent.Launcher, store *storage.
 			return failTaskStart(ctx, launcher, store, task, err.Error(), ew)
 		}
 	}
-	advanceToRunning(store, task, ew)
+	if err := advanceToRunning(store, task); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
 	if err := emitEvent(store, task.ID, "agent.started", payload, ew); err != nil {
 		return 1
 	}

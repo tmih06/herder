@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
 
@@ -64,6 +66,39 @@ func TestSplitExecArgs(t *testing.T) {
 	}
 	if _, _, ok := splitExecArgs([]string{"task_1", "go"}); ok {
 		t.Error("missing separator must fail")
+	}
+}
+
+// TestAdvanceToRunningRejectsCancelled proves the mid-launch race is
+// reported, not swallowed: a task cancelled after the start gate read it
+// fails the QUEUED -> PROVISIONING transition and the caller sees the
+// error instead of emitting agent.started for a cancelled task.
+func TestAdvanceToRunningRejectsCancelled(t *testing.T) {
+	path := writeTestConfig(t)
+	id := queueTask(t, path)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(cfg.Database.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The operator cancels after taskStart fetched the row: the in-memory
+	// copy still reads QUEUED while the store moved on.
+	if _, err := store.Transition(id, tasks.Cancelled, "controller", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := advanceToRunning(store, &task); err == nil {
+		t.Fatal("advance on a cancelled task should fail, got nil")
+	}
+	if task.Status != tasks.Queued {
+		t.Errorf("in-memory status = %s, want QUEUED (no partial advance)", task.Status)
 	}
 }
 
