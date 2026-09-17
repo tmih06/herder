@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tmih06/herder/internal/textutil"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // RunResult is one finished subprocess: split streams plus exit status.

@@ -441,8 +441,10 @@ func (s *Store) restartAttempt(id, newProfile, eventType, actorType, actorID str
 	task.UpdatedAt = now
 	payload := tasks.EventPayload(map[string]any{"attempt": task.Attempt})
 	if newProfile != "" {
-		payload = tasks.EventPayload(map[string]any{"attempt": task.Attempt,
-			"from_profile": task.AgentProfile, "to_profile": newProfile})
+		payload = tasks.EventPayload(map[string]any{
+			"attempt":      task.Attempt,
+			"from_profile": task.AgentProfile, "to_profile": newProfile,
+		})
 		task.AgentProfile = newProfile
 	}
 	if _, err := tx.Exec(`UPDATE tasks SET status = ?, agent_profile = ?, agent_session_id = '',

@@ -107,15 +107,6 @@ exit 1
 	return state
 }
 
-// setAgentStatus arms the fake-herdr agent_status a session reports on
-// the next `agent get`, so supervision tests drive state changes.
-func setAgentStatus(t *testing.T, state, session, status string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(state, "status-"+session), []byte(status), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // setHerdrMode arms a fake-herdr failure mode for the next call: the
 // script re-reads STATE/herdrmode every invocation, so a test can flip
 // "send-fails" or "start-fails" on after a successful launch.

@@ -624,7 +624,7 @@ usage: herder [--config PATH] <command> [args]
   task logs [--lines N] <id>
                           print the agent's recent output
   task pause|resume <id>  freeze the sandbox or thaw it (session stays alive)
-  task stop <id>          end the agent session and cancel the task
+  task stop <id>          end the agent session and cancel it
   task retry <id>         fresh attempt on the same sandbox (attempt +1)
   task handoff --agent P <id>
                           move the task to a different agent, work preserved

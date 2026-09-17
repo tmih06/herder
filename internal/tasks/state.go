@@ -242,8 +242,10 @@ func CreatedEvent(task Task, actorType, actorID string) Event {
 		Type:      EventCreated,
 		ActorType: actorType,
 		ActorID:   actorID,
-		Payload: EventPayload(map[string]string{"source_ref": task.SourceRef,
-			"repository": task.Repository, "agent_profile": task.AgentProfile}),
+		Payload: EventPayload(map[string]string{
+			"source_ref": task.SourceRef,
+			"repository": task.Repository, "agent_profile": task.AgentProfile,
+		}),
 		CreatedAt: task.CreatedAt,
 	}
 }
