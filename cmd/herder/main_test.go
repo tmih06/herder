@@ -19,13 +19,19 @@ func runCmd(t *testing.T, argv ...string) (int, string, string) {
 	return code, out.String(), errOut.String()
 }
 
-// writeTestConfig writes a minimal valid config with a temp database.
+// writeTestConfig writes a minimal valid config with a temp database and
+// a second agent profile (claude-default) so handoff tests have a target.
 func writeTestConfig(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	body := strings.ReplaceAll(config.ExampleYAML,
 		"~/.local/state/herder/herder.db", filepath.Join(dir, "herder.db"))
 	body = strings.ReplaceAll(body, "tmih06/meltiply", "acme/web")
+	body += `
+  claude-reviewer:
+    kind: claude
+    timeout: 2h
+`
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)

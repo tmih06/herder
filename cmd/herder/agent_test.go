@@ -13,11 +13,15 @@ import (
 )
 
 // writeFakeBins installs fake `herdr` and `docker` CLIs on PATH for agent
-// launch tests. The herdr fake records calls, tracks started sessions in
-// STATE markers, and answers `agent get` by marker presence; it re-reads
-// STATE/herdrmode on every call so setHerdrMode can arm "send-fails" or
-// "start-fails" mid-test. dockerMode selects the inspect outcome
-// ("ready", "stopped", or "missing").
+// launch and intervention tests. The herdr fake records calls, tracks
+// started sessions in STATE markers, answers `agent get` with JSON whose
+// status comes from STATE/status-<session> (default "working"), serves
+// `agent read` from STATE/read-<session>, closes panes via `pane close`,
+// and logs `notification show`; it re-reads STATE/herdrmode on every call
+// so setHerdrMode can arm "send-fails" or "start-fails" mid-test.
+// dockerMode selects the inspect outcome ("ready", "stopped", or
+// "missing"); the fake tracks STATE/docker-status so pause/unpause/start
+// move the container between running, paused, and stopped.
 func writeFakeBins(t *testing.T, dockerMode string) string {
 	t.Helper()
 	bin := t.TempDir()
@@ -31,7 +35,7 @@ mode=$(cat "$STATE/herdrmode" 2>/dev/null)
 case "$1 $2" in
 "agent start")
   [ "$mode" = "start-fails" ] && { echo "start refused" >&2; exit 1; }
-  echo '{"result":{"agent":{"pane_id":"w9:p1","workspace_id":"w9"}}}'
+  echo "{\"result\":{\"agent\":{\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
   touch "$STATE/started-$3"
   ;;
 "agent send")
@@ -40,6 +44,20 @@ case "$1 $2" in
   ;;
 "agent get")
   [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
+  st=$(cat "$STATE/status-$3" 2>/dev/null || true); [ -z "$st" ] && st=working
+  echo "{\"result\":{\"agent\":{\"agent\":\"codex\",\"agent_status\":\"$st\",\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
+  ;;
+"agent read")
+  [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
+  text=$(cat "$STATE/read-$3" 2>/dev/null || true); [ -z "$text" ] && text="agent output tail"
+  printf '%s\n' "{\"result\":{\"read\":{\"text\":\"$text\",\"pane_id\":\"w9:p-$3\"}}}"
+  ;;
+"pane close")
+  sess=${3#w9:p-}
+  rm -f "$STATE/started-$sess"
+  ;;
+"notification show")
+  echo "$3 ${4:-} ${5:-}" >> "$STATE/notifications"
   ;;
 *) echo "unexpected herdr: $@" >&2; exit 1 ;;
 esac
@@ -51,21 +69,29 @@ esac
 	}
 	var docker string
 	switch dockerMode {
-	case "ready":
+	case "ready", "stopped":
+		initial := "running"
+		if dockerMode == "stopped" {
+			initial = "exited"
+		}
 		docker = `#!/bin/sh
-if [ "$1" = "inspect" ]; then
-cat <<'EOF'
-[{"Id":"abc123","Name":"/herder-task","Config":{"Image":"golang:1.22-bookworm"},"State":{"Status":"running"},"Mounts":[{"Source":"/tmp/w","Destination":"/workspace"}]}]
+st=$(cat "$STATE/docker-status" 2>/dev/null || true); [ -z "$st" ] && st=` + initial + `
+case "$1" in
+"inspect")
+  if [ "$2" = "--format" ]; then
+    [ "$st" = "missing" ] && { echo "Error: No such object: $4" >&2; exit 1; }
+    echo "$st"; exit 0
+  fi
+  [ "$st" = "missing" ] && { echo "Error: No such object: $2" >&2; exit 1; }
+  cat <<EOF
+[{"Id":"abc123","Name":"/herder-task","Config":{"Image":"golang:1.22-bookworm"},"State":{"Status":"$st"},"Mounts":[{"Source":"/tmp/w","Destination":"/workspace"}]}]
 EOF
-else echo "unexpected docker: $@" >&2; exit 1; fi
-`
-	case "stopped":
-		docker = `#!/bin/sh
-if [ "$1" = "inspect" ]; then
-cat <<'EOF'
-[{"Id":"abc123","Name":"/herder-task","Config":{"Image":"golang:1.22-bookworm"},"State":{"Status":"exited"},"Mounts":[{"Source":"/tmp/w","Destination":"/workspace"}]}]
-EOF
-else echo "unexpected docker: $@" >&2; exit 1; fi
+  ;;
+"pause")   [ "$st" = "missing" ] && { echo "Error: No such container" >&2; exit 1; }; echo paused > "$STATE/docker-status" ;;
+"unpause") [ "$st" = "missing" ] && { echo "Error: No such container" >&2; exit 1; }; echo running > "$STATE/docker-status" ;;
+"start")   [ "$st" = "missing" ] && { echo "Error: No such container" >&2; exit 1; }; echo running > "$STATE/docker-status" ;;
+*) echo "unexpected docker: $@" >&2; exit 1 ;;
+esac
 `
 	default:
 		docker = `#!/bin/sh

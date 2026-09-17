@@ -336,3 +336,84 @@ func TestProvisionRejectsEmptySpec(t *testing.T) {
 		t.Error("empty spec must fail")
 	}
 }
+
+// statefulDocker fakes a container whose status moves with pause,
+// unpause, and start so EnsureRunning can be tested end to end.
+func statefulDocker(status *string) func(string, []string) (RunResult, error) {
+	return func(name string, args []string) (RunResult, error) {
+		if name != "docker" {
+			return RunResult{}, nil
+		}
+		switch args[0] {
+		case "inspect":
+			return RunResult{Stdout: *status + "\n"}, nil
+		case "pause":
+			*status = "paused"
+		case "unpause", "start":
+			*status = "running"
+		}
+		return RunResult{}, nil
+	}
+}
+
+// TestPauseFreezeThaw proves pause and unpause drive docker's freezer
+// verbs against the container without touching the workspace.
+func TestPauseFreezeThaw(t *testing.T) {
+	status := "running"
+	f := &fakeRunner{respond: statefulDocker(&status)}
+	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	if err := p.Pause(context.Background(), "herder-task_x"); err != nil {
+		t.Fatalf("Pause = %v", err)
+	}
+	if status != "paused" {
+		t.Errorf("container status = %s, want paused", status)
+	}
+	if err := p.Unpause(context.Background(), "herder-task_x"); err != nil {
+		t.Fatalf("Unpause = %v", err)
+	}
+	if status != "running" {
+		t.Errorf("container status = %s, want running", status)
+	}
+	if argvOf(f.calls, "docker", "pause") == nil || argvOf(f.calls, "docker", "unpause") == nil {
+		t.Errorf("expected docker pause and unpause calls, got %v", f.calls)
+	}
+}
+
+// TestEnsureRunningConverges proves the retry/handoff revive path:
+// running is a no-op, paused unpauses, stopped starts, missing reports
+// ErrNotFound so the caller knows to provision.
+func TestEnsureRunningConverges(t *testing.T) {
+	status := "running"
+	f := &fakeRunner{respond: statefulDocker(&status)}
+	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+
+	if err := p.EnsureRunning(context.Background(), "herder-task_x"); err != nil {
+		t.Fatalf("EnsureRunning on running = %v", err)
+	}
+	if len(f.calls) != 1 {
+		t.Errorf("running container needs only the inspect, ran %v", f.calls)
+	}
+
+	status = "paused"
+	if err := p.EnsureRunning(context.Background(), "herder-task_x"); err != nil {
+		t.Fatalf("EnsureRunning on paused = %v", err)
+	}
+	if status != "running" {
+		t.Errorf("paused container should thaw, status = %s", status)
+	}
+
+	status = "exited"
+	if err := p.EnsureRunning(context.Background(), "herder-task_x"); err != nil {
+		t.Fatalf("EnsureRunning on exited = %v", err)
+	}
+	if status != "running" || argvOf(f.calls, "docker", "start") == nil {
+		t.Errorf("exited container should start, status = %s calls %v", status, f.calls)
+	}
+
+	f.respond = func(name string, args []string) (RunResult, error) {
+		return RunResult{ExitCode: 1, Stderr: "Error: No such container: herder-task_x"}, nil
+	}
+	if err := p.EnsureRunning(context.Background(), "herder-task_x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing container = %v, want ErrNotFound", err)
+	}
+}
