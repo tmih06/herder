@@ -75,8 +75,8 @@ var statusTemplate = template.Must(template.New("status").Parse(`<!DOCTYPE html>
 <h1>Herder</h1>
 <p>{{len .Tasks}} tasks</p>
 <table border="1">
-<tr><th>ID</th><th>Source</th><th>Status</th><th>Repository</th><th>Agent</th></tr>
-{{range .Tasks}}<tr><td>{{.ID}}</td><td>{{.SourceRef}}</td><td>{{.Status}}</td><td>{{.Repository}}</td><td>{{.AgentProfile}}</td></tr>
+<tr><th>ID</th><th>Source</th><th>Status</th><th>Agent state</th><th>Repository</th><th>Agent</th></tr>
+{{range .Tasks}}<tr><td>{{.ID}}</td><td>{{.SourceRef}}</td><td>{{.Status}}</td><td>{{.AgentState}}</td><td>{{.Repository}}</td><td>{{.AgentProfile}}</td></tr>
 {{end}}</table>
 </body></html>
 `))
