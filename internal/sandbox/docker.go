@@ -113,10 +113,18 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	} else if len(dirty) > 0 {
 		return nil, &DirtyError{TaskID: spec.TaskID, Branch: spec.Branch, Files: dirty}
 	}
-	if out, err := p.run(ctx, "git", "-C", workspace, "checkout", "-B", spec.Branch); err != nil {
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "checkout", "-B", spec.Branch)...); err != nil {
 		return nil, err
 	} else if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: checkout %s: %s", spec.Branch, firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: checkout %s: %s", spec.Branch, FirstLine(out.Stderr))
+	}
+	// Record the upstream base before the agent runs: the gate diffs
+	// against this SHA because refs inside the workspace are
+	// agent-writable and a later merge-base would be forgeable.
+	baseSHA := ""
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "rev-parse", "origin/HEAD")...); err == nil &&
+		out.ExitCode == 0 {
+		baseSHA = strings.TrimSpace(out.Stdout)
 	}
 	state, err := p.containerState(ctx, name)
 	if err != nil {
@@ -131,12 +139,13 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 		if out, err := p.run(ctx, "docker", "start", name); err != nil {
 			return nil, err
 		} else if out.ExitCode != 0 {
-			return nil, fmt.Errorf("sandbox: start %s: %s", name, firstLine(out.Stderr))
+			return nil, fmt.Errorf("sandbox: start %s: %s", name, FirstLine(out.Stderr))
 		}
 	}
 	return &Sandbox{
 		ID: name, TaskID: spec.TaskID, Image: imageOf(spec),
 		Status: "running", Branch: spec.Branch, Workspace: workspace,
+		BaseSHA: baseSHA,
 	}, nil
 }
 
@@ -145,7 +154,7 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 // provisioning outright: an empty fallback would masquerade as a checkout
 // and hide auth, network, or naming failures from the controller.
 func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace string) error {
-	if out, err := p.run(ctx, "git", "-C", workspace, "rev-parse", "--git-dir"); err != nil {
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "rev-parse", "--git-dir")...); err != nil {
 		return err
 	} else if out.ExitCode == 0 {
 		return nil
@@ -154,19 +163,19 @@ func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace st
 	if out, err := p.run(ctx, "git", "clone", remote, workspace); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
-		return fmt.Errorf("sandbox: clone %s: %s", remote, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: clone %s: %s", remote, FirstLine(out.Stderr))
 	}
 	return nil
 }
 
 // dirtyFiles lists uncommitted paths, capped for the error message.
 func (p *DockerProvider) dirtyFiles(ctx context.Context, workspace string) ([]string, error) {
-	out, err := p.run(ctx, "git", "-C", workspace, "status", "--porcelain")
+	out, err := p.run(ctx, "git", GitArgs(workspace, "status", "--porcelain")...)
 	if err != nil {
 		return nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: git status: %s", firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: git status: %s", FirstLine(out.Stderr))
 	}
 	var files []string
 	for _, line := range strings.Split(out.Stdout, "\n") {
@@ -191,7 +200,7 @@ func (p *DockerProvider) containerState(ctx context.Context, name string) (strin
 		if isNoSuch(out.Stderr) {
 			return "", nil
 		}
-		return "", fmt.Errorf("sandbox: inspect %s: %s", name, firstLine(out.Stderr))
+		return "", fmt.Errorf("sandbox: inspect %s: %s", name, FirstLine(out.Stderr))
 	}
 	return strings.TrimSpace(out.Stdout), nil
 }
@@ -228,7 +237,7 @@ func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace 
 		return err
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sandbox: create %s: %s", name, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: create %s: %s", name, FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -288,7 +297,7 @@ func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, erro
 		if isNoSuch(out.Stderr) {
 			return nil, fmt.Errorf("sandbox: inspect %s: %w", id, ErrNotFound)
 		}
-		return nil, fmt.Errorf("sandbox: inspect %s: %s", id, firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: inspect %s: %s", id, FirstLine(out.Stderr))
 	}
 	var parsed []inspectJSON
 	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil || len(parsed) == 0 {
@@ -316,7 +325,7 @@ func (p *DockerProvider) List(ctx context.Context) ([]Sandbox, error) {
 		return nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox: list: %s", firstLine(out.Stderr))
+		return nil, fmt.Errorf("sandbox: list: %s", FirstLine(out.Stderr))
 	}
 	var sandboxes []Sandbox
 	for _, line := range strings.Split(out.Stdout, "\n") {
@@ -352,7 +361,28 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 			p.logf("herder: sandbox %s already removed (stop no-op)", id)
 			return nil
 		}
-		return fmt.Errorf("sandbox: stop %s: %s", id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: stop %s: %s", id, FirstLine(out.Stderr))
+	}
+	return nil
+}
+
+// Start restarts a stopped worker container so validation can exec into
+// it after a daemon or host restart. Unlike Stop/Destroy, a missing
+// container is ErrNotFound: the goal (a running container) was not
+// achieved, so a silent no-op would hide the real cause.
+func (p *DockerProvider) Start(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("sandbox: start needs a sandbox id")
+	}
+	out, err := p.run(ctx, "docker", "start", id)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		if isNoSuch(out.Stderr) {
+			return fmt.Errorf("sandbox: start %s: %w", id, ErrNotFound)
+		}
+		return fmt.Errorf("sandbox: start %s: %s", id, FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -383,7 +413,7 @@ func (p *DockerProvider) Destroy(ctx context.Context, id string) error {
 			p.logf("herder: sandbox %s already removed (destroy no-op)", id)
 			return nil
 		}
-		return fmt.Errorf("sandbox: destroy %s: %s", id, firstLine(out.Stderr))
+		return fmt.Errorf("sandbox: destroy %s: %s", id, FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -395,11 +425,23 @@ func isNoSuch(stderr string) bool {
 		strings.Contains(lower, "no such object")
 }
 
-// firstLine keeps error messages to one actionable line.
-func firstLine(s string) string {
+// FirstLine keeps error messages to one actionable line.
+func FirstLine(s string) string {
 	line, _, _ := strings.Cut(strings.TrimSpace(s), "\n")
 	if line == "" {
 		return "command failed"
 	}
 	return line
+}
+
+// GitArgs prefixes every workspace git call with overrides that
+// neutralize repo-controlled config: once the agent has run, .git is
+// agent-writable, so hooks and fsmonitor must never execute on the
+// controller host.
+func GitArgs(workspace string, args ...string) []string {
+	return append([]string{
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", workspace,
+	}, args...)
 }

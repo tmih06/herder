@@ -66,6 +66,30 @@ func TestInterventionLoop(t *testing.T) {
 	}
 }
 
+// Validation failure must route back to the agent (RETRYING -> RUNNING)
+// or to a human (WAITING_FOR_HUMAN), and a no-PR delivery must be able to
+// finish from REVIEWING (issue #6 acceptance criteria).
+func TestValidationOutcomeRouting(t *testing.T) {
+	pairs := [][2]State{
+		{Validating, Retrying},
+		{Retrying, Running},
+		{Validating, WaitingForHuman},
+		{WaitingForHuman, Running},
+		{Reviewing, Done},
+		// A branch that moved after the gate passed re-enters validation
+		// instead of shipping unverified commits.
+		{Reviewing, Validating},
+		{Delivering, Validating},
+		// create_pr: false rests a delivered task back in REVIEWING.
+		{Delivering, Reviewing},
+	}
+	for _, p := range pairs {
+		if err := ValidateTransition(p[0], p[1]); err != nil {
+			t.Errorf("transition %s -> %s rejected: %v", p[0], p[1], err)
+		}
+	}
+}
+
 // ApplyTransition must move the task and mint a structured, timestamped,
 // attributable event describing exactly that jump.
 func TestApplyTransitionEmitsEvent(t *testing.T) {

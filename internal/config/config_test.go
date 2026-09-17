@@ -67,6 +67,82 @@ agents:
     timeout: 2h
 `
 
+// The issue #6 gate knobs must parse: forbidden path globs, the clean-tree
+// switch, and the delivery label path.
+func TestValidationDeliveryConfig(t *testing.T) {
+	// validBody ends inside the agents map; splice the repo keys under the
+	// repository entry instead of appending at top level.
+	body := strings.Replace(validBody, "      provider: docker\n",
+		`      provider: docker
+    validation:
+      commands: [go test ./...]
+      forbidden_changes: [".github/workflows/**"]
+      require_clean_git: false
+    delivery:
+      create_pr: true
+      labels:
+        running: ci-running
+        review: ci-review
+        completed: ci-done
+`, 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	repo := cfg.Repositories["acme/web"]
+	if len(repo.Validation.ForbiddenChanges) != 1 ||
+		repo.Validation.ForbiddenChanges[0] != ".github/workflows/**" {
+		t.Errorf("forbidden_changes = %v", repo.Validation.ForbiddenChanges)
+	}
+	if repo.Validation.CleanTreeRequired() {
+		t.Error("require_clean_git: false must disable the clean-tree check")
+	}
+	labels := repo.Delivery.LabelSet()
+	if labels.Running != "ci-running" || labels.Review != "ci-review" || labels.Completed != "ci-done" {
+		t.Errorf("labels = %+v, want the configured stage names", labels)
+	}
+}
+
+// Omitted gate knobs must default safe: clean tree required, and the SPEC
+// section 35 label path agent-running -> agent-review -> completed.
+func TestValidationDeliveryDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validBody))
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	repo := cfg.Repositories["acme/web"]
+	if !repo.Validation.CleanTreeRequired() {
+		t.Error("require_clean_git must default to true")
+	}
+	labels := repo.Delivery.LabelSet()
+	if labels.Running != "agent-running" || labels.Review != "agent-review" ||
+		labels.Completed != "completed" {
+		t.Errorf("default labels = %+v, want the spec stage names", labels)
+	}
+}
+
+// Bad gate config fails at load: escaping globs and unprintable labels.
+func TestValidateBadGateConfig(t *testing.T) {
+	for name, fragment := range map[string]string{
+		"escaping glob": `    validation:
+      forbidden_changes: ["../outside/**"]
+`,
+		"absolute glob": `    validation:
+      forbidden_changes: ["/etc/passwd"]
+`,
+		"bad label": `    delivery:
+      labels:
+        review: "not a label!"
+`,
+	} {
+		body := strings.Replace(validBody, "      provider: docker\n",
+			"      provider: docker\n"+fragment, 1)
+		if _, err := Load(writeConfig(t, body)); err == nil {
+			t.Errorf("%s: Load must reject the config", name)
+		}
+	}
+}
+
 // TestValidateBadTrigger Empty trigger labels fail naming trigger/labels.
 func TestValidateBadTrigger(t *testing.T) {
 	bad := strings.Replace(validBody, "labels: [agent-ready]", "labels: []", 1)

@@ -94,7 +94,7 @@ func TestAdvanceToRunningRejectsCancelled(t *testing.T) {
 	if _, err := store.Transition(id, tasks.Cancelled, "controller", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if err := advanceToRunning(store, &task); err == nil {
+	if err := advanceToRunning(store, &task, true); err == nil {
 		t.Fatal("advance on a cancelled task should fail, got nil")
 	}
 	if task.Status != tasks.Queued {

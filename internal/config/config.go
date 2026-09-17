@@ -106,15 +106,56 @@ type SandboxConfig struct {
 	Image    string `yaml:"image"`
 }
 
-// ValidationConfig lists commands that must pass before delivery.
+// ValidationConfig is the per-repo gate that must pass before delivery
+// (SPEC section 33): shell commands run inside the task sandbox, glob
+// patterns for paths the agent must never touch, and the clean-tree rule
+// that refuses to ship uncommitted or untracked work. ForbiddenChanges
+// patterns are repo-relative globs where ** crosses directory separators;
+// RequireCleanGit defaults to true when omitted.
 type ValidationConfig struct {
-	Commands []string `yaml:"commands"`
+	Commands         []string `yaml:"commands"`
+	ForbiddenChanges []string `yaml:"forbidden_changes"`
+	RequireCleanGit  *bool    `yaml:"require_clean_git"`
+}
+
+// CleanTreeRequired reports whether validation must reject a dirty tree.
+// Purpose: the zero value (field omitted) means "required" — shipping
+// uncommitted work is the unsafe default, so opting out must be explicit.
+func (v ValidationConfig) CleanTreeRequired() bool {
+	return v.RequireCleanGit == nil || *v.RequireCleanGit
+}
+
+// DeliveryLabels names the issue labels marking each stage of the
+// running -> review -> completed path (SPEC section 35). Empty fields
+// fall back to the spec defaults in LabelSet.
+type DeliveryLabels struct {
+	Running   string `yaml:"running"`
+	Review    string `yaml:"review"`
+	Completed string `yaml:"completed"`
 }
 
 // DeliveryConfig controls pull-request delivery.
 type DeliveryConfig struct {
-	CreatePR  bool `yaml:"create_pr"`
-	AutoMerge bool `yaml:"auto_merge"`
+	CreatePR  bool           `yaml:"create_pr"`
+	AutoMerge bool           `yaml:"auto_merge"`
+	Labels    DeliveryLabels `yaml:"labels"`
+}
+
+// LabelSet returns the configured stage labels with spec defaults filled:
+// agent-running while the agent works, agent-review once the PR is open,
+// completed when the task is done.
+func (d DeliveryConfig) LabelSet() DeliveryLabels {
+	l := d.Labels
+	if l.Running == "" {
+		l.Running = "agent-running"
+	}
+	if l.Review == "" {
+		l.Review = "agent-review"
+	}
+	if l.Completed == "" {
+		l.Completed = "completed"
+	}
+	return l
 }
 
 // AgentConfig is a launch profile for one coding-agent kind.
@@ -228,7 +269,43 @@ func validateRepository(name string, repo RepositoryConfig, agents map[string]Ag
 		errs = append(errs, fmt.Errorf("%s.sandbox.provider %q unknown: want one of %s",
 			prefix, repo.Sandbox.Provider, strings.Join(supportedSandboxProviders, ", ")))
 	}
+	for _, pattern := range repo.Validation.ForbiddenChanges {
+		if err := validForbiddenPattern(pattern); err != nil {
+			errs = append(errs, fmt.Errorf("%s.validation.forbidden_changes: %w", prefix, err))
+		}
+	}
+	for stage, label := range map[string]string{
+		"running":   repo.Delivery.Labels.Running,
+		"review":    repo.Delivery.Labels.Review,
+		"completed": repo.Delivery.Labels.Completed,
+	} {
+		if label != "" && !labelPattern.MatchString(label) {
+			errs = append(errs, fmt.Errorf("%s.delivery.labels.%s %q must match %s",
+				prefix, stage, label, labelPattern.String()))
+		}
+	}
 	return errs
+}
+
+// validForbiddenPattern rejects globs that cannot name a repo-relative
+// path: empty, absolute, escaping the root, or carrying whitespace or
+// character classes (the matcher supports only *, ?, and **).
+func validForbiddenPattern(pattern string) error {
+	if strings.TrimSpace(pattern) == "" {
+		return errors.New("pattern must not be empty")
+	}
+	if strings.HasPrefix(pattern, "/") || strings.HasPrefix(pattern, "~") {
+		return fmt.Errorf("pattern %q must be repo-relative, not absolute", pattern)
+	}
+	for _, seg := range strings.Split(pattern, "/") {
+		if seg == ".." {
+			return fmt.Errorf("pattern %q must not escape the repository root", pattern)
+		}
+	}
+	if strings.ContainsAny(pattern, " \t[]") {
+		return fmt.Errorf("pattern %q supports only *, ?, and ** (no spaces or character classes)", pattern)
+	}
+	return nil
 }
 
 // validPort reports whether s is a TCP port number.

@@ -290,11 +290,12 @@ func cmdDoctor(path string, w, ew io.Writer) int {
 	return 0
 }
 
-// cmdTask implements `herder task list|inspect|create|transition|event`
+// cmdTask implements `herder task
+// list|inspect|create|start|attach|validate|deliver|done|transition|event`
 // against the SQLite file directly.
 func cmdTask(path string, args []string, w, ew io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintf(ew, "herder: usage: herder task list|inspect|create|transition|event ...\n")
+		fmt.Fprintf(ew, "herder: usage: herder task list|inspect|create|start|attach|validate|deliver|done|transition|event ...\n")
 		return 2
 	}
 	cfg := loadConfig(path, ew)
@@ -318,6 +319,12 @@ func cmdTask(path string, args []string, w, ew io.Writer) int {
 		return taskStart(cfg, store, rest, w, ew)
 	case "attach":
 		return taskAttach(store, rest, w, ew)
+	case "validate":
+		return taskValidate(cfg, store, rest, w, ew)
+	case "deliver":
+		return taskDeliver(cfg, store, rest, w, ew)
+	case "done":
+		return taskDone(cfg, store, rest, w, ew)
 	case "transition":
 		return taskTransition(store, rest, w, ew)
 	case "event":
@@ -584,7 +591,10 @@ usage: herder [--config PATH] <command> [args]
                           move a task, appending a structured event
   task start [--agent P] <id>
                           launch the agent through Herdr into its sandbox
-  task attach <id>       drop into the real running agent (detach keeps it running)
+  task attach <id>        drop into the real running agent (detach keeps it running)
+  task validate <id>      run the repo's validation gate inside the sandbox
+  task deliver <id>       validate, push the branch, open the PR, update the issue
+  task done <id>          mark a delivered task complete (completed label)
   sandbox provision <task-id>
                           create or reuse the task's isolated container
   sandbox exec <id> -- <command...>

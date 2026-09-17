@@ -280,6 +280,31 @@ func TestStopUnknownIsLoggedNoOp(t *testing.T) {
 	}
 }
 
+// Start must restart a stopped worker so validation can exec into it; a
+// missing container is ErrNotFound — the goal was not achieved.
+func TestStartStoppedAndUnknown(t *testing.T) {
+	f := &fakeRunner{}
+	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	if err := p.Start(context.Background(), "herder-task_a"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if argvOf(f.calls, "docker", "start") == nil {
+		t.Errorf("start must run docker start, ran %v", f.calls)
+	}
+
+	// Unlike stop/destroy, a missing container is an error: the goal (a
+	// running container) was not achieved, so ErrNotFound surfaces the
+	// real cause instead of a silent no-op.
+	gone := &fakeRunner{}
+	gone.respond = func(name string, args []string) (RunResult, error) {
+		return RunResult{ExitCode: 1, Stderr: "Error: No such container"}, nil
+	}
+	p2 := &DockerProvider{Runner: gone.run}
+	if err := p2.Start(context.Background(), "herder-gone"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("start of unknown sandbox must return ErrNotFound, got %v", err)
+	}
+}
+
 func TestInspectParsesLiveSandbox(t *testing.T) {
 	f := &fakeRunner{}
 	f.respond = func(name string, args []string) (RunResult, error) {

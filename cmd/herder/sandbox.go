@@ -177,12 +177,13 @@ func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(w, "herder: sandbox %s running (branch %s)\n", sb.ID, sb.Branch)
-	if err := advanceToRunning(store, &task); err != nil {
+	if err := advanceToRunning(store, &task, false); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 	}
 	payload, _ := json.Marshal(map[string]string{
 		"sandbox": sb.ID, "branch": sb.Branch,
 		"workspace": sb.Workspace, "image": sb.Image,
+		"base_sha": sb.BaseSHA,
 	})
 	if _, err := store.AppendEvent(task.ID, "sandbox.provisioned", "controller", "cli", string(payload)); err != nil {
 		fmt.Fprintf(ew, "herder: record provision event: %v\n", err)
@@ -192,16 +193,24 @@ func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 }
 
 // advanceToRunning walks QUEUED -> PROVISIONING -> RUNNING so the durable
-// state reflects the live container. Any other state is left untouched:
+// state reflects the live container. relaunch additionally admits
+// RETRYING and WAITING_FOR_HUMAN — the start path legitimately re-enters
+// RUNNING from them, while a bare re-provision must not silently un-block
+// a task waiting on a human. Any other state is left untouched:
 // re-provisioning an active task is normal. Returns the first rejected
 // transition so callers can stop instead of reporting a started agent
 // for a task the store no longer considers launchable.
-func advanceToRunning(store *storage.Store, task *tasks.Task) error {
+func advanceToRunning(store *storage.Store, task *tasks.Task, relaunch bool) error {
 	var path []tasks.State
 	switch task.Status {
 	case tasks.Queued:
 		path = []tasks.State{tasks.Provisioning, tasks.Running}
 	case tasks.Provisioning:
+		path = []tasks.State{tasks.Running}
+	case tasks.Retrying, tasks.WaitingForHuman:
+		if !relaunch {
+			return nil
+		}
 		path = []tasks.State{tasks.Running}
 	default:
 		return nil

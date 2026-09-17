@@ -97,6 +97,10 @@ type Sandbox struct {
 	Branch string
 	// Workspace is the host checkout mounted at /workspace.
 	Workspace string
+	// BaseSHA is the upstream base commit recorded at provisioning time,
+	// before the agent runs: the validation gate diffs against it because
+	// refs inside the workspace are agent-writable.
+	BaseSHA string
 }
 
 // Result is one finished exec: output plus exit status for later

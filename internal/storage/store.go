@@ -351,6 +351,24 @@ func (s *Store) ClearSessionBinding(id string) error {
 	return nil
 }
 
+// IncrementAttempt bumps the task's attempt counter and returns the
+// updated row. Purpose: a validation failure routed back to the agent is
+// a new attempt on the same sandbox work (issue #6); the counter makes
+// retries visible in inspect output and event history. Unknown ids fail
+// with ErrNotFound; updated_at moves so recovery sees the touch.
+func (s *Store) IncrementAttempt(id string) (tasks.Task, error) {
+	res, err := s.db.Exec(
+		`UPDATE tasks SET attempt = attempt + 1, updated_at = ? WHERE id = ?`,
+		formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return tasks.Task{}, fmt.Errorf("storage: increment attempt %s: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return tasks.Task{}, ErrNotFound
+	}
+	return s.GetTask(id)
+}
+
 // AppendEvent records a custom event (agent output, validation results,
 // delivery notes) against an existing task.
 func (s *Store) AppendEvent(taskID, eventType, actorType, actorID, payload string) (tasks.Event, error) {
