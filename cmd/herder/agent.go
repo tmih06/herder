@@ -63,9 +63,9 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		return 1
 	}
 	switch task.Status {
-	case tasks.Queued, tasks.Provisioning, tasks.Running:
+	case tasks.Queued, tasks.Provisioning, tasks.Running, tasks.Retrying, tasks.WaitingForHuman:
 	default:
-		fmt.Fprintf(ew, "herder: task %s in %s cannot start (want QUEUED, PROVISIONING, or RUNNING)\n",
+		fmt.Fprintf(ew, "herder: task %s in %s cannot start (want QUEUED, PROVISIONING, RUNNING, RETRYING, or WAITING_FOR_HUMAN)\n",
 			task.ID, task.Status)
 		return 1
 	}
@@ -83,10 +83,7 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 // priorAgent names the previous worker on a handoff so the prompt tells
 // the new agent it inherits existing work instead of starting cold.
 func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, task *tasks.Task, override, priorAgent string, w, ew io.Writer) int {
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) {
-		fmt.Fprintf(ew, format+"\n", args...)
-	}
+	provider := newProvider(ew)
 	launcher := &agent.Launcher{}
 	repo, ok := cfg.Repositories[task.Repository]
 	if !ok {
@@ -134,7 +131,7 @@ func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, t
 		PriorAgent: priorAgent,
 	})
 	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.AgentSessionID) {
-		return reuseSession(ctx, launcher, store, task, prompt, map[string]any{
+		return reuseSession(ctx, launcher, store, task, repo, prompt, map[string]any{
 			"session": task.AgentSessionID, "kind": prof.Kind, "profile": profileName,
 			"sandbox": container, "reused": true,
 		}, ew)
@@ -164,7 +161,7 @@ func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, t
 	if _, err := store.RecordAgentState(task.ID, tasks.AgentStarting, "controller", "cli"); err != nil {
 		fmt.Fprintf(ew, "herder: record agent state: %v\n", err)
 	}
-	if err := advanceToRunning(store, task); err != nil {
+	if err := advanceToRunning(store, task, true); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -175,6 +172,9 @@ func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, t
 	}, ew); err != nil {
 		return 1
 	}
+	// The issue's stage label moves to running once the agent is live;
+	// best-effort so a missing gh never blocks a launch.
+	markIssueRunning(store, task, repo, ew)
 	fmt.Fprintf(w, "herder: agent %s started for %s in session %s (pane %s)\n",
 		prof.Kind, task.ID, session, res.PaneID)
 	return 0
@@ -185,7 +185,7 @@ func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, t
 // via SendPrompt so the reused pane carries the current goal (crash
 // recovery); a RUNNING task's mid-work agent is left alone. A failed send
 // fails the task like a failed launch. Then the task just ensures RUNNING.
-func reuseSession(ctx context.Context, launcher *agent.Launcher, store *storage.Store, task *tasks.Task, prompt string, payload map[string]any, ew io.Writer) int {
+func reuseSession(ctx context.Context, launcher *agent.Launcher, store *storage.Store, task *tasks.Task, repo config.RepositoryConfig, prompt string, payload map[string]any, ew io.Writer) int {
 	if err := store.SetBinding(task.ID, sandbox.ContainerName(task.ID), ""); err != nil {
 		fmt.Fprintf(ew, "herder: record sandbox binding: %v\n", err)
 		return 1
@@ -195,13 +195,14 @@ func reuseSession(ctx context.Context, launcher *agent.Launcher, store *storage.
 			return failTaskStart(ctx, launcher, store, task, err.Error(), ew)
 		}
 	}
-	if err := advanceToRunning(store, task); err != nil {
+	if err := advanceToRunning(store, task, true); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
 	if err := emitEvent(store, task.ID, "agent.started", payload, ew); err != nil {
 		return 1
 	}
+	markIssueRunning(store, task, repo, ew)
 	return 0
 }
 

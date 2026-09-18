@@ -100,6 +100,36 @@ func TestDurabilityAcrossReopen(t *testing.T) {
 	}
 }
 
+// A validation-failure retry must bump the attempt counter durably so the
+// next try is distinguishable in history (issue #6).
+func TestIncrementAttempt(t *testing.T) {
+	store, _ := openTestStore(t)
+	created, err := store.CreateTask(createInput())
+	if err != nil {
+		t.Fatalf("CreateTask = %v", err)
+	}
+	if created.Attempt != 1 {
+		t.Fatalf("fresh task attempt = %d, want 1", created.Attempt)
+	}
+	got, err := store.IncrementAttempt(created.ID)
+	if err != nil {
+		t.Fatalf("IncrementAttempt = %v", err)
+	}
+	if got.Attempt != 2 {
+		t.Errorf("attempt = %d, want 2", got.Attempt)
+	}
+	reloaded, err := store.GetTask(created.ID)
+	if err != nil {
+		t.Fatalf("GetTask = %v", err)
+	}
+	if reloaded.Attempt != 2 {
+		t.Errorf("persisted attempt = %d, want 2", reloaded.Attempt)
+	}
+	if _, err := store.IncrementAttempt("task_missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown id must fail with ErrNotFound, got %v", err)
+	}
+}
+
 // An illegal jump must fail and leave neither a new status nor an event.
 func TestIllegalTransitionLeavesNoTrace(t *testing.T) {
 	store, _ := openTestStore(t)

@@ -32,9 +32,16 @@ repositories:
     validation:
       commands:
         - go test ./...
+      forbidden_changes:
+        - ".github/workflows/**"
+      require_clean_git: true
     delivery:
       create_pr: true
       auto_merge: false
+      labels:
+        running: agent-running
+        review: agent-review
+        completed: completed
 
 agents:
   codex-default:
