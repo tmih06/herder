@@ -115,10 +115,18 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	} else if len(dirty) > 0 {
 		return nil, &DirtyError{TaskID: spec.TaskID, Branch: spec.Branch, Files: dirty}
 	}
-	if out, err := p.run(ctx, "git", "-C", workspace, "checkout", "-B", spec.Branch); err != nil {
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "checkout", "-B", spec.Branch)...); err != nil {
 		return nil, err
 	} else if out.ExitCode != 0 {
 		return nil, fmt.Errorf("sandbox: checkout %s: %s", spec.Branch, textutil.FirstLine(out.Stderr))
+	}
+	// Record the upstream base before the agent runs: the gate diffs
+	// against this SHA because refs inside the workspace are
+	// agent-writable and a later merge-base would be forgeable.
+	baseSHA := ""
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "rev-parse", "origin/HEAD")...); err == nil &&
+		out.ExitCode == 0 {
+		baseSHA = strings.TrimSpace(out.Stdout)
 	}
 	state, err := p.containerState(ctx, name)
 	if err != nil {
@@ -139,6 +147,7 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	return &Sandbox{
 		ID: name, TaskID: spec.TaskID, Image: imageOf(spec),
 		Status: "running", Branch: spec.Branch, Workspace: workspace,
+		BaseSHA: baseSHA,
 	}, nil
 }
 
@@ -147,7 +156,7 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 // provisioning outright: an empty fallback would masquerade as a checkout
 // and hide auth, network, or naming failures from the controller.
 func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace string) error {
-	if out, err := p.run(ctx, "git", "-C", workspace, "rev-parse", "--git-dir"); err != nil {
+	if out, err := p.run(ctx, "git", GitArgs(workspace, "rev-parse", "--git-dir")...); err != nil {
 		return err
 	} else if out.ExitCode == 0 {
 		return nil
@@ -163,7 +172,7 @@ func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace st
 
 // dirtyFiles lists uncommitted paths, capped for the error message.
 func (p *DockerProvider) dirtyFiles(ctx context.Context, workspace string) ([]string, error) {
-	out, err := p.run(ctx, "git", "-C", workspace, "status", "--porcelain")
+	out, err := p.run(ctx, "git", GitArgs(workspace, "status", "--porcelain")...)
 	if err != nil {
 		return nil, err
 	}
@@ -464,4 +473,16 @@ func isNoSuch(stderr string) bool {
 	lower := strings.ToLower(stderr)
 	return strings.Contains(lower, "no such container") ||
 		strings.Contains(lower, "no such object")
+}
+
+// GitArgs prefixes every workspace git call with overrides that
+// neutralize repo-controlled config: once the agent has run, .git is
+// agent-writable, so hooks and fsmonitor must never execute on the
+// controller host.
+func GitArgs(workspace string, args ...string) []string {
+	return append([]string{
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", workspace,
+	}, args...)
 }
