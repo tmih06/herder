@@ -34,7 +34,7 @@ func ensureSandbox(ctx context.Context, provider *sandbox.DockerProvider,
 		return "", "", fmt.Errorf("sandbox %s not ready: %w", container, err)
 	}
 	if sb.Status != "running" {
-		if err := provider.Start(ctx, container); err != nil {
+		if err := provider.EnsureRunning(ctx, container); err != nil {
 			return "", "", fmt.Errorf("sandbox %s not running: %w", container, err)
 		}
 	}
@@ -87,9 +87,7 @@ func prepareTask(cfg *config.Config, store *storage.Store, args []string,
 	if !ok {
 		return fail(1, "herder: task repository %q not in config\n", task.Repository)
 	}
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
-	return task, repo, provider, -1
+	return task, repo, newProvider(ew), -1
 }
 
 // stateNames renders a state list for refusal messages.

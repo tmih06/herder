@@ -34,6 +34,7 @@ import (
 
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/sandbox"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // Event types emitted through Gate.Emit (SPEC section 58).
@@ -270,7 +271,7 @@ func (g *Gate) headSHA(ctx context.Context, workspace string) (string, error) {
 		return "", err
 	}
 	if out.ExitCode != 0 {
-		return "", fmt.Errorf("validation: git rev-parse HEAD: %s", sandbox.FirstLine(out.Stderr))
+		return "", fmt.Errorf("validation: git rev-parse HEAD: %s", textutil.FirstLine(out.Stderr))
 	}
 	return strings.TrimSpace(out.Stdout), nil
 }
@@ -290,7 +291,7 @@ func (g *Gate) changedPaths(ctx context.Context, in Input) (changed, dirty []str
 		return nil, nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, nil, fmt.Errorf("validation: git diff %s: %s", base, sandbox.FirstLine(out.Stderr))
+		return nil, nil, fmt.Errorf("validation: git diff %s: %s", base, textutil.FirstLine(out.Stderr))
 	}
 	for _, p := range strings.Split(out.Stdout, "\x00") {
 		if p != "" {
@@ -304,7 +305,7 @@ func (g *Gate) changedPaths(ctx context.Context, in Input) (changed, dirty []str
 		return nil, nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, nil, fmt.Errorf("validation: git status: %s", sandbox.FirstLine(out.Stderr))
+		return nil, nil, fmt.Errorf("validation: git status: %s", textutil.FirstLine(out.Stderr))
 	}
 	for _, line := range strings.Split(out.Stdout, "\n") {
 		path, ok := porcelainPath(line)

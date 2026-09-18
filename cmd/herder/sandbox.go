@@ -17,6 +17,7 @@ import (
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // execOutputCap bounds sandbox.exec event payloads: full output goes to
@@ -85,11 +86,7 @@ func sandboxSetup(path string, ew io.Writer) (*config.Config, *storage.Store, *s
 	if store == nil {
 		return nil, nil, nil
 	}
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) {
-		fmt.Fprintf(ew, format+"\n", args...)
-	}
-	return cfg, store, provider
+	return cfg, store, newProvider(ew)
 }
 
 // specForTask builds the provision spec from the task plus its repo and
@@ -251,7 +248,7 @@ func sandboxExec(path string, args []string, w, ew io.Writer) int {
 	if task != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"command": cmd, "exit_code": res.ExitCode,
-			"output": truncate(res.Stdout+res.Stderr, execOutputCap),
+			"output": textutil.Truncate(res.Stdout+res.Stderr, execOutputCap),
 		})
 		if _, err := store.AppendEvent(task.ID, "sandbox.exec", "controller", "cli", string(payload)); err != nil {
 			fmt.Fprintf(ew, "herder: record exec event: %v\n", err)
@@ -401,12 +398,4 @@ func sandboxOneID(path string, args []string, w, ew io.Writer, verb, done string
 	}
 	fmt.Fprintf(w, "herder: sandbox %s %s\n", container, done)
 	return 0
-}
-
-// truncate keeps event payloads bounded while marking the cut.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "...(truncated)"
 }

@@ -43,12 +43,9 @@ const startTimeout = 2 * time.Minute
 // taskStart launches the task's agent through Herdr into its ready sandbox
 // and records the durable task-sandbox-session link. Purpose: turn a queued
 // task into a watchable session (issue #4 acceptance core). Flow: state
-// gate -> resolve profile -> sandbox inspect reports running -> build the
-// seed prompt -> reuse a live session (re-seeded unless the task already
-// runs) or launch -> bind -> RUNNING -> agent.started event. Unknown task
-// profiles or agent kinds fail the task with agent.start_failed instead of
-// hanging; an unknown --agent override is an operator typo and leaves the
-// task alone.
+// gate -> launchTask. Unknown task profiles or agent kinds fail the task
+// with agent.start_failed instead of hanging; an unknown --agent override
+// is an operator typo and leaves the task alone.
 func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(ew)
@@ -59,10 +56,6 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	if fs.NArg() != 1 {
 		fmt.Fprintf(ew, "herder: usage: herder task start [--agent P] <id>\n")
 		return 2
-	}
-	provider := sandbox.NewDockerProvider()
-	provider.Log = func(format string, args ...any) {
-		fmt.Fprintf(ew, format+"\n", args...)
 	}
 	task, err := store.GetTask(fs.Arg(0))
 	if err != nil {
@@ -80,26 +73,37 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	// every failure path can probe session liveness before clearing a link.
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
+	return launchTask(ctx, cfg, store, &task, *override, "", w, ew)
+}
+
+// launchTask runs the shared launch flow behind start, retry, and
+// handoff: resolve profile -> sandbox inspect reports running -> build
+// the seed prompt -> reuse a live session (re-seeded unless the task
+// already runs) or launch -> bind -> RUNNING -> agent.started event.
+// priorAgent names the previous worker on a handoff so the prompt tells
+// the new agent it inherits existing work instead of starting cold.
+func launchTask(ctx context.Context, cfg *config.Config, store *storage.Store, task *tasks.Task, override, priorAgent string, w, ew io.Writer) int {
+	provider := newProvider(ew)
 	launcher := &agent.Launcher{}
 	repo, ok := cfg.Repositories[task.Repository]
 	if !ok {
-		return failTaskStart(ctx, launcher, store, &task, fmt.Sprintf("repository %q not in config", task.Repository), ew)
+		return failTaskStart(ctx, launcher, store, task, fmt.Sprintf("repository %q not in config", task.Repository), ew)
 	}
 	// One policy owns profile selection (agent.ResolveProfile): explicit
 	// override, then the task's claimed profile, then the repo default. An
 	// unknown override is an operator typo and leaves the task alone; an
 	// unresolvable task profile fails the task with a clear event.
-	profileName, prof, ok := agent.ResolveProfile(cfg, task.Repository, task.AgentProfile, *override)
+	profileName, prof, ok := agent.ResolveProfile(cfg, task.Repository, task.AgentProfile, override)
 	if !ok {
-		if *override != "" {
-			fmt.Fprintf(ew, "herder: agent profile %q unknown\n", *override)
+		if override != "" {
+			fmt.Fprintf(ew, "herder: agent profile %q unknown\n", override)
 			return 1
 		}
-		return failTaskStart(ctx, launcher, store, &task,
+		return failTaskStart(ctx, launcher, store, task,
 			fmt.Sprintf("agent profile %q unknown and no usable default", task.AgentProfile), ew)
 	}
 	if _, ok := agent.CommandForKind(prof.Kind); !ok {
-		return failTaskStart(ctx, launcher, store, &task, fmt.Sprintf("unknown agent kind %q", prof.Kind), ew)
+		return failTaskStart(ctx, launcher, store, task, fmt.Sprintf("unknown agent kind %q", prof.Kind), ew)
 	}
 	container := sandbox.ContainerName(task.ID)
 	sb, err := provider.Inspect(ctx, container)
@@ -118,15 +122,16 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	// The deterministic worker branch: claimed when set, else herder/<issue>.
 	// The prompt is built before the reuse/launch decision because a reused
 	// session on a not-yet-running task is re-seeded with the same contract.
-	task.BranchName = branchForTask(task)
+	task.BranchName = branchForTask(*task)
 	prompt := agent.BuildPrompt(agent.PromptInput{
-		Task: task, AgentKind: prof.Kind, ProfileName: profileName,
+		Task: *task, AgentKind: prof.Kind, ProfileName: profileName,
 		Repo:             repo,
 		RepoInstructions: agent.LoadRepoInstructions(workspace),
 		SandboxID:        container, Workspace: workspace,
+		PriorAgent: priorAgent,
 	})
 	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.AgentSessionID) {
-		return reuseSession(ctx, launcher, store, &task, repo, prompt, map[string]any{
+		return reuseSession(ctx, launcher, store, task, repo, prompt, map[string]any{
 			"session": task.AgentSessionID, "kind": prof.Kind, "profile": profileName,
 			"sandbox": container, "reused": true,
 		}, ew)
@@ -142,16 +147,21 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		if bindErr := store.SetBinding(task.ID, container, session); bindErr == nil {
 			task.AgentSessionID = session
 		}
-		return failTaskStart(ctx, launcher, store, &task, err.Error(), ew)
+		return failTaskStart(ctx, launcher, store, task, err.Error(), ew)
 	}
 	// Bind only after the pane exists: a failed Start leaves no session
 	// name behind for attach to resolve. A bind failure still fails the
 	// task, and the reason names the orphaned session for manual recovery.
 	if err := store.SetBinding(task.ID, container, session); err != nil {
-		return failTaskStart(ctx, launcher, store, &task,
+		return failTaskStart(ctx, launcher, store, task,
 			fmt.Sprintf("session %s started but binding failed: %v", session, err), ew)
 	}
-	if err := advanceToRunning(store, &task, true); err != nil {
+	// "starting" is the one normalized state Herder mints itself: Herdr's
+	// first detection report lands on the next supervisor poll.
+	if _, err := store.RecordAgentState(task.ID, tasks.AgentStarting, "controller", "cli"); err != nil {
+		fmt.Fprintf(ew, "herder: record agent state: %v\n", err)
+	}
+	if err := advanceToRunning(store, task, true); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -164,7 +174,7 @@ func taskStart(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	}
 	// The issue's stage label moves to running once the agent is live;
 	// best-effort so a missing gh never blocks a launch.
-	markIssueRunning(store, &task, repo, ew)
+	markIssueRunning(store, task, repo, ew)
 	fmt.Fprintf(w, "herder: agent %s started for %s in session %s (pane %s)\n",
 		prof.Kind, task.ID, session, res.PaneID)
 	return 0
@@ -218,6 +228,9 @@ func failTaskStart(ctx context.Context, launcher *agent.Launcher, store *storage
 	if task.AgentSessionID != "" && !launcher.IsLive(ctx, task.AgentSessionID) {
 		if err := store.ClearSessionBinding(task.ID); err != nil {
 			fmt.Fprintf(ew, "herder: clear stale session binding: %v\n", err)
+		}
+		if _, err := store.RecordAgentState(task.ID, tasks.AgentUnknown, "controller", "cli"); err != nil {
+			fmt.Fprintf(ew, "herder: record agent state: %v\n", err)
 		}
 	}
 	if _, err := store.Transition(task.ID, tasks.Failed, "controller", "cli"); err != nil {

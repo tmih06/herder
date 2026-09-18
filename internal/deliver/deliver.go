@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/tmih06/herder/internal/sandbox"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // Runner runs one host-side subprocess; satisfied by
@@ -69,7 +70,7 @@ func (e *Engine) PushBranch(ctx context.Context, workspace, repo, branch, wantSH
 	if out, err := e.run(ctx, "git", cleanGit("init", "--bare")...); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: init staging repo: %s", sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: init staging repo: %s", textutil.FirstLine(out.Stderr))
 	}
 	// refs/heads/ qualifies the refspec: an unqualified name resolves a
 	// same-named tag first, and the workspace's refs are agent-writable.
@@ -77,14 +78,14 @@ func (e *Engine) PushBranch(ctx context.Context, workspace, repo, branch, wantSH
 		cleanGit("fetch", "--no-tags", workspace, "refs/heads/"+branch)...); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: fetch %s: %s", branch, sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: fetch %s: %s", branch, textutil.FirstLine(out.Stderr))
 	}
 	out, err := e.run(ctx, "git", "-C", staging, "rev-parse", "FETCH_HEAD")
 	if err != nil {
 		return err
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: resolve fetched head: %s", sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: resolve fetched head: %s", textutil.FirstLine(out.Stderr))
 	}
 	sha := strings.TrimSpace(out.Stdout)
 	if wantSHA != "" && sha != wantSHA {
@@ -97,7 +98,7 @@ func (e *Engine) PushBranch(ctx context.Context, workspace, repo, branch, wantSH
 		"push", remote, sha+":refs/heads/"+branch)...); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: push %s: %s", branch, sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: push %s: %s", branch, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -113,7 +114,7 @@ func (e *Engine) BranchSHA(ctx context.Context, workspace, branch string) (strin
 		return "", err
 	}
 	if out.ExitCode != 0 {
-		return "", fmt.Errorf("deliver: resolve %s: %s", branch, sandbox.FirstLine(out.Stderr))
+		return "", fmt.Errorf("deliver: resolve %s: %s", branch, textutil.FirstLine(out.Stderr))
 	}
 	return strings.TrimSpace(out.Stdout), nil
 }
@@ -136,7 +137,7 @@ func (e *Engine) CreatePR(ctx context.Context, repo, branch, title, body string)
 	if url, found := e.findPR(ctx, repo, branch); found {
 		return url, nil
 	}
-	return "", fmt.Errorf("deliver: create PR for %s: %s", branch, sandbox.FirstLine(out.Stderr))
+	return "", fmt.Errorf("deliver: create PR for %s: %s", branch, textutil.FirstLine(out.Stderr))
 }
 
 // findPR returns the OPEN PR URL for branch, or found=false. A closed or
@@ -174,7 +175,7 @@ func (e *Engine) CommentIssue(ctx context.Context, repo string, issue int, body,
 		// caller leaves the task in DELIVERING and a rerun resumes instead
 		// of double-commenting.
 		if out.ExitCode != 0 {
-			return fmt.Errorf("deliver: read comments on #%d: %s", issue, sandbox.FirstLine(out.Stderr))
+			return fmt.Errorf("deliver: read comments on #%d: %s", issue, textutil.FirstLine(out.Stderr))
 		}
 		if strings.Contains(out.Stdout, marker) {
 			return nil
@@ -186,7 +187,7 @@ func (e *Engine) CommentIssue(ctx context.Context, repo string, issue int, body,
 		return err
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: comment issue #%d: %s", issue, sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: comment issue #%d: %s", issue, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -213,7 +214,7 @@ func (e *Engine) SetLabels(ctx context.Context, repo string, issue int, add, rem
 		return err
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("deliver: label issue #%d: %s", issue, sandbox.FirstLine(out.Stderr))
+		return fmt.Errorf("deliver: label issue #%d: %s", issue, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
@@ -230,7 +231,7 @@ func (e *Engine) IssueLabels(ctx context.Context, repo string, issue int) ([]str
 		return nil, err
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("deliver: read labels on #%d: %s", issue, sandbox.FirstLine(out.Stderr))
+		return nil, fmt.Errorf("deliver: read labels on #%d: %s", issue, textutil.FirstLine(out.Stderr))
 	}
 	var labels []string
 	for _, line := range strings.Split(out.Stdout, "\n") {

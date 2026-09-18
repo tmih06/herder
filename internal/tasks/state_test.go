@@ -58,6 +58,12 @@ func TestInterventionLoop(t *testing.T) {
 		{Paused, Running},
 		{Failed, Retrying},
 		{Retrying, Queued},
+		// issue #5: a human can retry a live, blocked, waiting, or frozen
+		// task — retry is not reserved for failures.
+		{Running, Retrying},
+		{Blocked, Retrying},
+		{WaitingForHuman, Retrying},
+		{Paused, Retrying},
 	}
 	for _, p := range pairs {
 		if err := ValidateTransition(p[0], p[1]); err != nil {

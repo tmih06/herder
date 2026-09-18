@@ -60,6 +60,7 @@ echo "herdr $@" >> "$STATE/calls"
 case "$1 $2" in
 "agent get")
   [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
+  echo "{\"result\":{\"agent\":{\"agent\":\"codex\",\"agent_status\":\"working\",\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
   ;;
 "agent send")
   printf '%s' "$4" >> "$STATE/prompt-$3"

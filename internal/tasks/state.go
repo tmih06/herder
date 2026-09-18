@@ -16,6 +16,7 @@ package tasks
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -49,6 +50,18 @@ const (
 	Paused          State = "PAUSED"
 )
 
+// Normalized agent states (SPEC section 19): the Herdr-reported worker
+// condition recorded on the owning task. AgentStarting is minted by Herder
+// at launch, before Herdr's first detection report lands.
+const (
+	AgentStarting = "starting"
+	AgentWorking  = "working"
+	AgentIdle     = "idle"
+	AgentBlocked  = "blocked"
+	AgentDone     = "done"
+	AgentUnknown  = "unknown"
+)
+
 // Event types minted by this package.
 const (
 	// EventCreated marks task creation.
@@ -60,6 +73,22 @@ const (
 	// EventWebhookDuplicate records a deduplicated redelivery on the
 	// surviving task so repeats stay visible instead of silent.
 	EventWebhookDuplicate = "webhook.duplicate"
+	// EventAgentStateChanged records one normalized agent-state change on
+	// the owning task (SPEC sections 19, 58: agent.state_changed).
+	EventAgentStateChanged = "agent.state_changed"
+	// EventRetry records a fresh attempt with the incremented counter.
+	EventRetry = "task.retry"
+	// EventHandoff records a worker change that preserves task history and
+	// sandbox work (SPEC section 22: handoff).
+	EventHandoff = "agent.handed_off"
+	// EventAgentBlocked records a blocked worker with its reason.
+	EventAgentBlocked = "agent.blocked"
+	// EventAgentExited records a bound session that stopped answering.
+	EventAgentExited = "agent.exited"
+	// EventAgentPrompted records a human message sent to the live worker.
+	EventAgentPrompted = "agent.prompted"
+	// EventAgentStopped records a human-driven session close.
+	EventAgentStopped = "agent.stopped"
 )
 
 // State is a task lifecycle state.
@@ -74,14 +103,14 @@ var allowed = map[State][]State{
 	Claimed:         {Queued, Cancelled, Failed},
 	Queued:          {Provisioning, Paused, Cancelled, Failed},
 	Provisioning:    {Running, Retrying, Cancelled, Failed},
-	Running:         {Validating, Blocked, WaitingForHuman, Paused, TimedOut, Cancelled, Failed},
+	Running:         {Validating, Blocked, WaitingForHuman, Paused, Retrying, TimedOut, Cancelled, Failed},
 	Validating:      {Reviewing, WaitingForHuman, Retrying, Cancelled, Failed},
 	Reviewing:       {Delivering, Validating, Done, WaitingForHuman, Retrying, Cancelled, Failed},
 	Delivering:      {PROpen, Validating, Reviewing, Retrying, Cancelled, Failed},
 	PROpen:          {Done, Cancelled, Failed},
-	Blocked:         {Running, Cancelled, Failed},
-	WaitingForHuman: {Running, Reviewing, Cancelled, Failed},
-	Paused:          {Queued, Running, Cancelled},
+	Blocked:         {Running, Retrying, Cancelled, Failed},
+	WaitingForHuman: {Running, Reviewing, Retrying, Cancelled, Failed},
+	Paused:          {Queued, Running, Retrying, Cancelled},
 	Retrying:        {Queued, Provisioning, Running, Cancelled, Failed},
 	Failed:          {Retrying, Cancelled},
 	Done:            {},
@@ -93,7 +122,9 @@ var allowed = map[State][]State{
 // goal text seeded into the agent prompt. AgentSessionID names the
 // live Herdr agent session (empty until the agent launches) and SandboxID
 // names the worker container; together they are the durable
-// task <-> sandbox <-> session link from SPEC section 18.
+// task <-> sandbox <-> session link from SPEC section 18. AgentState is
+// the normalized Herdr-reported worker condition (empty until the
+// supervision loop observes the session).
 type Task struct {
 	ID             string
 	SourceProvider string
@@ -105,6 +136,7 @@ type Task struct {
 	BranchName     string
 	AgentSessionID string
 	SandboxID      string
+	AgentState     string
 	Attempt        int
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
@@ -195,7 +227,7 @@ func ApplyTransition(task *Task, to State, actorType, actorID string) (Event, er
 		Type:      EventTransition,
 		ActorType: actorType,
 		ActorID:   actorID,
-		Payload:   fmt.Sprintf(`{"from":%q,"to":%q}`, string(from), string(to)),
+		Payload:   EventPayload(map[string]string{"from": string(from), "to": string(to)}),
 		CreatedAt: now,
 	}, nil
 }
@@ -210,10 +242,23 @@ func CreatedEvent(task Task, actorType, actorID string) Event {
 		Type:      EventCreated,
 		ActorType: actorType,
 		ActorID:   actorID,
-		Payload: fmt.Sprintf(`{"source_ref":%q,"repository":%q,"agent_profile":%q}`,
-			task.SourceRef, task.Repository, task.AgentProfile),
+		Payload: EventPayload(map[string]string{
+			"source_ref": task.SourceRef,
+			"repository": task.Repository, "agent_profile": task.AgentProfile,
+		}),
 		CreatedAt: task.CreatedAt,
 	}
+}
+
+// EventPayload renders an event payload as real JSON: fmt %q quoting is
+// Go syntax, not JSON, and can store payloads that fail to parse.
+// Returns "{}" only when the value itself cannot marshal.
+func EventPayload(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // hexID returns n random bytes as hex for task identity.

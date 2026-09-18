@@ -20,15 +20,18 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/textutil"
 )
 
 // instructionCap bounds repository instructions embedded in the prompt: the
@@ -99,6 +102,8 @@ func ResolveProfile(cfg *config.Config, repoName, taskProfile, override string) 
 
 // PromptInput bundles everything BuildPrompt needs:
 // the resolved agent, repo policy, and the live sandbox handles.
+// PriorAgent names the previous worker profile on a handoff so the new
+// agent knows it inherits existing work instead of starting cold.
 type PromptInput struct {
 	Task             tasks.Task
 	AgentKind        string
@@ -107,6 +112,7 @@ type PromptInput struct {
 	RepoInstructions string
 	SandboxID        string
 	Workspace        string
+	PriorAgent       string
 }
 
 // BuildPrompt renders the seed prompt for one worker (SPEC section 36):
@@ -124,6 +130,11 @@ func BuildPrompt(in PromptInput) string {
 	}
 	fmt.Fprintf(&b, "Implement the work for issue %s (%s) in repository %s.\n",
 		in.Task.SourceRef, in.Task.SourceProvider, in.Task.Repository)
+	if in.PriorAgent != "" {
+		fmt.Fprintf(&b, "This task was handed off from agent profile %s: its work and history are already in this workspace — continue it, do not restart.\n", in.PriorAgent)
+	} else if in.Task.Attempt > 1 {
+		fmt.Fprintf(&b, "This is attempt %d: earlier attempts may have left work in this workspace — continue it, do not restart.\n", in.Task.Attempt)
+	}
 	fmt.Fprintf(&b, "Work on branch %s. Keep the change focused on the issue.\n\n", in.Task.BranchName)
 	b.WriteString("## Issue metadata\n\n")
 	fmt.Fprintf(&b, "- Task: %s (attempt %d)\n", in.Task.ID, in.Task.Attempt)
@@ -270,7 +281,7 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		return StartResult{}, fmt.Errorf("agent: start %s: %w", in.Session, err)
 	}
 	if out.ExitCode != 0 {
-		return StartResult{}, fmt.Errorf("agent: start %s: %s", in.Session, firstLine(out.Stderr))
+		return StartResult{}, fmt.Errorf("agent: start %s: %s", in.Session, textutil.FirstLine(out.Stderr))
 	}
 	paneID, workspaceID := parseStartResult(out.Stdout)
 	if err := l.SendPrompt(ctx, in.Session, in.Prompt); err != nil {
@@ -293,17 +304,149 @@ func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error
 		return fmt.Errorf("agent: send prompt to %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("agent: send prompt to %s: %s", session, firstLine(out.Stderr))
+		return fmt.Errorf("agent: send prompt to %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	return nil
 }
+
+// AgentInfo is the parsed `agent get` report for one live session: the
+// normalized status Herdr detected plus the pane identity needed to stop
+// or attach the worker.
+type AgentInfo struct {
+	Status string
+	PaneID string
+}
+
+// Get resolves one live Herdr session: exit 0 from `agent get` parses the
+// agent record; an agent_not_found answer means the session is gone or
+// never existed (ErrSessionGone), while any other failure — including a
+// Herdr outage — is a plain error so callers can tell "dead" from
+// "Herdr unreachable".
+func (l *Launcher) Get(ctx context.Context, session string) (AgentInfo, error) {
+	out, err := l.runner()(ctx, "herdr", "agent", "get", session)
+	if err != nil {
+		return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, err)
+	}
+	if out.ExitCode != 0 {
+		if strings.Contains(out.Stderr, "agent_not_found") ||
+			strings.Contains(out.Stdout, "agent_not_found") {
+			return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
+		}
+		return AgentInfo{}, fmt.Errorf("agent: get %s: %s", session, textutil.FirstLine(out.Stderr))
+	}
+	var parsed struct {
+		Result struct {
+			Agent struct {
+				Status string `json:"agent_status"`
+				PaneID string `json:"pane_id"`
+			} `json:"agent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil {
+		return AgentInfo{}, fmt.Errorf("agent: get %s: unreadable output", session)
+	}
+	return AgentInfo{
+		Status: parsed.Result.Agent.Status,
+		PaneID: parsed.Result.Agent.PaneID,
+	}, nil
+}
+
+// ErrSessionGone reports a Herdr session that no longer answers: the pane
+// exited or Herdr never tracked it. Callers clear the binding instead of
+// retrying a dead name.
+var ErrSessionGone = errors.New("session gone")
 
 // IsLive reports whether a Herdr session still answers: exit 0 from
 // `agent get` means the pane exists and Herdr tracks it. Transport errors
 // read as not-live; the subsequent Start surfaces the real cause.
 func (l *Launcher) IsLive(ctx context.Context, session string) bool {
-	out, err := l.runner()(ctx, "herdr", "agent", "get", session)
-	return err == nil && out.ExitCode == 0
+	_, err := l.Get(ctx, session)
+	return err == nil
+}
+
+// Read returns the agent's recent terminal output via `agent read`:
+// the human-facing tail behind `herder task logs` and the blocked-reason
+// snippet behind supervisor notifications. Inputs: session name and the
+// number of recent lines to keep. Returns the text, or a wrapped error
+// when the session is unreadable.
+func (l *Launcher) Read(ctx context.Context, session string, lines int) (string, error) {
+	out, err := l.runner()(ctx, "herdr", "agent", "read", session,
+		"--lines", strconv.Itoa(lines))
+	if err != nil {
+		return "", fmt.Errorf("agent: read %s: %w", session, err)
+	}
+	if out.ExitCode != 0 {
+		return "", fmt.Errorf("agent: read %s: %s", session, textutil.FirstLine(out.Stderr))
+	}
+	var parsed struct {
+		Result struct {
+			Read struct {
+				Text string `json:"text"`
+			} `json:"read"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil {
+		return "", fmt.Errorf("agent: read %s: unreadable output", session)
+	}
+	return parsed.Result.Read.Text, nil
+}
+
+// Stop ends one live Herdr session by closing its pane: the agent process
+// dies with the pane while the sandbox and workspace stay intact for
+// inspection or a fresh attempt. A session that is already gone is a
+// no-op — the desired end state holds either way.
+func (l *Launcher) Stop(ctx context.Context, session string) error {
+	info, err := l.Get(ctx, session)
+	if err != nil {
+		if errors.Is(err, ErrSessionGone) {
+			return nil
+		}
+		return err
+	}
+	if info.PaneID == "" {
+		return fmt.Errorf("agent: stop %s: session has no pane id", session)
+	}
+	out, err := l.runner()(ctx, "herdr", "pane", "close", info.PaneID)
+	if err != nil {
+		return fmt.Errorf("agent: stop %s: %w", session, err)
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("agent: stop %s: %s", session, textutil.FirstLine(out.Stderr))
+	}
+	return nil
+}
+
+// Notify raises a human-visible Herdr notification (SPEC section 61):
+// the supervision loop's channel for blocked, finished, and exited
+// workers. A notification failure is returned so the caller can log it,
+// but it must never gate the state change it announces.
+func (l *Launcher) Notify(ctx context.Context, title, body string) error {
+	args := []string{"notification", "show", title}
+	if strings.TrimSpace(body) != "" {
+		args = append(args, "--body", body)
+	}
+	out, err := l.runner()(ctx, "herdr", args...)
+	if err != nil {
+		return fmt.Errorf("agent: notify %q: %w", title, err)
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("agent: notify %q: %s", title, textutil.FirstLine(out.Stderr))
+	}
+	return nil
+}
+
+// NormalizeState maps a Herdr-reported agent_status onto Herder's
+// normalized vocabulary (SPEC section 19). Herdr already reports the same
+// words; anything unrecognized — including the empty string — normalizes
+// to unknown instead of leaking a foreign token into task state.
+func NormalizeState(reported string) string {
+	switch strings.ToLower(strings.TrimSpace(reported)) {
+	case tasks.AgentStarting, tasks.AgentWorking, tasks.AgentIdle,
+		tasks.AgentBlocked, tasks.AgentDone:
+		return strings.ToLower(strings.TrimSpace(reported))
+	default:
+		return tasks.AgentUnknown
+	}
 }
 
 // AttachArgv builds the glass-box attach entry: the human lands in the
@@ -337,12 +480,4 @@ func (l *Launcher) runner() Runner {
 		return l.Runner
 	}
 	return DefaultRunner
-}
-
-// firstLine keeps launch errors to one actionable line.
-func firstLine(s string) string {
-	if line, _, ok := strings.Cut(s, "\n"); ok {
-		return strings.TrimSpace(line)
-	}
-	return strings.TrimSpace(s)
 }
