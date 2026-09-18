@@ -18,6 +18,12 @@ github:
 
 scheduler:
   max_workers: 4
+  per_repository:
+    tmih06/meltiply: 3
+  per_agent:
+    codex: 4
+  lease_ttl: 2m
+  dispatch_interval: 2s
 
 repositories:
   tmih06/meltiply:

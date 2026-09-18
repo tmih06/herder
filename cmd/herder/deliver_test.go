@@ -9,6 +9,7 @@ import (
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 )
@@ -126,7 +127,7 @@ func runningTask(t *testing.T, cfgPath, state string, live bool) (id, workspace 
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspace = sandbox.WorkspacePath(sandboxRoot(cfg.Database.Path), id)
+	workspace = sandbox.WorkspacePath(dispatch.SandboxRoot(cfg.Database.Path), id)
 	if err := os.MkdirAll(workspace, 0o750); err != nil {
 		t.Fatal(err)
 	}

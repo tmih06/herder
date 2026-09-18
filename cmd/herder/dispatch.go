@@ -1,0 +1,23 @@
+package main
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/tmih06/herder/internal/dispatch"
+	"github.com/tmih06/herder/internal/storage"
+)
+
+// newDispatcher builds the shared dispatch engine for one CLI verb:
+// info lines land on w, non-fatal warnings on ew, and the Docker
+// provider logs through the same ew seam newProvider uses. The daemon
+// wires its own dispatcher (owner "daemon") instead of this one.
+func newDispatcher(store *storage.Store, w, ew io.Writer) *dispatch.Dispatcher {
+	return &dispatch.Dispatcher{
+		Store:    store,
+		Provider: newProvider(ew),
+		Owner:    "cli",
+		Logf:     func(format string, args ...any) { fmt.Fprintf(w, format+"\n", args...) },
+		Warnf:    func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) },
+	}
+}

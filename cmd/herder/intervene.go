@@ -204,7 +204,7 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	if err := newDispatcher(store, w, ew).StopWorker(ctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -244,7 +244,8 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	d := newDispatcher(store, w, ew)
+	if err := d.StopWorker(ctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -257,7 +258,11 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		return code
 	}
 	fmt.Fprintf(w, "herder: task %s retrying (attempt %d)\n", updated.ID, updated.Attempt)
-	return launchTask(ctx, cfg, store, &updated, "", "", w, ew)
+	if err := d.Launch(ctx, cfg, &updated, "", ""); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // taskHandoff moves the task to a different agent kind on a fresh attempt
@@ -298,7 +303,8 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	if code := guardRestart(&task, "handoff", ew); code != 0 {
 		return code
 	}
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	d := newDispatcher(store, w, ew)
+	if err := d.StopWorker(ctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -313,7 +319,11 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	}
 	fmt.Fprintf(w, "herder: task %s handed off %s -> %s (attempt %d)\n",
 		updated.ID, prior, *profile, updated.Attempt)
-	return launchTask(ctx, cfg, store, &updated, *profile, prior, w, ew)
+	if err := d.Launch(ctx, cfg, &updated, *profile, prior); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // oneTask resolves the single <id> argument shared by the intervention
@@ -338,26 +348,6 @@ func newProvider(ew io.Writer) *sandbox.DockerProvider {
 	provider := sandbox.NewDockerProvider()
 	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
 	return provider
-}
-
-// stopWorker ends the live session and thaws a paused container so a
-// stop, retry, or handoff never leaves a frozen agent behind. The thaw
-// happens before the pane close: a frozen agent survives `pane close`
-// and would wake on unpause as an orphan running the same task.
-// Inputs: bounded ctx, the task, and the error writer for provider logs.
-// Returns the first failure; a dead session is already the goal.
-func stopWorker(ctx context.Context, task *tasks.Task, ew io.Writer) error {
-	if task.Status == tasks.Paused {
-		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
-			return fmt.Errorf("thaw sandbox: %w", err)
-		}
-	}
-	if task.AgentSessionID != "" {
-		if err := (&agent.Launcher{}).Stop(ctx, task.AgentSessionID); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // guardRestart validates the RETRYING transition shared by retry and

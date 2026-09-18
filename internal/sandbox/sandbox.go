@@ -93,6 +93,9 @@ type Sandbox struct {
 	Image string
 	// Status is the engine status (running, exited, ...).
 	Status string
+	// OOMKilled is the engine-reported OOM kill so the scheduler can
+	// attribute a resource-limit failure.
+	OOMKilled bool
 	// Branch is the checked-out worker branch.
 	Branch string
 	// Workspace is the host checkout mounted at /workspace.

@@ -277,7 +277,8 @@ type inspectJSON struct {
 		Image string `json:"Image"`
 	} `json:"Config"`
 	State struct {
-		Status string `json:"Status"`
+		Status    string `json:"Status"`
+		OOMKilled bool   `json:"OOMKilled"`
 	} `json:"State"`
 	Mounts []struct {
 		Source      string `json:"Source"`
@@ -309,6 +310,7 @@ func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, erro
 	sb := &Sandbox{
 		ID: strings.TrimPrefix(info.Name, "/"), ContainerID: info.ID,
 		Image: info.Config.Image, Status: info.State.Status,
+		OOMKilled: info.State.OOMKilled,
 	}
 	for _, m := range info.Mounts {
 		if m.Destination == "/workspace" {

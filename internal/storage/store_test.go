@@ -36,6 +36,7 @@ func createInputWithRef(ref string) CreateInput {
 		SourceRef:      ref,
 		Repository:     "acme/web",
 		AgentProfile:   "codex-default",
+		Priority:       3,
 		ActorType:      "controller",
 		ActorID:        "test",
 	}
@@ -77,6 +78,9 @@ func TestDurabilityAcrossReopen(t *testing.T) {
 	}
 	if got.SourceRef != "acme/web#7" || got.AgentProfile != "codex-default" {
 		t.Errorf("task fields did not survive reopen: %+v", got)
+	}
+	if got.Priority != 3 {
+		t.Errorf("priority after reopen = %d, want 3", got.Priority)
 	}
 
 	events, err := reopened.ListEvents(created.ID)

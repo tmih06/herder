@@ -89,6 +89,22 @@ const (
 	EventAgentPrompted = "agent.prompted"
 	// EventAgentStopped records a human-driven session close.
 	EventAgentStopped = "agent.stopped"
+	// EventLeaseAcquired records a dispatch lease granted to an owner.
+	EventLeaseAcquired = "lease.acquired"
+	// EventLeaseReleased records a dispatch lease returned on completion.
+	EventLeaseReleased = "lease.released"
+	// EventLeaseExpired records a dead owner's lease returning the task to
+	// the queue (SPEC section 50: expired leases requeue, never strand).
+	EventLeaseExpired = "lease.expired"
+	// EventDispatchFailed records a dispatch attempt that failed before the
+	// agent launched; the task returns to QUEUED for a later attempt.
+	EventDispatchFailed = "task.dispatch_failed"
+	// EventWorkerDisconnected marks a worker whose session or sandbox is
+	// gone at reconcile time (SPEC section 48: recovery policy).
+	EventWorkerDisconnected = "worker.disconnected"
+	// EventTaskTimedOut records a worker stopped for exceeding its
+	// configured agent timeout (SPEC section 15: time limits enforced).
+	EventTaskTimedOut = "task.timed_out"
 )
 
 // State is a task lifecycle state.
@@ -102,13 +118,13 @@ var allowed = map[State][]State{
 	Eligible:        {Claimed, Cancelled, Failed},
 	Claimed:         {Queued, Cancelled, Failed},
 	Queued:          {Provisioning, Paused, Cancelled, Failed},
-	Provisioning:    {Running, Retrying, Cancelled, Failed},
+	Provisioning:    {Running, Queued, Retrying, Cancelled, Failed},
 	Running:         {Validating, Blocked, WaitingForHuman, Paused, Retrying, TimedOut, Cancelled, Failed},
 	Validating:      {Reviewing, WaitingForHuman, Retrying, Cancelled, Failed},
 	Reviewing:       {Delivering, Validating, Done, WaitingForHuman, Retrying, Cancelled, Failed},
 	Delivering:      {PROpen, Validating, Reviewing, Retrying, Cancelled, Failed},
 	PROpen:          {Done, Cancelled, Failed},
-	Blocked:         {Running, Retrying, Cancelled, Failed},
+	Blocked:         {Running, Retrying, TimedOut, Cancelled, Failed},
 	WaitingForHuman: {Running, Reviewing, Retrying, Cancelled, Failed},
 	Paused:          {Queued, Running, Retrying, Cancelled},
 	Retrying:        {Queued, Provisioning, Running, Cancelled, Failed},
@@ -137,9 +153,15 @@ type Task struct {
 	AgentSessionID string
 	SandboxID      string
 	AgentState     string
-	Attempt        int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// Priority orders the dispatch queue: higher runs first, ties break on
+	// CreatedAt (FIFO-plus-priority, SPEC section 15).
+	Priority int
+	// StartedAt stamps the latest entry into RUNNING: the agent timeout
+	// measures wall-clock work from here, not from task creation.
+	StartedAt time.Time
+	Attempt   int
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Event is the in-memory form of one row in task_events.
@@ -155,13 +177,14 @@ type Event struct {
 
 // NewInput carries the fields New needs to seed a task: source identity,
 // repository, agent profile, and the issue goal text seeded into the
-// agent prompt.
+// agent prompt. Priority orders the dispatch queue (zero is normal).
 type NewInput struct {
 	SourceProvider string
 	SourceRef      string
 	Repository     string
 	AgentProfile   string
 	Goal           string
+	Priority       int
 }
 
 // New builds a DISCOVERED task with fresh identity and timestamps.
@@ -177,6 +200,7 @@ func New(in NewInput) Task {
 		Status:         Discovered,
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
+		Priority:       in.Priority,
 		Attempt:        1,
 		CreatedAt:      now,
 		UpdatedAt:      now,

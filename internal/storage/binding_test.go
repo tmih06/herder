@@ -189,6 +189,9 @@ func TestLegacyDBMigration(t *testing.T) {
 	if got.AgentSessionID != "" || got.SandboxID != "" || got.Goal != "" {
 		t.Errorf("legacy task bindings and goal should read empty, got %+v", got)
 	}
+	if got.Priority != 0 || !got.StartedAt.IsZero() {
+		t.Errorf("legacy task scheduler fields should read zero, got %+v", got)
+	}
 	if err := store.SetBinding("task_legacy", "sbx-9", "sess-9"); err != nil {
 		t.Fatalf("migrated db should accept bindings: %v", err)
 	}
