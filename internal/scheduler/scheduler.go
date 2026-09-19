@@ -189,10 +189,13 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 
 // reconcile folds runtime truth into durable state for every task
 // holding a worker (SPEC section 48): a worker past its agent timeout
-// stops and lands TIMED_OUT, a bound session that vanished lands
-// WAITING_FOR_HUMAN, and a dead or OOM-killed sandbox disconnects or
-// fails the task. A task under a live dispatch lease is skipped
-// entirely: the lease owner is responsible until the lease lapses.
+// stops and lands TIMED_OUT, a dead or OOM-killed sandbox disconnects
+// or fails the task, and a bound session that vanished lands
+// WAITING_FOR_HUMAN. The sandbox verdict runs before the session check
+// so a kill that also took the session down still attributes the
+// resource-limit reason instead of a generic disconnect. A task under
+// a live dispatch lease is skipped entirely: the lease owner is
+// responsible until the lease lapses.
 // A PROVISIONING task with no live lease is an abandoned dispatch —
 // the owner died between Provision and Launch, or a manual provision
 // was left staged — so it requeues with a dispatch_failed event
@@ -233,15 +236,17 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 		if s.enforceTimeout(ctx, task) {
 			continue
 		}
+		if !s.checkSandbox(ctx, task) {
+			continue
+		}
 		if task.AgentSessionID == "" {
 			// The supervisor's agent.exited already cleared the binding;
-			// a session-less worker is a disconnected one (SPEC 48).
+			// a session-less worker on a healthy sandbox is a disconnected
+			// one (SPEC 48).
 			s.disconnect(task, "session gone", map[string]string{
 				"reason": "session gone", "session": "",
 			})
-			continue
 		}
-		s.checkSandbox(ctx, task)
 	}
 }
 
@@ -281,15 +286,17 @@ func (s *Scheduler) enforceTimeout(ctx context.Context, task *tasks.Task) bool {
 	return true
 }
 
-// checkSandbox reconciles one session-bound worker against the sandbox
-// provider: a missing container disconnects the worker, an OOM kill
-// fails the task with the resource-limit reason, and any other
-// non-running status waits for a human. An inspect error is uncertain —
-// logged and skipped, never acted on — and nothing here ever destroys
-// the sandbox or workspace (SPEC section 48).
-func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) {
+// checkSandbox reconciles one worker against the sandbox provider: a
+// missing container disconnects the worker, an OOM kill fails the task
+// with the resource-limit reason, and any other non-running status
+// waits for a human. An inspect error is uncertain — logged and
+// skipped, never acted on — and nothing here ever destroys the
+// sandbox or workspace (SPEC section 48). Returns true only when the
+// sandbox is confirmed running, so the caller may still check the
+// session binding; every other outcome already handled the task.
+func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 	if s.Dispatcher == nil || s.Dispatcher.Provider == nil {
-		return
+		return true
 	}
 	container := sandbox.ContainerName(task.ID)
 	sb, err := s.Dispatcher.Provider.Inspect(ctx, container)
@@ -299,10 +306,10 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) {
 			s.disconnect(task, "sandbox gone", map[string]string{
 				"reason": "sandbox gone", "sandbox": container,
 			})
-			return
+			return false
 		}
 		s.logf("herder: scheduler: reconcile %s: inspect %s: %v", task.ID, container, err)
-		return
+		return false
 	}
 	// OOMKilled is checked before the running status: the engine reports
 	// the kill on the dead container, and a kill is a resource-limit
@@ -311,20 +318,21 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) {
 		s.stopWorkerBestEffort(ctx, task)
 		if _, err := s.Store.Transition(task.ID, tasks.Failed, "controller", s.owner()); err != nil {
 			s.logf("herder: scheduler: reconcile %s: fail OOM task: %v", task.ID, err)
-			return
+			return false
 		}
 		s.appendDisconnectEvent(task, map[string]string{
 			"reason": "resource limit: container OOM-killed", "sandbox": container,
 		})
-		return
+		return false
 	}
 	if sb.Status == "running" {
-		return
+		return true
 	}
 	s.stopWorkerBestEffort(ctx, task)
 	s.disconnect(task, "sandbox "+sb.Status, map[string]string{
 		"reason": "sandbox " + sb.Status, "sandbox": container,
 	})
+	return false
 }
 
 // disconnect lands a workerless task WAITING_FOR_HUMAN and records why:

@@ -571,6 +571,88 @@ func TestOOMKilledSandboxFails(t *testing.T) {
 	}
 }
 
+// TestBlockedSessionGoneDisconnects proves a BLOCKED task whose session
+// binding is gone lands WAITING_FOR_HUMAN with worker.disconnected —
+// a blocked worker is still a worker, so losing its session follows the
+// same recovery policy as RUNNING.
+func TestBlockedSessionGoneDisconnects(t *testing.T) {
+	store := testStore(t)
+	cfg := testConfig()
+	rec := &recorder{respond: happyRespond}
+	s := newScheduler(store, cfg, rec)
+
+	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
+	if _, err := store.Transition(task.ID, tasks.Provisioning, "controller", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(task.ID, tasks.Running, "controller", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(task.ID, tasks.Blocked, "agent", "herder-"+task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// No SetBinding: the supervisor's agent.exited already cleared it.
+
+	s.Tick(context.Background())
+	waitDispatch(s)
+
+	if got := taskStatus(t, store, task.ID); got != tasks.WaitingForHuman {
+		t.Errorf("blocked session-less task = %s, want WAITING_FOR_HUMAN", got)
+	}
+	types := eventTypes(t, store, task.ID)
+	if !hasEvent(types, tasks.EventWorkerDisconnected) {
+		t.Errorf("want worker.disconnected event, got %v", types)
+	}
+}
+
+// TestOOMKilledAfterSessionClearedFails proves the resource-limit
+// verdict survives the supervisor clearing the binding first: an OOM
+// kill takes the agent down with the container, so the task must land
+// FAILED with the resource-limit reason, not WAITING_FOR_HUMAN with a
+// generic "session gone".
+func TestOOMKilledAfterSessionClearedFails(t *testing.T) {
+	store := testStore(t)
+	cfg := testConfig()
+	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+		argv := strings.Join(args, " ")
+		if name == "docker" && strings.HasPrefix(argv, "inspect ") {
+			return sandbox.RunResult{Stdout: inspectJSON("exited", true)}, nil
+		}
+		return happyRespond(name, args)
+	}}
+	s := newScheduler(store, cfg, rec)
+
+	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
+	if _, err := store.Transition(task.ID, tasks.Provisioning, "controller", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(task.ID, tasks.Running, "controller", "test"); err != nil {
+		t.Fatal(err)
+	}
+	// No SetBinding: the OOM kill took the session down with the
+	// container and the supervisor already cleared it.
+
+	s.Tick(context.Background())
+	waitDispatch(s)
+
+	if got := taskStatus(t, store, task.ID); got != tasks.Failed {
+		t.Errorf("OOM-killed session-less task = %s, want FAILED", got)
+	}
+	events, err := store.ListEvents(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reasoned bool
+	for _, e := range events {
+		if e.Type == tasks.EventWorkerDisconnected && strings.Contains(e.Payload, "resource limit") {
+			reasoned = true
+		}
+	}
+	if !reasoned {
+		t.Error("want worker.disconnected carrying the resource-limit reason")
+	}
+}
+
 // TestProvisionFailureBacksOff proves a failed provision requeues the
 // task with task.dispatch_failed and the retry backoff suppresses an
 // immediate second attempt: a tick inside RetryDelay runs no new
