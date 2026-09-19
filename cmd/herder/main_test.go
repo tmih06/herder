@@ -162,6 +162,28 @@ func TestTaskCreateGoalThroughCLI(t *testing.T) {
 	}
 }
 
+// TestTaskCreatePriorityThroughCLI lands --priority on the created task
+// and task inspect surfaces it for the operator.
+func TestTaskCreatePriorityThroughCLI(t *testing.T) {
+	path := writeTestConfig(t)
+	code, id, errOut := runCmd(t, "--config", path, "task", "create",
+		"--repo", "acme/web", "--source-ref", "acme/web#7",
+		"--priority", "5")
+	if code != 0 {
+		t.Fatalf("create exit = %d (%s)", code, errOut)
+	}
+	code, out, errOut := runCmd(t, "--config", path, "task", "inspect", strings.TrimSpace(id))
+	if code != 0 {
+		t.Fatalf("inspect exit = %d (%s)", code, errOut)
+	}
+	if !strings.Contains(out, "priority: 5") {
+		t.Errorf("inspect should print priority: 5, got %q", out)
+	}
+	if !strings.Contains(out, "started: -") {
+		t.Errorf("inspect should print started: - for a queued task, got %q", out)
+	}
+}
+
 // TestTaskCreateUnknownRepo create against an unconfigured repo fails naming the repo.
 func TestTaskCreateUnknownRepo(t *testing.T) {
 	path := writeTestConfig(t)

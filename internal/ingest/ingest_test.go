@@ -217,8 +217,9 @@ func TestHandleDisabledRepo(t *testing.T) {
 	}
 }
 
-// A breached concurrency cap denies without a task.
-func TestHandleCapDenied(t *testing.T) {
+// A burst beyond the worker cap still queues: concurrency caps belong to
+// the scheduler (issue #7), so Handle accepts every distinct issue.
+func TestHandleBurstStillQueues(t *testing.T) {
 	cfg, _, _ := testSetup(t)
 	cfg.Scheduler.MaxWorkers = 1
 
@@ -236,15 +237,18 @@ func TestHandleCapDenied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle = %v", err)
 	}
-	if out.Decision != storage.DecisionPolicyDenied || !strings.Contains(out.Reason, "concurrency cap") {
-		t.Errorf("cap breach must deny, got %+v", out)
+	if out.Decision != storage.DecisionAccepted {
+		t.Errorf("burst delivery must be accepted, got %+v", out)
+	}
+	if out.Task.Status != tasks.Queued {
+		t.Errorf("status = %s, want QUEUED", out.Task.Status)
 	}
 	found, err := store.ListTasks()
 	if err != nil {
 		t.Fatalf("ListTasks = %v", err)
 	}
-	if len(found) != 1 {
-		t.Fatalf("cap denial created a task: %d tasks", len(found))
+	if len(found) != 2 {
+		t.Fatalf("burst created %d tasks, want 2", len(found))
 	}
 }
 

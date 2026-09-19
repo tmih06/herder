@@ -6,7 +6,8 @@
 // instead of a second worker.
 // Approach: static policy from config (repository known and enabled,
 // trigger label present), then one atomic storage.Claim covering delivery
-// dedup, source dedup, the concurrency cap, and the insert. A mutex
+// dedup, source dedup, and the insert; concurrency caps belong to the
+// scheduler (issue #7), so bursts queue instead of being denied. A mutex
 // serializes same-process deliveries; UNIQUE rows cover sibling processes.
 // Inputs: IssueEvent deliveries plus the loaded config and open store.
 // Flow: Handle validates -> static gate -> Claim or RecordDenied.
@@ -70,7 +71,8 @@ func New(cfg *config.Config, store *storage.Store) *Handler {
 // ineligible or duplicate delivery becomes a logged non-event" holds.
 // Flow: validate identity -> unknown/disabled repository denied ->
 // missing trigger label denied -> atomic Claim (same-delivery and
-// same-issue redeliveries return duplicate, a breached cap is denied).
+// same-issue redeliveries return duplicate; bursts queue for the
+// scheduler's caps rather than being denied here).
 // Malformed events (no delivery id, repository, or issue number) are
 // caller errors, not denials: nothing durable can reference them.
 func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
@@ -125,7 +127,6 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
 		Goal:           goal,
-		MaxActive:      h.cfg.Scheduler.MaxWorkers,
 		PolicyPayload:  string(payload),
 		ActorType:      "controller",
 		ActorID:        "webhook",

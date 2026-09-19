@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/deliver"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -107,7 +107,7 @@ func gateOrRoute(ctx context.Context, cfg *config.Config, store *storage.Store,
 	provider *sandbox.DockerProvider, task *tasks.Task, repo config.RepositoryConfig,
 	w, ew io.Writer,
 ) (code int, ok bool) {
-	container, workspace, err := ensureSandbox(ctx, provider, task, sandboxRoot(cfg.Database.Path))
+	container, workspace, err := ensureSandbox(ctx, provider, task, dispatch.SandboxRoot(cfg.Database.Path))
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1, false
@@ -194,9 +194,9 @@ func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew 
 		// The review stage of the label path still applies: the work is
 		// validated and awaiting human review even without a PR.
 		if _, hasIssue := deliver.IssueNumber(task.SourceRef); hasIssue {
-			engine := &deliver.Engine{}
-			if err := advanceIssueLabels(ctx, engine, store, &task, repo,
-				repo.Delivery.LabelSet().Review, ew); err != nil {
+			d := newDispatcher(store, w, ew)
+			if err := d.AdvanceIssueLabels(ctx, &task, repo,
+				repo.Delivery.LabelSet().Review); err != nil {
 				fmt.Fprintf(ew, "herder: %v\n", err)
 				return 1
 			}
@@ -220,7 +220,7 @@ func taskWorkspace(ctx context.Context, cfg *config.Config, provider *sandbox.Do
 	if sb, err := provider.Inspect(ctx, container); err == nil && sb.Workspace != "" {
 		return sb.Workspace
 	}
-	return sandbox.WorkspacePath(sandboxRoot(cfg.Database.Path), task.ID)
+	return sandbox.WorkspacePath(dispatch.SandboxRoot(cfg.Database.Path), task.ID)
 }
 
 // validatedHead returns the HEAD SHA recorded by the most recent
@@ -258,7 +258,7 @@ func branchMoved(ctx context.Context, cfg *config.Config, provider *sandbox.Dock
 	}
 	workspace := taskWorkspace(ctx, cfg, provider, task)
 	engine := &deliver.Engine{}
-	sha, err := engine.BranchSHA(ctx, workspace, branchForTask(*task))
+	sha, err := engine.BranchSHA(ctx, workspace, dispatch.BranchForTask(*task))
 	if err != nil {
 		return false, err
 	}
@@ -304,7 +304,7 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 	// validated that directory, so that directory ships. The deterministic
 	// path is only a fallback when the container is already gone.
 	workspace := taskWorkspace(ctx, cfg, provider, task)
-	branch := branchForTask(*task)
+	branch := dispatch.BranchForTask(*task)
 	engine := &deliver.Engine{}
 	dctx, cancel := context.WithTimeout(ctx, deliverTimeout)
 	defer cancel()
@@ -344,8 +344,9 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 			map[string]any{"issue": issue, "pr": url}, ew); err != nil {
 			return 1
 		}
-		if err := advanceIssueLabels(dctx, engine, store, task, repo,
-			repo.Delivery.LabelSet().Review, ew); err != nil {
+		d := newDispatcher(store, w, ew)
+		if err := d.AdvanceIssueLabels(dctx, task, repo,
+			repo.Delivery.LabelSet().Review); err != nil {
 			return deliverFailed(store, task, err, ew)
 		}
 	}
@@ -380,9 +381,9 @@ func taskDone(cfg *config.Config, store *storage.Store, args []string, w, ew io.
 	ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
 	defer cancel()
 	if _, ok := deliver.IssueNumber(task.SourceRef); ok {
-		engine := &deliver.Engine{}
-		if err := advanceIssueLabels(ctx, engine, store, &task, repo,
-			repo.Delivery.LabelSet().Completed, ew); err != nil {
+		d := newDispatcher(store, w, ew)
+		if err := d.AdvanceIssueLabels(ctx, &task, repo,
+			repo.Delivery.LabelSet().Completed); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return 1
 		}
@@ -429,7 +430,7 @@ func runGate(ctx context.Context, store *storage.Store, provider *sandbox.Docker
 	}
 	rep, err := gate.Run(ctx, validation.Input{
 		TaskID: task.ID, Container: container,
-		Workspace: workspace, Branch: branchForTask(*task),
+		Workspace: workspace, Branch: dispatch.BranchForTask(*task),
 		BaseSHA: provisionedBase(store, task.ID), Config: repo.Validation,
 	})
 	if err != nil {
@@ -510,67 +511,6 @@ func deliverFailed(store *storage.Store, task *tasks.Task, cause error, ew io.Wr
 		map[string]string{"reason": cause.Error()}, ew)
 	fmt.Fprintf(ew, "herder: %v\n", cause)
 	return 1
-}
-
-// advanceIssueLabels swaps the issue's stage labels for the next stage:
-// every configured stage or trigger label currently on the issue leaves,
-// the new one arrives. Label failures are delivery failures — the label
-// path is part of the contract.
-func advanceIssueLabels(ctx context.Context, engine *deliver.Engine, store *storage.Store,
-	task *tasks.Task, repo config.RepositoryConfig, next string, ew io.Writer,
-) error {
-	issue, ok := deliver.IssueNumber(task.SourceRef)
-	if !ok {
-		return nil
-	}
-	current, err := engine.IssueLabels(ctx, task.Repository, issue)
-	if err != nil {
-		return err
-	}
-	remove := staleLabels(current, repo, next)
-	if err := engine.SetLabels(ctx, task.Repository, issue, []string{next}, remove); err != nil {
-		return err
-	}
-	return emitEvent(store, task.ID, "issue.labels_updated",
-		map[string]any{"issue": issue, "added": next, "removed": remove}, ew)
-}
-
-// staleLabels computes which labels to remove when advancing to next:
-// the trigger labels plus every stage label currently on the issue,
-// except the one being applied. Sorted for stable events and argv.
-func staleLabels(current []string, repo config.RepositoryConfig, next string) []string {
-	stages := repo.Delivery.LabelSet()
-	managed := map[string]bool{next: true}
-	for _, l := range repo.Trigger.Labels {
-		managed[l] = true
-	}
-	for _, l := range []string{stages.Running, stages.Review, stages.Completed} {
-		managed[l] = true
-	}
-	var remove []string
-	for _, l := range current {
-		if managed[l] && l != next {
-			remove = append(remove, l)
-		}
-	}
-	sort.Strings(remove)
-	return remove
-}
-
-// markIssueRunning applies the running stage label when a task's agent
-// starts. Best-effort: a missing gh or unreachable GitHub warns on ew but
-// never blocks a launch.
-func markIssueRunning(store *storage.Store, task *tasks.Task, repo config.RepositoryConfig, ew io.Writer) {
-	if _, ok := deliver.IssueNumber(task.SourceRef); !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	engine := &deliver.Engine{}
-	if err := advanceIssueLabels(ctx, engine, store, task, repo,
-		repo.Delivery.LabelSet().Running, ew); err != nil {
-		fmt.Fprintf(ew, "herder: warning: could not mark %s running: %v\n", task.SourceRef, err)
-	}
 }
 
 // transition moves the task and keeps the caller's copy in sync.
