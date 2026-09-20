@@ -20,6 +20,7 @@ import (
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -263,14 +264,21 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	return 0
 }
 
-// taskRetry starts a fresh attempt (SPEC section 22): the live session
-// closes, the container thaws if paused, the attempt counter increments
-// through RETRYING -> QUEUED, and the launch flow runs again on the same
-// sandbox and workspace. The dispatch lease is held across the requeue
-// so a scheduler tick in the gap cannot claim the task and double-
-// dispatch it; Launch's own HoldLease sees the same-owner lease and
-// proceeds. A missing container leaves the task QUEUED with a provision
-// hint instead of failing it.
+// taskRetry starts a fresh attempt (SPEC section 22): the dispatch
+// lease is taken first, the live session closes, the container thaws
+// if paused, the attempt counter increments through RETRYING ->
+// QUEUED, and the launch flow runs again on the same sandbox and
+// workspace. The lease must precede the RETRYING commit: a scheduler
+// reconcile tick in the gap would see a lease-less RETRYING task,
+// requeue it with a spurious "retry abandoned" dispatch_failed event,
+// and let dispatchOne steal the launch — so holdRestartLease claims
+// the lease while the task still wears its pre-retry state and keeps
+// it across the whole requeue-and-launch. A foreign lease refuses
+// before the worker is touched or the attempt minted: a dispatch
+// already in progress is the honest error, not a post-commit
+// surprise. Launch's own HoldLease sees the same-owner lease and
+// proceeds. A missing container leaves the task QUEUED with a
+// provision hint instead of failing it.
 func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "retry", ew)
 	if code != 0 {
@@ -282,7 +290,15 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
 	d := newDispatcher(store, w, ew)
-	if err := d.StopWorker(ctx, &task); err != nil {
+	lctx, release, err := holdRestartLease(ctx, d, &task)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	if release != nil {
+		defer release()
+	}
+	if err := d.StopWorker(lctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -290,14 +306,6 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	if err != nil {
 		fmt.Fprintf(ew, "herder: retry task %s: %v\n", task.ID, err)
 		return 1
-	}
-	lctx, release, err := d.HoldLease(ctx, &updated)
-	if err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	if release != nil {
-		defer release()
 	}
 	if code := requeue(store, &updated, ew); code != 0 {
 		return code
@@ -310,13 +318,14 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	return 0
 }
 
-// taskHandoff moves the task to a different agent kind on a fresh attempt
-// (SPEC section 22): the old session closes, the profile swap and attempt
-// increment commit atomically with an agent.handed_off event, and the new
-// agent launches into the same sandbox and workspace — history and work
-// preserved, never an untraceable new job. The dispatch lease is held
-// across the requeue like taskRetry's so a scheduler tick cannot claim
-// the fresh attempt mid-handoff.
+// taskHandoff moves the task to a different agent kind on a fresh
+// attempt (SPEC section 22): the dispatch lease is taken first (the
+// same lease-first ordering as taskRetry, so a scheduler tick cannot
+// requeue the lease-less RETRYING commit or steal the launch), the
+// old session closes, the profile swap and attempt increment commit
+// atomically with an agent.handed_off event, and the new agent
+// launches into the same sandbox and workspace — history and work
+// preserved, never an untraceable new job.
 func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	fs := flag.NewFlagSet("handoff", flag.ContinueOnError)
 	fs.SetOutput(ew)
@@ -351,7 +360,15 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 		return code
 	}
 	d := newDispatcher(store, w, ew)
-	if err := d.StopWorker(ctx, &task); err != nil {
+	lctx, release, err := holdRestartLease(ctx, d, &task)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	if release != nil {
+		defer release()
+	}
+	if err := d.StopWorker(lctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -360,14 +377,6 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	if err != nil {
 		fmt.Fprintf(ew, "herder: handoff task %s: %v\n", task.ID, err)
 		return 1
-	}
-	lctx, release, err := d.HoldLease(ctx, &updated)
-	if err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	if release != nil {
-		defer release()
 	}
 	if code := requeue(store, &updated, ew); code != 0 {
 		return code
@@ -420,6 +429,24 @@ func guardRestart(task *tasks.Task, verb string, ew io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// holdRestartLease takes the dispatch lease before retry or handoff
+// commits RETRYING, closing the gap where a scheduler reconcile tick
+// would requeue a lease-less RETRYING task as "retry abandoned" and
+// dispatchOne would steal the launch. HoldLease's guard only covers
+// QUEUED/PROVISIONING/RETRYING, so the call passes a copy stamped
+// RETRYING — the state the restart is about to commit — while the
+// stored row still wears its pre-retry state; the lease row keys on
+// the task id, not the status. The caller's copy keeps its real
+// status because StopWorker reads it (a PAUSED task must thaw).
+// Returns HoldLease's triple unchanged: the lease-held context, the
+// release func to defer (nil when a same-owner lease already lives),
+// or a leaseError when a foreign owner holds it.
+func holdRestartLease(ctx context.Context, d *dispatch.Dispatcher, task *tasks.Task) (context.Context, func(), error) {
+	leasing := *task
+	leasing.Status = tasks.Retrying
+	return d.HoldLease(ctx, &leasing)
 }
 
 // requeue lands a RETRYING task back into QUEUED after Retry or Handoff

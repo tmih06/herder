@@ -144,8 +144,10 @@ func (s *Scheduler) stampDispatcher() {
 // expireLeases returns tasks whose dispatch lease lapsed to the queue:
 // the owner is presumed dead, so a queued/provisioning/retrying task
 // loses its possibly-orphaned pane and requeues with a lease.expired
-// event. Tasks in any other state just lose the stale row — their
-// worker already launched or finished, so no event, no transition.
+// event. The pane close thaws a bound sandbox first so a frozen agent
+// cannot survive as an orphan. Tasks in any other state just lose the
+// stale row — their worker already launched or finished, so no event,
+// no transition.
 func (s *Scheduler) expireLeases(ctx context.Context) {
 	expired, err := s.Store.ExpireLeases(time.Now().UTC())
 	if err != nil {
@@ -164,7 +166,8 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 			continue
 		}
 		// The dead owner may have left a Herdr pane running the task;
-		// stopping is best-effort because the pane is usually gone too.
+		// stopWorkerSession thaws the sandbox then closes the pane,
+		// best-effort because both are usually gone too.
 		s.stopWorkerSession(ctx, &task)
 		if task.Status != tasks.Queued {
 			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
@@ -191,9 +194,10 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 // responsible until the lease lapses.
 // A PROVISIONING task with no live lease is an abandoned dispatch —
 // the owner died between Provision and Launch, or a manual provision
-// was left staged — so it requeues with a dispatch_failed event
-// instead of holding a worker slot forever. A RETRYING task with no
-// live lease is the same shape: `task retry` died between the
+// was left staged — so it requeues through requeueDispatch with a
+// dispatch_failed event and a backoff stamp instead of holding a
+// worker slot forever or re-dispatching every tick. A RETRYING task
+// with no live lease is the same shape: `task retry` died between the
 // RETRYING commit and the QUEUED requeue, or Launch bound the session
 // then died before RUNNING — either way it is stranded (not
 // dispatched, not supervised, holding no worker slot), so it requeues
@@ -228,16 +232,7 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 			if task.AgentSessionID != "" {
 				s.stopWorkerSession(ctx, task)
 			}
-			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
-				s.logf("herder: scheduler: reconcile %s: requeue abandoned %s: %v", task.ID, stage, err)
-				continue
-			}
-			if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
-				"controller", s.owner(), tasks.EventPayload(map[string]string{
-					"reason": reason, "stage": stage,
-				})); err != nil {
-				s.logf("herder: scheduler: reconcile %s: event: %v", task.ID, err)
-			}
+			s.requeueDispatch(*task, stage, reason)
 			continue
 		}
 		if task.Status != tasks.Running && task.Status != tasks.Blocked {
@@ -537,7 +532,7 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 			// stopping): expireLeases already requeued the task, so
 			// this attempt just ends — no event, no backoff.
 		default:
-			s.requeueDispatch(cur, err.Error())
+			s.requeueDispatch(cur, "provision", err.Error())
 		}
 		return
 	}
@@ -648,11 +643,13 @@ func (s *Scheduler) failDispatch(task tasks.Task, reason string, preserved bool)
 	}
 }
 
-// requeueDispatch returns a task to QUEUED after a failed provision and
-// stamps its backoff so the next tick does not retry immediately. The
-// transition is skipped when the task already sits in QUEUED — the
-// store rejects same-state jumps — and logged when it races elsewhere.
-func (s *Scheduler) requeueDispatch(task tasks.Task, reason string) {
+// requeueDispatch returns a task to QUEUED after a failed or abandoned
+// dispatch and stamps its backoff so the next tick does not retry
+// immediately. The transition is skipped when the task already sits in
+// QUEUED — the store rejects same-state jumps — and logged when it
+// races elsewhere. Stage names the dispatch_failed event's stage:
+// "provision" for a failed attempt, "retry" for an abandoned one.
+func (s *Scheduler) requeueDispatch(task tasks.Task, stage, reason string) {
 	if cur, err := s.Store.GetTask(task.ID); err != nil {
 		s.logf("herder: scheduler: dispatch %s: re-read: %v", task.ID, err)
 	} else if cur.Status != tasks.Queued {
@@ -662,7 +659,7 @@ func (s *Scheduler) requeueDispatch(task tasks.Task, reason string) {
 	}
 	if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
 		"controller", s.owner(), tasks.EventPayload(map[string]any{
-			"reason": reason, "stage": "provision",
+			"reason": reason, "stage": stage,
 		})); err != nil {
 		s.logf("herder: scheduler: dispatch %s: event: %v", task.ID, err)
 	}
@@ -696,14 +693,22 @@ func (s *Scheduler) stopWorkerBestEffort(ctx context.Context, task *tasks.Task) 
 
 // stopWorkerSession closes the task's deterministic Herdr pane,
 // best-effort: the pane is usually already gone with its dead owner.
-// The call runs under reconcileCallTimeout so a wedged herdr
-// subprocess cannot stall the pass.
+// A bound sandbox is thawed first — a frozen agent survives `pane
+// close` and would wake on unpause as an orphan (the StopWorker
+// invariant) — so EnsureRunning runs best-effort before the close.
+// Both calls run under reconcileCallTimeout so a wedged docker or
+// herdr subprocess cannot stall the pass.
 func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
 	if s.Dispatcher == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, reconcileCallTimeout)
 	defer cancel()
+	if task.SandboxID != "" {
+		if err := s.Dispatcher.SandboxProvider().EnsureRunning(ctx, task.SandboxID); err != nil {
+			s.logf("herder: scheduler: thaw sandbox for %s: %v", task.ID, err)
+		}
+	}
 	if err := s.Dispatcher.SessionLauncher().Stop(ctx, agent.SessionName(task.ID)); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}

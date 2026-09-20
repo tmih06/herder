@@ -13,10 +13,12 @@ import (
 )
 
 // Launch runs the shared launch flow behind start, retry, handoff, and
-// the scheduler: resolve profile -> sandbox inspect reports running ->
-// build the seed prompt -> reuse a live session (re-seeded unless the
-// task already runs) or launch -> bind -> RUNNING -> agent.started
-// event. priorAgent names the previous worker on a handoff so the
+// the scheduler: resolve profile -> sandbox inspect reports running
+// (an OOM-killed container fails the task with the resource-limit
+// reason instead) -> build the seed prompt -> reuse a live session
+// (re-seeded unless the task already runs) or launch -> bind ->
+// RUNNING -> agent.started event. priorAgent names the previous
+// worker on a handoff so the
 // prompt tells the new agent it inherits existing work instead of
 // starting cold.
 // A QUEUED, PROVISIONING, or RETRYING task takes the dispatch lease
@@ -28,6 +30,9 @@ import (
 // and a hung subprocess dies at the bound instead of beating forever.
 // Returns the first failure carrying the operator-facing message; the
 // success line goes to Logf.
+// An advance failure after a bound start — the task left the
+// launchable set mid-dispatch, e.g. CANCELLED — stops the fresh pane
+// and clears the binding so no unsupervised session outlives it.
 func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks.Task, override, priorAgent string) error {
 	// The dispatch lease serializes QUEUED, PROVISIONING, and RETRYING
 	// launches (SPEC section 50): a second dispatcher sees ErrLeaseHeld
@@ -67,6 +72,12 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 	if err != nil {
 		return fmt.Errorf("sandbox %s not ready: run `herder sandbox provision %s` first (%w)",
 			container, task.ID, err)
+	}
+	// OOMKilled is checked before the status word: the engine reports
+	// the kill on the dead container, and a kill is a resource-limit
+	// verdict the task carries as FAILED, not a "not ready" hint.
+	if sb.OOMKilled {
+		return d.failTaskStart(ctx, task, "resource limit: container OOM-killed")
 	}
 	if sb.Status != "running" {
 		return fmt.Errorf("sandbox %s not ready: status %s (run `herder sandbox provision %s` first)",
@@ -118,6 +129,19 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		d.warnf("herder: record agent state: %v", err)
 	}
 	if err := d.advanceToRunning(ctx, task, true); err != nil {
+		// The task left the launchable set mid-dispatch (CANCELLED has
+		// no outgoing edges), so nothing supervises it: stop the
+		// just-bound pane on a fresh bounded ctx — a cancelled parent
+		// must not skip cleanup — and drop the binding so attach
+		// reports no session instead of landing on an orphaned pane.
+		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer stopCancel()
+		if stopErr := d.launcher().Stop(stopCtx, session); stopErr != nil {
+			d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
+		}
+		if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {
+			d.warnf("herder: clear orphaned session binding: %v", clearErr)
+		}
 		return err
 	}
 	if err := d.emitEvent(task.ID, "agent.started", map[string]string{
