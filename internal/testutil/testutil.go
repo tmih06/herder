@@ -102,7 +102,7 @@ func OpenStore(t *testing.T) *storage.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 

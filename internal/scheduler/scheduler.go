@@ -184,7 +184,11 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 // A PROVISIONING task with no live lease is an abandoned dispatch —
 // the owner died between Provision and Launch, or a manual provision
 // was left staged — so it requeues with a dispatch_failed event
-// instead of holding a worker slot forever.
+// instead of holding a worker slot forever. A session-less RETRYING
+// task with no live lease is the same shape: `task retry` died
+// between the RETRYING commit and the QUEUED requeue, so it requeues
+// the same way. A RETRYING task still bound to a session is the
+// live-agent retry path and is left alone.
 // Uncertain inspect answers only log — the next tick retries — because
 // acting on a maybe-wrong reading could strand real work. No path ever
 // destroys a sandbox or workspace: dirty work is preserved for a human.
@@ -201,17 +205,22 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 	}
 	for i := range found {
 		task := &found[i]
-		if task.Status == tasks.Provisioning {
+		if task.Status == tasks.Provisioning ||
+			(task.Status == tasks.Retrying && task.AgentSessionID == "") {
 			if s.leaseHeld(task.ID) {
 				continue
 			}
+			stage, reason := "provision", "provisioning abandoned: no dispatch lease"
+			if task.Status == tasks.Retrying {
+				stage, reason = "retry", "retry abandoned: no dispatch lease"
+			}
 			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
-				s.logf("herder: scheduler: reconcile %s: requeue abandoned provision: %v", task.ID, err)
+				s.logf("herder: scheduler: reconcile %s: requeue abandoned %s: %v", task.ID, stage, err)
 				continue
 			}
 			if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
 				"controller", s.owner(), tasks.EventPayload(map[string]string{
-					"reason": "provisioning abandoned: no dispatch lease", "stage": "provision",
+					"reason": reason, "stage": stage,
 				})); err != nil {
 				s.logf("herder: scheduler: reconcile %s: event: %v", task.ID, err)
 			}
@@ -452,11 +461,12 @@ func (s *Scheduler) dispatchable(taskID string, now time.Time) bool {
 // heartbeat through provision and launch, release. The lease — not the
 // queue scan — serializes competing dispatchers: ErrLeaseHeld means
 // someone else owns the task and this attempt simply ends. A dirty
-// workspace fails the task (the work is preserved, never re-provisioned
-// over); any other provision failure requeues with a dispatch_failed
-// event and a backoff stamp so the next tick does not hammer a broken
-// task. Launch failures need no state work here: the launch path
-// already failed the task itself.
+// workspace or a permanent misconfiguration (ErrPermanent) fails the
+// task — the work is preserved, never re-provisioned over, and a
+// broken config must not requeue forever; any other provision failure
+// requeues with a dispatch_failed event and a backoff stamp so the
+// next tick does not hammer a broken task. Launch failures need no
+// state work here: the launch path already failed the task itself.
 func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 	defer s.wg.Done()
 	defer func() {
@@ -479,11 +489,16 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 		}
 	}()
 	// The queue scan raced real state: re-read before spending a
-	// provision on a task that left QUEUED (cancelled, retried by hand).
-	if cur, err := s.Store.GetTask(task.ID); err != nil {
+	// provision on a task that left QUEUED (cancelled, retried by
+	// hand). Provision and Launch run on the re-read row so a profile
+	// swap committed between scan and re-read launches the verified
+	// agent, not the stale one.
+	cur, err := s.Store.GetTask(task.ID)
+	if err != nil {
 		s.logf("herder: scheduler: dispatch %s: re-read: %v", task.ID, err)
 		return
-	} else if cur.Status != tasks.Queued {
+	}
+	if cur.Status != tasks.Queued {
 		return
 	}
 	// The heartbeat cancels pctx on lease loss so a mid-flight provision
@@ -493,24 +508,26 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 	defer cancel()
 	lost, stopHeartbeat := s.heartbeat(pctx, task.ID, owner, cancel)
 	defer stopHeartbeat()
-	if err := s.Dispatcher.Provision(pctx, s.Cfg, &task); err != nil {
+	if err := s.Dispatcher.Provision(pctx, s.Cfg, &cur); err != nil {
 		var dirty *sandbox.DirtyError
 		switch {
 		case errors.As(err, &dirty):
-			s.failDispatch(task, err.Error(), true)
+			s.failDispatch(cur, err.Error(), true)
+		case errors.Is(err, dispatch.ErrPermanent):
+			s.failDispatch(cur, err.Error(), false)
 		case s.leaseLost(lost) || pctx.Err() != nil:
 			// The lease lapsed mid-provision (or the daemon is
 			// stopping): expireLeases already requeued the task, so
 			// this attempt just ends — no event, no backoff.
 		default:
-			s.requeueDispatch(task, err.Error())
+			s.requeueDispatch(cur, err.Error())
 		}
 		return
 	}
 	if s.leaseLost(lost) {
 		return
 	}
-	if err := s.Dispatcher.Launch(pctx, s.Cfg, &task, "", ""); err != nil {
+	if err := s.Dispatcher.Launch(pctx, s.Cfg, &cur, "", ""); err != nil {
 		// ErrLeaseHeld means a competing dispatcher owns the task;
 		// every other failure already landed on the task via
 		// failTaskStart, so both paths only log.
@@ -680,8 +697,10 @@ func (s *Scheduler) agentProfile(name string) (config.AgentConfig, bool) {
 
 // kindOf resolves the task's agent kind for the per-agent cap: the
 // configured profile's kind, or a "profile:"-prefixed key when the
-// profile is unresolvable so unknown profiles still group under one
-// bucket instead of bypassing the cap.
+// profile is unresolvable. The fallback cannot be capped — validate()
+// rejects per_agent keys outside the supported kinds — it exists so an
+// unknown profile gets its own accounting key instead of masquerading
+// as a known kind.
 func (s *Scheduler) kindOf(task tasks.Task) string {
 	if prof, ok := s.agentProfile(task.AgentProfile); ok {
 		return prof.Kind

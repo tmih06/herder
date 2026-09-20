@@ -25,7 +25,7 @@ func (d *Dispatcher) AdvanceIssueLabels(ctx context.Context, task *tasks.Task,
 	if err != nil {
 		return err
 	}
-	remove := StaleLabels(current, repo, next)
+	remove := staleLabels(current, repo, next)
 	if err := d.engine().SetLabels(ctx, task.Repository, issue, []string{next}, remove); err != nil {
 		return err
 	}
@@ -33,10 +33,10 @@ func (d *Dispatcher) AdvanceIssueLabels(ctx context.Context, task *tasks.Task,
 		map[string]any{"issue": issue, "added": next, "removed": remove})
 }
 
-// StaleLabels computes which labels to remove when advancing to next:
+// staleLabels computes which labels to remove when advancing to next:
 // the trigger labels plus every stage label currently on the issue,
 // except the one being applied. Sorted for stable events and argv.
-func StaleLabels(current []string, repo config.RepositoryConfig, next string) []string {
+func staleLabels(current []string, repo config.RepositoryConfig, next string) []string {
 	stages := repo.Delivery.LabelSet()
 	managed := map[string]bool{next: true}
 	for _, l := range repo.Trigger.Labels {

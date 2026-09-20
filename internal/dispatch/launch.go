@@ -12,10 +12,6 @@ import (
 	"github.com/tmih06/herder/internal/tasks"
 )
 
-// launchTimeout bounds one Launch call like Provision's 10m bound: a
-// hung herdr call must not heartbeat forever and burn a worker slot.
-const launchTimeout = 10 * time.Minute
-
 // Launch runs the shared launch flow behind start, retry, handoff, and
 // the scheduler: resolve profile -> sandbox inspect reports running ->
 // build the seed prompt -> reuse a live session (re-seeded unless the
@@ -23,30 +19,29 @@ const launchTimeout = 10 * time.Minute
 // event. priorAgent names the previous worker on a handoff so the
 // prompt tells the new agent it inherits existing work instead of
 // starting cold.
-// A QUEUED or PROVISIONING task takes the dispatch lease before any
-// subprocess so two dispatchers never start it twice; the lease
-// heartbeats until the call returns and releases on exit, unless an
-// outer dispatch already owns it. All work runs on the lease-held
-// context bounded by launchTimeout: a lost heartbeat cancels it so a
+// A QUEUED, PROVISIONING, or RETRYING task takes the dispatch lease
+// before any subprocess so two dispatchers never start it twice; the
+// lease heartbeats until the call returns and releases on exit, unless
+// an outer dispatch already owns it. All work runs on the lease-held
+// context bounded by dispatchTimeout: a lost heartbeat cancels it so a
 // stale CLI stops instead of finishing a dispatch the store requeued,
 // and a hung subprocess dies at the bound instead of beating forever.
 // Returns the first failure carrying the operator-facing message; the
 // success line goes to Logf.
 func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks.Task, override, priorAgent string) error {
-	// The dispatch lease serializes QUEUED and PROVISIONING launches
-	// (SPEC section 50): a second dispatcher sees ErrLeaseHeld instead
-	// of double-starting. Relaunches (retry, handoff) are already
-	// serialized by the caller's own transition, so they run
-	// lease-free. A live same-owner lease means an outer dispatch owns
-	// the lifecycle.
-	hctx, release, err := d.holdLease(ctx, task)
+	// The dispatch lease serializes QUEUED, PROVISIONING, and RETRYING
+	// launches (SPEC section 50): a second dispatcher sees ErrLeaseHeld
+	// instead of double-starting. A live same-owner lease means an outer
+	// dispatch owns the lifecycle — including an intervene holding the
+	// lease across a retry's requeue-and-launch.
+	hctx, release, err := d.HoldLease(ctx, task)
 	if err != nil {
 		return err
 	}
 	if release != nil {
 		defer release()
 	}
-	ctx, cancel := context.WithTimeout(hctx, launchTimeout)
+	ctx, cancel := context.WithTimeout(hctx, dispatchTimeout)
 	defer cancel()
 	repo, ok := cfg.Repositories[task.Repository]
 	if !ok {
@@ -181,12 +176,22 @@ func (d *Dispatcher) emitEvent(taskID, eventType string, payload any) error {
 
 // failTaskStart moves the task to FAILED and records agent.start_failed
 // with the reason, so an unlaunchable task is a clear event, not a hang.
-// A dead session's stale binding is cleared first so task attach reports
-// no session instead of execing a dead pane; a live session keeps its
-// binding so attach can still land on it. Returns an error carrying the
-// same "task %s failed: %s" line the CLI printed.
+// A cancelled ctx means the lease was lost or dispatchTimeout hit: the
+// scheduler's expireLeases/reconcile owns the requeue, so the FAILED
+// stamp is skipped and the reason returned with the ctx error instead
+// of overwriting it. A dead session's stale binding is cleared first so
+// task attach reports no session instead of execing a dead pane; a live
+// session keeps its binding so attach can still land on it. The liveness
+// probe runs on a fresh bounded context detached from ctx so a cancelled
+// parent cannot false-negative and orphan a live session. Returns an
+// error carrying the same "task %s failed: %s" line the CLI printed.
 func (d *Dispatcher) failTaskStart(ctx context.Context, task *tasks.Task, reason string) error {
-	if task.AgentSessionID != "" && !d.launcher().IsLive(ctx, task.AgentSessionID) {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s: %w", reason, ctx.Err())
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if task.AgentSessionID != "" && !d.launcher().IsLive(probeCtx, task.AgentSessionID) {
 		if err := d.Store.ClearSessionBinding(task.ID); err != nil {
 			d.warnf("herder: clear stale session binding: %v", err)
 		}

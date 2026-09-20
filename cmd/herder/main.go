@@ -199,21 +199,38 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 		Store: store, Launcher: &agent.Launcher{},
 		Logf: logf,
 	}
-	go supervisor.Run(supCtx)
+	supDone := make(chan struct{})
+	go func() { supervisor.Run(supCtx); close(supDone) }()
 	owner := fmt.Sprintf("daemon-%d", os.Getpid())
 	d := &dispatch.Dispatcher{
 		Store: store, Owner: owner,
 		Provider: newProvider(ew), Launcher: &agent.Launcher{},
-		Engine:    &deliver.Engine{},
-		ActorType: "controller", ActorID: owner,
-		Logf: logf, Warnf: logf,
+		Engine:  &deliver.Engine{},
+		ActorID: owner,
+		Logf:    logf, Warnf: logf,
 	}
 	sched := &scheduler.Scheduler{
 		Store: store, Dispatcher: d, Cfg: cfg,
 		Owner: owner,
 		Logf:  logf,
 	}
-	go sched.Run(supCtx)
+	schedDone := make(chan struct{})
+	go func() { sched.Run(supCtx); close(schedDone) }()
+	// drainWorkers cancels the shared context and joins both loops so a
+	// shutdown never exits mid-poll or mid-dispatch: scheduler.Run's
+	// wg.Wait lets in-flight dispatches finish. Bounded by ctx — a wedged
+	// dispatch must not hold the process open forever.
+	drainWorkers := func(ctx context.Context) bool {
+		stopSupervisor()
+		for _, done := range []chan struct{}{supDone, schedDone} {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return false
+			}
+		}
+		return true
+	}
 	fmt.Fprintf(w, "herder: scheduler running (max_workers %d, lease %s)\n",
 		cfg.Scheduler.MaxWorkers, cfg.Scheduler.LeaseTTLDuration())
 	errCh := make(chan error, 1)
@@ -225,6 +242,14 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	case err := <-errCh:
 		if err != nil && !strings.Contains(err.Error(), "Server closed") {
 			fmt.Fprintf(ew, "herder: serve: %v\n", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if !drainWorkers(ctx) {
+			fmt.Fprintf(ew, "herder: worker drain timed out\n")
+			return 1
+		}
+		if err != nil && !strings.Contains(err.Error(), "Server closed") {
 			return 1
 		}
 		return 0
@@ -234,6 +259,10 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			fmt.Fprintf(ew, "herder: shutdown: %v\n", err)
+			return 1
+		}
+		if !drainWorkers(ctx) {
+			fmt.Fprintf(ew, "herder: worker drain timed out\n")
 			return 1
 		}
 		return 0

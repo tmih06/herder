@@ -10,9 +10,9 @@
 // Approach: the Dispatcher bundles the store, the Herdr launcher, the
 // Docker provider, and the delivery engine behind the same Runner seams
 // the leaf packages use, so tests script subprocesses and the scheduler
-// injects its owner identity. QUEUED and PROVISIONING tasks take a
-// store lease — heartbeated for the life of the call — before any
-// subprocess so two dispatchers never start the same task.
+// injects its owner identity. QUEUED, PROVISIONING, and RETRYING tasks
+// take a store lease — heartbeated for the life of the call — before
+// any subprocess so two dispatchers never start the same task.
 // Inputs: config, the task row, an optional profile override, and the
 // prior agent's name on handoffs.
 // Flow: lease -> resolve profile -> sandbox inspect -> build prompt ->
@@ -24,6 +24,8 @@ package dispatch
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +49,17 @@ import (
 // Exported for the scheduler's own dispatch heartbeat.
 const HeartbeatDivisor = 3
 
+// dispatchTimeout bounds one Provision or Launch call: a hung provider
+// or herdr call must not heartbeat forever and burn a worker slot.
+const dispatchTimeout = 10 * time.Minute
+
+// ErrPermanent marks terminal misconfiguration — the task's repository
+// is absent from config or names an unsupported provider — so callers
+// (the scheduler's dispatchOne) fail the task instead of requeueing a
+// dispatch that can never succeed. Wrap with fmt.Errorf %w; test with
+// errors.Is.
+var ErrPermanent = errors.New("dispatch: permanent misconfiguration")
+
 // Dispatcher runs the shared worker pipeline: provision, launch, stop,
 // and issue-label bookkeeping for one task at a time.
 // Store is required; Launcher, Provider, and Engine lazily default to
@@ -66,7 +79,9 @@ type Dispatcher struct {
 	// defaults to a zero-value engine.
 	Engine *deliver.Engine
 	// Owner names this dispatcher in the task lease; empty means
-	// "cli-<pid>" so two concurrent CLI processes never share an owner.
+	// "cli-<pid>-<nonce>" — per-process with a random suffix so a
+	// recycled PID cannot adopt a dead process's lease through the
+	// same-owner fast path.
 	Owner string
 	// LeaseTTL bounds one dispatch attempt; zero means
 	// config.DefaultLeaseTTL.
@@ -134,14 +149,27 @@ func (d *Dispatcher) warnf(format string, args ...any) {
 }
 
 // owner names this dispatcher in the task lease. The CLI default is
-// per-process so two `herder task start` invocations cannot both pass
-// the same-owner check and double-dispatch one task.
+// per-process with a random nonce: a recycled PID must not pass the
+// same-owner check on a dead process's lease — that fast path skips
+// acquisition and heartbeat, so the adopted lease would lapse
+// mid-dispatch into a duplicate worker.
 func (d *Dispatcher) owner() string {
 	if d.Owner != "" {
 		return d.Owner
 	}
-	return fmt.Sprintf("cli-%d", os.Getpid())
+	return cliOwner()
 }
+
+// cliOwner is the process-lifetime default lease owner: "cli-<pid>-"
+// plus 4 hex chars from crypto/rand so a recycled PID cannot
+// impersonate a dead CLI. Falls back to nanotime on rand failure.
+var cliOwner = sync.OnceValue(func() string {
+	var nonce [2]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Sprintf("cli-%d-%d", os.Getpid(), time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("cli-%d-%s", os.Getpid(), hex.EncodeToString(nonce[:]))
+})
 
 // leaseTTL bounds one dispatch attempt with its default.
 func (d *Dispatcher) leaseTTL() time.Duration {
@@ -214,22 +242,24 @@ func SandboxRoot(dbPath string) string {
 // here would mark the task RUNNING before any agent exists, and
 // reconcile would read the session-less worker as dead. Dirty work
 // fails with a preservation note.
-// A QUEUED or PROVISIONING task takes the dispatch lease first — the
-// same mutual exclusion Launch applies — so a manual provision never
-// races the scheduler's dispatch of the same task (SPEC section 50);
-// the lease heartbeats for the life of the call so a slow provision
-// never lapses into a duplicate dispatch. All work runs on the
-// lease-held context: a lost heartbeat cancels it, aborting the
-// provider call instead of finishing a dispatch the store requeued.
+// A QUEUED, PROVISIONING, or RETRYING task takes the dispatch lease
+// first — the same mutual exclusion Launch applies — so a manual
+// provision never races the scheduler's dispatch of the same task
+// (SPEC section 50); the lease heartbeats for the life of the call so
+// a slow provision never lapses into a duplicate dispatch. All work
+// runs on the lease-held context bounded by dispatchTimeout: a lost
+// heartbeat cancels it, aborting the provider call instead of
+// finishing a dispatch the store requeued.
 // Inputs: bounded ctx, config, and the task row. Returns the first
-// failure; the success line goes to Logf.
+// failure — terminal misconfiguration wraps ErrPermanent so the
+// scheduler fails instead of requeueing; the success line goes to Logf.
 func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *tasks.Task) error {
 	if repo, ok := cfg.Repositories[task.Repository]; !ok {
-		return fmt.Errorf("task repository %q not in config", task.Repository)
+		return fmt.Errorf("task repository %q not in config: %w", task.Repository, ErrPermanent)
 	} else if repo.Sandbox.Provider != "docker" {
-		return fmt.Errorf("provider %q unsupported here (want docker)", repo.Sandbox.Provider)
+		return fmt.Errorf("provider %q unsupported here (want docker): %w", repo.Sandbox.Provider, ErrPermanent)
 	}
-	hctx, release, err := d.holdLease(ctx, task)
+	hctx, release, err := d.HoldLease(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -237,7 +267,7 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 		defer release()
 	}
 	spec := SpecForTask(cfg, *task)
-	ctx, cancel := context.WithTimeout(hctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(hctx, dispatchTimeout)
 	defer cancel()
 	sb, err := d.provider().Provision(ctx, spec)
 	if err != nil {
@@ -347,24 +377,26 @@ func (d *Dispatcher) leaseError(taskID string, err error) error {
 		taskID, owner, err)
 }
 
-// holdLease takes the task's dispatch lease for a QUEUED or
-// PROVISIONING task unless the caller already holds it: a live
-// same-owner lease means an outer dispatch (the scheduler's
-// dispatchOne) owns the lifecycle, so this call neither renews nor
-// releases it. A lease this call acquires gets a heartbeat goroutine
-// ticking every TTL/HeartbeatDivisor on hctx — a provision longer than
-// the TTL must not let the lease lapse into a duplicate dispatch.
-// Any heartbeat failure warns and cancels hctx, mirroring
-// dispatchOne's pctx-cancel-on-ErrLeaseLost: a stale CLI must not keep
-// working toward a duplicate worker, and the ctx re-checks in walkPath
-// stop it from marking a requeued task RUNNING.
+// HoldLease takes the task's dispatch lease for a QUEUED,
+// PROVISIONING, or RETRYING task unless the caller already holds it: a
+// live same-owner lease means an outer dispatch (the scheduler's
+// dispatchOne, or an intervene holding the lease across a retry's
+// requeue-and-launch) owns the lifecycle, so this call neither renews
+// nor releases it. A lease this call acquires gets a heartbeat
+// goroutine ticking every TTL/HeartbeatDivisor on hctx — a provision
+// longer than the TTL must not let the lease lapse into a duplicate
+// dispatch. Only ErrLeaseLost cancels hctx: the lease is gone, so a
+// stale CLI must stop instead of finishing a dispatch the store
+// requeued. Transient store errors warn and keep beating, matching
+// the scheduler's heartbeat — one missed beat never kills a healthy
+// dispatch.
 // Returns the lease-held context and the release func for the caller
 // to defer — ctx unchanged and nil release when the task is not
-// QUEUED/PROVISIONING or the lease was already ours — or a leaseError
-// when a foreign owner holds it. Release is idempotent: it stops the
-// beat, cancels hctx, then drops the lease.
-func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (context.Context, func(), error) {
-	if task.Status != tasks.Queued && task.Status != tasks.Provisioning {
+// QUEUED/PROVISIONING/RETRYING or the lease was already ours — or a
+// leaseError when a foreign owner holds it. Release is idempotent: it
+// stops the beat, cancels hctx, then drops the lease.
+func (d *Dispatcher) HoldLease(ctx context.Context, task *tasks.Task) (context.Context, func(), error) {
+	if task.Status != tasks.Queued && task.Status != tasks.Provisioning && task.Status != tasks.Retrying {
 		return ctx, nil, nil
 	}
 	owner := d.owner()
@@ -394,10 +426,15 @@ func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (context.C
 			case <-hctx.Done():
 				return
 			case <-ticker.C:
-				if err := d.Store.HeartbeatLease(task.ID, owner, d.leaseTTL()); err != nil {
-					d.warnf("herder: dispatch %s: lease heartbeat: %v", task.ID, err)
+				err := d.Store.HeartbeatLease(task.ID, owner, d.leaseTTL())
+				switch {
+				case err == nil:
+				case errors.Is(err, storage.ErrLeaseLost):
+					d.warnf("herder: dispatch %s: lease lost", task.ID)
 					cancel()
 					return
+				default:
+					d.warnf("herder: dispatch %s: lease heartbeat: %v", task.ID, err)
 				}
 			}
 		}

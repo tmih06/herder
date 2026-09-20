@@ -364,7 +364,7 @@ func TestAdvanceToRunningRejectsCancelled(t *testing.T) {
 // labels currently on the issue, minus the one being applied, sorted.
 func TestStaleLabels(t *testing.T) {
 	repo := testConfig().Repositories["acme/web"]
-	got := StaleLabels(
+	got := staleLabels(
 		[]string{"bug", "agent-review", "agent-ready", "agent-running"},
 		repo, "agent-review")
 	want := []string{"agent-ready", "agent-running"}
