@@ -529,15 +529,16 @@ func (l *Launcher) killContainerAgent(ctx context.Context, container string) {
 		}
 		pid, comm := fields[0], fields[1]
 		// The agent is the docker exec'd command: match its comm (direct
-		// binary) or an argv token whose basename is the kind (script
-		// wrapper like `sh /usr/local/bin/codex`). A bare substring would
-		// kill unrelated processes that merely mention the name. Skip
-		// the container's own init.
+		// binary) or an argv token that names its path (script wrapper
+		// like `sh /usr/local/bin/codex`). A bare substring — or a bare
+		// token later in argv — would kill unrelated processes that
+		// merely mention the name (`grep codex`). Skip the container's
+		// own init.
 		if pid == "1" {
 			continue
 		}
 		for kind := range agentCommands {
-			if filepath.Base(comm) == kind || argvHasBasename(fields[2:], kind) {
+			if filepath.Base(comm) == kind || argvNamesPath(fields[2:], kind) {
 				_, _ = l.runner()(ctx, "kill", "-9", pid)
 				break
 			}
@@ -545,12 +546,16 @@ func (l *Launcher) killContainerAgent(ctx context.Context, container string) {
 	}
 }
 
-// argvHasBasename reports whether any argv token's basename equals name:
-// `sh /usr/local/bin/codex` matches "codex" while `grep codex` in an
-// unrelated process does not.
-func argvHasBasename(argv []string, name string) bool {
-	for _, a := range argv {
-		if filepath.Base(a) == name {
+// argvNamesPath reports whether argv invokes the agent by name: either
+// argv[0] is the bare command (`codex`, PATH-resolved) or some token is
+// a path whose basename is the name (`/bin/sh /usr/local/bin/codex`).
+// A bare `codex` appearing later in argv (`grep codex`) does not match.
+func argvNamesPath(argv []string, name string) bool {
+	if len(argv) > 0 && filepath.Base(argv[0]) == name {
+		return true
+	}
+	for _, a := range argv[1:] {
+		if strings.Contains(a, "/") && filepath.Base(a) == name {
 			return true
 		}
 	}
@@ -787,9 +792,10 @@ func (l *Launcher) Read(ctx context.Context, session string, lines int) (string,
 // agent running deaf inside the container (verified: it survives
 // indefinitely, writing files and burning tokens after Herder believes
 // it stopped). The sandbox and workspace stay intact for inspection or
-// a fresh attempt. A session that is already gone is a no-op — the
-// desired end state holds either way. Inputs: the session name and the
-// container the agent runs in (pass "" to skip the container kill).
+// a fresh attempt. A session that is already gone still gets the
+// container kill — the pane may be dead while the exec'd agent runs on.
+// Inputs: the session name and the container the agent runs in (pass ""
+// to skip the container kill).
 func (l *Launcher) Stop(ctx context.Context, session, container string) error {
 	info, err := l.Get(ctx, session)
 	if err != nil {
