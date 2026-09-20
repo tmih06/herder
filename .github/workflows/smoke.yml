@@ -54,7 +54,7 @@ jobs:
       - name: Kill and restart durability
         run: |
           set -euo pipefail
-          ID=$(./herder task create --config "$RUNNER_TEMP/config.yaml" --repo tmih06/meltiply --source-ref tmih06/meltiply#1)
+          ID=$(./herder task create --config "$RUNNER_TEMP/config.yaml" --repo owner/repo --source-ref owner/repo#1)
           ./herder task transition --config "$RUNNER_TEMP/config.yaml" "$ID" ELIGIBLE
           ./herder task event --config "$RUNNER_TEMP/config.yaml" --payload '{"pane":"w3:p2"}' "$ID" agent.working
           if ./herder task transition --config "$RUNNER_TEMP/config.yaml" "$ID" RUNNING; then echo 'illegal jump accepted' >&2; exit 1; fi

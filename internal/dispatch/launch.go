@@ -148,7 +148,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		if getErr == nil && (stored.Status == tasks.Cancelled || stored.Status == tasks.Failed) {
 			stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer stopCancel()
-			if stopErr := d.launcher().Stop(stopCtx, session); stopErr != nil {
+			if stopErr := d.launcher().Stop(stopCtx, session, container); stopErr != nil {
 				d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
 			}
 			if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {

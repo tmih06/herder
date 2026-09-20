@@ -8,10 +8,10 @@
 # records each input, and on the finish sentinel writes the fix the task
 # asked for, commits it on the task branch, and exits.
 #
-# Protocol (one line per input):
 #   any line                       -> appended to .herder-messages
 #   a line containing "finish"     -> write FIX.md, git commit, exit 0
-#   EOF / 5-minute idle            -> commit whatever is pending, exit
+#   EOF                            -> commit whatever is pending, exit
+
 #
 # Output stays terse and declarative: Herdr classifies agent_status from
 # screen heuristics, so prompt-like text (a trailing "?", "blocked",

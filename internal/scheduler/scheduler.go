@@ -27,7 +27,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
@@ -733,7 +732,7 @@ func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
 			s.logf("herder: scheduler: thaw sandbox for %s: %v", task.ID, err)
 		}
 	}
-	if err := s.Dispatcher.SessionLauncher().Stop(ctx, agent.SessionName(task.ID)); err != nil {
+	if err := s.Dispatcher.SessionLauncher().Stop(ctx, task.AgentSessionID, task.SandboxID); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}
 }

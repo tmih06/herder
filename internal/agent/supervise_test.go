@@ -415,7 +415,7 @@ func TestReadReturnsTail(t *testing.T) {
 func TestStopClosesPane(t *testing.T) {
 	fake := &scriptedHerdr{gone: map[string]bool{}}
 	l := &Launcher{Runner: fake.run}
-	if err := l.Stop(context.Background(), "herder-task_x"); err != nil {
+	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
 		t.Fatalf("Stop = %v", err)
 	}
 	var closed bool
@@ -429,12 +429,40 @@ func TestStopClosesPane(t *testing.T) {
 	}
 }
 
+// TestStopKillsContainerAgent proves stop kills the docker exec'd agent
+// inside the container: `pane close` only drops the host exec client and
+// the agent would keep running deaf inside (verified against herdr
+// 0.9.1). The kill is host-side via docker top + kill.
+func TestStopKillsContainerAgent(t *testing.T) {
+	fake := &scriptedHerdr{gone: map[string]bool{}}
+	var calls []string
+	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (RunResult, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		if name == "docker" && len(args) > 0 && args[0] == "top" {
+			return RunResult{Stdout: "PID   COMMAND   ARGS\n1     sleep     sleep infinity\n4242  sh        /bin/sh /usr/local/bin/codex\n"}, nil
+		}
+		return fake.run(ctx, name, args...)
+	}}
+	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+	var killed bool
+	for _, call := range calls {
+		if call == "kill -9 4242" {
+			killed = true
+		}
+	}
+	if !killed {
+		t.Errorf("stop must kill the in-container agent pid, calls: %v", calls)
+	}
+}
+
 // TestStopGoneSessionIsNoop proves stopping a dead session is a no-op:
 // the desired end state already holds.
 func TestStopGoneSessionIsNoop(t *testing.T) {
 	fake := &scriptedHerdr{gone: map[string]bool{"herder-task_x": true}}
 	l := &Launcher{Runner: fake.run}
-	if err := l.Stop(context.Background(), "herder-task_x"); err != nil {
+	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
 		t.Fatalf("Stop on dead session = %v, want nil", err)
 	}
 	for _, call := range fake.calls {

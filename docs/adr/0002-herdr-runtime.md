@@ -9,10 +9,11 @@ API (SPEC sections 4, 17-18).
 ## Decision
 
 Herder orchestrates Herdr, never forks it. Stage 1 (v0.1): CLI
-orchestration — `herdr agent start|send|get|read|attach|pane close` —
-because it is debuggable and needs no protocol client. Stage 2 (later):
-the socket API for long-lived event subscriptions. Each worker is one
-Herdr agent session, bound durably as task ↔ sandbox ↔ session, with
+orchestration — `herdr workspace create|pane run|agent get|rename|
+prompt|read|attach|pane close|pane process-info` — because it is
+debuggable and needs no protocol client. Stage 2 (later): the socket
+API for long-lived event subscriptions. Each worker is one Herdr agent
+session, bound durably as task ↔ sandbox ↔ session, with
 `HERDR_AGENT=<kind>` on the host-visible wrapper so Herdr attributes
 the agent inside the sandbox.
 

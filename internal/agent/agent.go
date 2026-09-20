@@ -315,7 +315,8 @@ var lookPath = exec.LookPath
 // detected as the agent kind while really running `docker exec`. A symlink
 // keeps comm at the link name (verified against herdr 0.9.1), costs
 // nothing, and tracks docker upgrades automatically. A stale or wrong
-// link is recreated; a real file at the path is left alone.
+// symlink is recreated; a non-symlink file at the path is left alone and
+// reported — removing someone's real file to make room is not ours to do.
 func EnsureShim(dir, kind string) (string, error) {
 	dockerPath, err := lookPath("docker")
 	if err != nil {
@@ -325,20 +326,24 @@ func EnsureShim(dir, kind string) (string, error) {
 		return "", fmt.Errorf("agent: create shim dir: %w", err)
 	}
 	shim := filepath.Join(dir, kind)
-	if target, err := os.Readlink(shim); err == nil && target == dockerPath {
+	target, err := os.Readlink(shim)
+	switch {
+	case err == nil && target == dockerPath:
 		return shim, nil
-	}
-	if err := os.Symlink(dockerPath, shim); err != nil {
-		if !os.IsExist(err) {
-			return "", fmt.Errorf("agent: link %s shim: %w", kind, err)
-		}
-		// Exists but is not our link (or a dangling one): replace it.
+	case err == nil:
+		// A symlink to the wrong target is ours to replace.
 		if rmErr := os.Remove(shim); rmErr != nil {
 			return "", fmt.Errorf("agent: replace %s shim: %w", kind, rmErr)
 		}
-		if err := os.Symlink(dockerPath, shim); err != nil {
-			return "", fmt.Errorf("agent: link %s shim: %w", kind, err)
-		}
+	case os.IsNotExist(err):
+		// Nothing there: link it below.
+	default:
+		// Exists but is not a symlink (a real file, a dir): refuse to
+		// destroy it — the caller sees the conflict, not a silent clobber.
+		return "", fmt.Errorf("agent: %s exists and is not a shim symlink", shim)
+	}
+	if err := os.Symlink(dockerPath, shim); err != nil {
+		return "", fmt.Errorf("agent: link %s shim: %w", kind, err)
 	}
 	return shim, nil
 }
@@ -442,9 +447,14 @@ func (l *Launcher) clearSessionName(ctx context.Context, session string) error {
 	// Guard: only release the name when the holder's shim is confirmed
 	// gone. If the record still answers and its shim is foreground, the
 	// name belongs to a live agent — stealing it would orphan that
-	// agent's identity while it keeps running.
-	if info, err := l.Get(ctx, session); err == nil && info.Running {
+	// agent's identity while it keeps running. A transport error is
+	// uncertain, not free: propagate it rather than clearing blind.
+	info, err := l.Get(ctx, session)
+	switch {
+	case err == nil && info.Running:
 		return fmt.Errorf("session %s held by a live agent", session)
+	case err != nil && !errors.Is(err, ErrSessionGone):
+		return err
 	}
 	out, err := l.runner()(ctx, "herdr", "agent", "rename", session, "--clear")
 	if err != nil {
@@ -524,7 +534,7 @@ func (l *Launcher) killContainerAgent(ctx context.Context, container string) {
 		if pid == "1" {
 			continue
 		}
-		for _, kind := range []string{"codex", "claude", "opencode", "gemini"} {
+		for kind := range agentCommands {
 			if filepath.Base(comm) == kind || strings.Contains(args, kind) {
 				_, _ = l.runner()(ctx, "kill", "-9", pid)
 				break
@@ -764,8 +774,9 @@ func (l *Launcher) Read(ctx context.Context, session string, lines int) (string,
 // indefinitely, writing files and burning tokens after Herder believes
 // it stopped). The sandbox and workspace stay intact for inspection or
 // a fresh attempt. A session that is already gone is a no-op — the
-// desired end state holds either way.
-func (l *Launcher) Stop(ctx context.Context, session string) error {
+// desired end state holds either way. Inputs: the session name and the
+// container the agent runs in (pass "" to skip the container kill).
+func (l *Launcher) Stop(ctx context.Context, session, container string) error {
 	info, err := l.Get(ctx, session)
 	if err != nil {
 		if errors.Is(err, ErrSessionGone) {
@@ -783,9 +794,7 @@ func (l *Launcher) Stop(ctx context.Context, session string) error {
 	if out.ExitCode != 0 {
 		return fmt.Errorf("agent: stop %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
-	// The session name IS the container name (both herder-<taskid>):
-	// kill the deaf agent the pane close orphaned.
-	l.killContainerAgent(ctx, session)
+	l.killContainerAgent(ctx, container)
 	return nil
 }
 
