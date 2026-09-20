@@ -27,8 +27,11 @@ import (
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/api"
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/deliver"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/health"
 	"github.com/tmih06/herder/internal/ingest"
+	"github.com/tmih06/herder/internal/scheduler"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
@@ -191,11 +194,45 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	srv := api.New(cfg, store, path)
 	supCtx, stopSupervisor := context.WithCancel(context.Background())
 	defer stopSupervisor()
+	logf := func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
 	supervisor := &agent.Supervisor{
 		Store: store, Launcher: &agent.Launcher{},
-		Logf: func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) },
+		Logf: logf,
 	}
-	go supervisor.Run(supCtx)
+	supDone := make(chan struct{})
+	go func() { supervisor.Run(supCtx); close(supDone) }()
+	owner := fmt.Sprintf("daemon-%d", os.Getpid())
+	d := &dispatch.Dispatcher{
+		Store: store, Owner: owner,
+		Provider: newProvider(ew), Launcher: &agent.Launcher{},
+		Engine:  &deliver.Engine{},
+		ActorID: owner,
+		Logf:    logf, Warnf: logf,
+	}
+	sched := &scheduler.Scheduler{
+		Store: store, Dispatcher: d, Cfg: cfg,
+		Owner: owner,
+		Logf:  logf,
+	}
+	schedDone := make(chan struct{})
+	go func() { sched.Run(supCtx); close(schedDone) }()
+	// drainWorkers cancels the shared context and joins both loops so a
+	// shutdown never exits mid-poll or mid-dispatch: scheduler.Run's
+	// wg.Wait lets in-flight dispatches finish. Bounded by ctx — a wedged
+	// dispatch must not hold the process open forever.
+	drainWorkers := func(ctx context.Context) bool {
+		stopSupervisor()
+		for _, done := range []chan struct{}{supDone, schedDone} {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return false
+			}
+		}
+		return true
+	}
+	fmt.Fprintf(w, "herder: scheduler running (max_workers %d, lease %s)\n",
+		cfg.Scheduler.MaxWorkers, cfg.Scheduler.LeaseTTLDuration())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	sigCh := make(chan os.Signal, 1)
@@ -205,6 +242,14 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	case err := <-errCh:
 		if err != nil && !strings.Contains(err.Error(), "Server closed") {
 			fmt.Fprintf(ew, "herder: serve: %v\n", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if !drainWorkers(ctx) {
+			fmt.Fprintf(ew, "herder: worker drain timed out\n")
+			return 1
+		}
+		if err != nil && !strings.Contains(err.Error(), "Server closed") {
 			return 1
 		}
 		return 0
@@ -214,6 +259,10 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			fmt.Fprintf(ew, "herder: shutdown: %v\n", err)
+			return 1
+		}
+		if !drainWorkers(ctx) {
+			fmt.Fprintf(ew, "herder: worker drain timed out\n")
 			return 1
 		}
 		return 0
@@ -394,10 +443,14 @@ func taskInspect(store *storage.Store, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: task %q not found\n", args[0])
 		return 1
 	}
-	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nagent_state: %s\nbranch: %s\nattempt: %d\ncreated: %s\nupdated: %s\n",
+	started := "-"
+	if !task.StartedAt.IsZero() {
+		started = task.StartedAt.Format(time.RFC3339)
+	}
+	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nagent_state: %s\nbranch: %s\nattempt: %d\npriority: %d\ncreated: %s\nupdated: %s\nstarted: %s\n",
 		task.ID, task.Status, task.SourceProvider, task.SourceRef,
 		task.Repository, task.AgentProfile, orDash(task.AgentState), task.BranchName, task.Attempt,
-		task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339))
+		task.Priority, task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339), started)
 	fmt.Fprintf(w, "sandbox: %s\nsession: %s\n",
 		task.SandboxID, task.AgentSessionID)
 	events, err := store.ListEvents(task.ID)
@@ -424,13 +477,14 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 	agent := fs.String("agent", "", "agent profile (default: repo default)")
 	branch := fs.String("branch", "", "working branch name")
 	goal := fs.String("goal", "", "issue goal text seeded into the agent prompt")
+	priority := fs.Int("priority", 0, "dispatch priority (higher runs first)")
 	actorType := fs.String("actor-type", "controller", "event actor type")
 	actorID := fs.String("actor-id", "cli", "event actor id")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *repo == "" || *sourceRef == "" {
-		fmt.Fprintf(ew, "herder: usage: herder task create --repo R --source-ref REF [--agent P] [--branch B] [--goal G]\n")
+		fmt.Fprintf(ew, "herder: usage: herder task create --repo R --source-ref REF [--agent P] [--branch B] [--goal G] [--priority N]\n")
 		return 2
 	}
 	repoCfg, ok := cfg.Repositories[*repo]
@@ -451,6 +505,7 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 	created, err := store.CreateTask(storage.CreateInput{
 		SourceProvider: *provider, SourceRef: *sourceRef,
 		Repository: *repo, AgentProfile: profile, BranchName: *branch, Goal: *goal,
+		Priority:  *priority,
 		ActorType: *actorType, ActorID: *actorID,
 	})
 	if err != nil {

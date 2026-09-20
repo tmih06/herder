@@ -7,13 +7,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -89,47 +87,6 @@ func sandboxSetup(path string, ew io.Writer) (*config.Config, *storage.Store, *s
 	return cfg, store, newProvider(ew)
 }
 
-// specForTask builds the provision spec from the task plus its repo and
-// agent config: image from the repo sandbox block, CPU/memory limits from
-// the agent profile, workspace rooted beside the state database so it
-// survives restarts without a config change.
-func specForTask(cfg *config.Config, task tasks.Task) sandbox.Spec {
-	repo := cfg.Repositories[task.Repository]
-	agent := cfg.Agents[task.AgentProfile]
-	return sandbox.Spec{
-		TaskID: task.ID, Repository: task.Repository,
-		Branch: branchForTask(task), Image: repo.Sandbox.Image,
-		CPUs: agent.Resources["cpu"], Memory: agent.Resources["memory"],
-		WorkspaceRoot: sandboxRoot(cfg.Database.Path),
-	}
-}
-
-// branchForTask returns the deterministic worker branch: the claimed
-// branch when set, else herder/<issue> parsed from the source ref, else
-// herder/<task-id> so provisioning never blocks on an empty branch.
-func branchForTask(task tasks.Task) string {
-	if strings.TrimSpace(task.BranchName) != "" {
-		return strings.TrimSpace(task.BranchName)
-	}
-	if _, num, ok := strings.Cut(task.SourceRef, "#"); ok {
-		if n, err := strconv.Atoi(strings.TrimSpace(num)); err == nil && n > 0 {
-			return fmt.Sprintf("herder/%d", n)
-		}
-	}
-	return "herder/" + task.ID
-}
-
-// sandboxRoot resolves the workspace root beside the state database:
-// <dbdir>/sandboxes, with ~/ expanded like the store does.
-func sandboxRoot(dbPath string) string {
-	if rest, ok := strings.CutPrefix(dbPath, "~/"); ok {
-		if home, err := os.UserHomeDir(); err == nil {
-			dbPath = filepath.Join(home, rest)
-		}
-	}
-	return filepath.Join(filepath.Dir(dbPath), "sandboxes")
-}
-
 // resolveTarget maps a task id to its container name, passing container
 // names through. The task is non-nil when the target is a known task, so
 // callers can link exec output back to durable history.
@@ -140,15 +97,17 @@ func resolveTarget(store *storage.Store, target string) (container string, task 
 	return target, nil
 }
 
-// sandboxProvision creates or reuses the task's container and walks the
-// task toward RUNNING along legal transitions, recording the durable
-// sandbox.provisioned event. Dirty work fails with a preservation note.
+// sandboxProvision creates or reuses the task's container and walks a
+// QUEUED task to PROVISIONING, recording the durable sandbox.provisioned
+// event. Dirty work fails with a preservation note.
+// The dispatcher owns the repo/provider checks and the state walk; the
+// CLI keeps only the usage gate and the task lookup.
 func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 	if len(args) != 1 {
 		fmt.Fprintf(ew, "herder: usage: herder sandbox provision <task-id>\n")
 		return 2
 	}
-	cfg, store, provider := sandboxSetup(path, ew)
+	cfg, store, _ := sandboxSetup(path, ew)
 	if cfg == nil {
 		return 1
 	}
@@ -158,67 +117,13 @@ func sandboxProvision(path string, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: task %q: %v\n", args[0], err)
 		return 1
 	}
-	if repo, ok := cfg.Repositories[task.Repository]; !ok {
-		fmt.Fprintf(ew, "herder: task repository %q not in config\n", task.Repository)
-		return 1
-	} else if repo.Sandbox.Provider != "docker" {
-		fmt.Fprintf(ew, "herder: provider %q unsupported here (want docker)\n", repo.Sandbox.Provider)
-		return 1
-	}
-	spec := specForTask(cfg, task)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	sb, err := provider.Provision(ctx, spec)
-	if err != nil {
+	if err := newDispatcher(store, w, ew).Provision(ctx, cfg, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(w, "herder: sandbox %s running (branch %s)\n", sb.ID, sb.Branch)
-	if err := advanceToRunning(store, &task, false); err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-	}
-	payload, _ := json.Marshal(map[string]string{
-		"sandbox": sb.ID, "branch": sb.Branch,
-		"workspace": sb.Workspace, "image": sb.Image,
-		"base_sha": sb.BaseSHA,
-	})
-	if _, err := store.AppendEvent(task.ID, "sandbox.provisioned", "controller", "cli", string(payload)); err != nil {
-		fmt.Fprintf(ew, "herder: record provision event: %v\n", err)
 		return 1
 	}
 	return 0
-}
-
-// advanceToRunning walks QUEUED -> PROVISIONING -> RUNNING so the durable
-// state reflects the live container. relaunch additionally admits
-// RETRYING and WAITING_FOR_HUMAN — the start path legitimately re-enters
-// RUNNING from them, while a bare re-provision must not silently un-block
-// a task waiting on a human. Any other state is left untouched:
-// re-provisioning an active task is normal. Returns the first rejected
-// transition so callers can stop instead of reporting a started agent
-// for a task the store no longer considers launchable.
-func advanceToRunning(store *storage.Store, task *tasks.Task, relaunch bool) error {
-	var path []tasks.State
-	switch task.Status {
-	case tasks.Queued:
-		path = []tasks.State{tasks.Provisioning, tasks.Running}
-	case tasks.Provisioning:
-		path = []tasks.State{tasks.Running}
-	case tasks.Retrying, tasks.WaitingForHuman:
-		if !relaunch {
-			return nil
-		}
-		path = []tasks.State{tasks.Running}
-	default:
-		return nil
-	}
-	for _, next := range path {
-		if _, err := store.Transition(task.ID, next, "controller", "cli"); err != nil {
-			return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, next, err)
-		}
-		task.Status = next
-	}
-	return nil
 }
 
 // sandboxExec runs a command inside the sandbox, streams output, records
@@ -320,7 +225,7 @@ func sandboxInspect(path string, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(w, "workspace: %s\n", sb.Workspace)
 	}
 	if task != nil {
-		fmt.Fprintf(w, "task:      %s (%s, branch %s)\n", task.ID, task.Status, branchForTask(*task))
+		fmt.Fprintf(w, "task:      %s (%s, branch %s)\n", task.ID, task.Status, dispatch.BranchForTask(*task))
 	}
 	return 0
 }

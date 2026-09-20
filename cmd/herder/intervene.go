@@ -20,6 +20,7 @@ import (
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/dispatch"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -128,7 +129,11 @@ func taskLogs(store *storage.Store, args []string, w, ew io.Writer) int {
 // the Herdr pane and the agent stay alive for resume. Only RUNNING tasks
 // pause — QUEUED has nothing to freeze and BLOCKED is already halted.
 // The container must actually exist: claiming PAUSED on a vanished
-// sandbox would lie about the freeze.
+// sandbox would lie about the freeze. The task lands PAUSED before the
+// freeze so a reconcile tick between the two cannot strand the
+// transition; a failed freeze rolls the task back to RUNNING so the
+// still-running container never escapes supervision while the task
+// claims PAUSED.
 func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "pause", ew)
 	if code != 0 {
@@ -146,12 +151,18 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: cannot pause %s: %v\n", task.ID, err)
 		return 1
 	}
-	if err := provider.Pause(ctx, container); err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
 	if _, err := store.Transition(task.ID, tasks.Paused, "human", "cli"); err != nil {
 		fmt.Fprintf(ew, "herder: pause task %s: %v\n", task.ID, err)
+		return 1
+	}
+	if err := provider.Pause(ctx, container); err != nil {
+		// The task landed PAUSED but the container kept running; roll
+		// back to RUNNING so the worker stays supervised instead of
+		// escaping the timeout behind a PAUSED label.
+		if _, rerr := store.Transition(task.ID, tasks.Running, "human", "cli"); rerr != nil {
+			fmt.Fprintf(ew, "herder: revert pause on task %s: %v\n", task.ID, rerr)
+		}
+		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(w, "herder: task %s paused (session %s kept alive)\n", task.ID, task.AgentSessionID)
@@ -159,9 +170,11 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 }
 
 // taskResume continues a paused task: the container thaws and the task
-// returns to RUNNING so the supervisor picks the session back up. The
-// thaw happens before the transition so a failed unpause leaves the task
-// honestly PAUSED.
+// returns to RUNNING so the supervisor picks the session back up.
+// EnsureRunning converges instead of a bare unpause so a PAUSED task on
+// an already-running container — a failed pause rollback or external
+// docker drift — still resumes. The thaw happens before the transition
+// so a failed converge leaves the task honestly PAUSED.
 func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "resume", ew)
 	if code != 0 {
@@ -174,7 +187,7 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
 	provider := newProvider(ew)
-	if err := provider.Unpause(ctx, sandbox.ContainerName(task.ID)); err != nil {
+	if err := provider.EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -187,24 +200,50 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 }
 
 // taskStop ends the agent session and cancels the task (SPEC section 22):
-// the Herdr pane closes, the binding clears so attach cannot resolve a
-// dead session, and the task lands in CANCELLED. A paused container thaws
-// first so the agent process actually dies with the pane instead of
-// staying frozen inside the sandbox. The sandbox and its workspace stay
-// for inspection — `sandbox destroy` owns their removal.
+// the task lands in CANCELLED first so a reconcile tick mid-teardown
+// cannot strand the transition, then the Herdr pane closes and the
+// binding clears so attach cannot resolve a dead session. A paused
+// container thaws first so the agent process actually dies with the pane
+// instead of staying frozen inside the sandbox — StopWorker reads the
+// pre-transition task.Status for that, so it stays Paused here. A task
+// already CANCELLED with a live binding means an earlier stop died
+// mid-teardown, so the verb retries the teardown instead of
+// early-returning. The sandbox and its workspace stay for inspection —
+// `sandbox destroy` owns their removal.
 func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "stop", ew)
 	if code != 0 {
 		return code
 	}
 	switch task.Status {
-	case tasks.Done, tasks.Cancelled, tasks.Failed:
+	case tasks.Done, tasks.Failed:
 		fmt.Fprintf(ew, "herder: task %s already %s\n", task.ID, task.Status)
 		return 1
+	case tasks.Cancelled:
+		// CANCELLED has no outgoing edges; only a leftover binding
+		// justifies continuing into the teardown below.
+		if task.AgentSessionID == "" && task.SandboxID == "" {
+			fmt.Fprintf(ew, "herder: task %s already %s\n", task.ID, task.Status)
+			return 1
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	if task.Status != tasks.Cancelled {
+		if _, err := store.Transition(task.ID, tasks.Cancelled, "human", "cli"); err != nil {
+			fmt.Fprintf(ew, "herder: stop task %s: %v\n", task.ID, err)
+			return 1
+		}
+	} else if task.SandboxID != "" {
+		// The earlier stop may have died before thawing a frozen
+		// container; EnsureRunning is a no-op on a running one, and a
+		// missing container already killed the agent inside, so a thaw
+		// failure only warns — the pane close below still converges.
+		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
+			fmt.Fprintf(ew, "herder: thaw sandbox: %v\n", err)
+		}
+	}
+	if err := newDispatcher(store, w, ew).StopWorker(ctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -221,19 +260,25 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 			fmt.Fprintf(ew, "herder: record agent state: %v\n", err)
 		}
 	}
-	if _, err := store.Transition(task.ID, tasks.Cancelled, "human", "cli"); err != nil {
-		fmt.Fprintf(ew, "herder: stop task %s: %v\n", task.ID, err)
-		return 1
-	}
 	fmt.Fprintf(w, "herder: task %s stopped\n", task.ID)
 	return 0
 }
 
-// taskRetry starts a fresh attempt (SPEC section 22): the live session
-// closes, the container thaws if paused, the attempt counter increments
-// through RETRYING -> QUEUED, and the launch flow runs again on the same
-// sandbox and workspace. A missing container leaves the task QUEUED with
-// a provision hint instead of failing it.
+// taskRetry starts a fresh attempt (SPEC section 22): the dispatch
+// lease is taken first, the live session closes, the container thaws
+// if paused, the attempt counter increments through RETRYING ->
+// QUEUED, and the launch flow runs again on the same sandbox and
+// workspace. The lease must precede the RETRYING commit: a scheduler
+// reconcile tick in the gap would see a lease-less RETRYING task,
+// requeue it with a spurious "retry abandoned" dispatch_failed event,
+// and let dispatchOne steal the launch — so holdRestartLease claims
+// the lease while the task still wears its pre-retry state and keeps
+// it across the whole requeue-and-launch. A foreign lease refuses
+// before the worker is touched or the attempt minted: a dispatch
+// already in progress is the honest error, not a post-commit
+// surprise. Launch's own HoldLease sees the same-owner lease and
+// proceeds. A missing container leaves the task QUEUED with a
+// provision hint instead of failing it.
 func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "retry", ew)
 	if code != 0 {
@@ -244,7 +289,16 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	d := newDispatcher(store, w, ew)
+	lctx, release, err := holdRestartLease(ctx, d, &task)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	if release != nil {
+		defer release()
+	}
+	if err := d.StopWorker(lctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -257,13 +311,20 @@ func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io
 		return code
 	}
 	fmt.Fprintf(w, "herder: task %s retrying (attempt %d)\n", updated.ID, updated.Attempt)
-	return launchTask(ctx, cfg, store, &updated, "", "", w, ew)
+	if err := d.Launch(lctx, cfg, &updated, "", ""); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
-// taskHandoff moves the task to a different agent kind on a fresh attempt
-// (SPEC section 22): the old session closes, the profile swap and attempt
-// increment commit atomically with an agent.handed_off event, and the new
-// agent launches into the same sandbox and workspace — history and work
+// taskHandoff moves the task to a different agent kind on a fresh
+// attempt (SPEC section 22): the dispatch lease is taken first (the
+// same lease-first ordering as taskRetry, so a scheduler tick cannot
+// requeue the lease-less RETRYING commit or steal the launch), the
+// old session closes, the profile swap and attempt increment commit
+// atomically with an agent.handed_off event, and the new agent
+// launches into the same sandbox and workspace — history and work
 // preserved, never an untraceable new job.
 func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	fs := flag.NewFlagSet("handoff", flag.ContinueOnError)
@@ -298,7 +359,16 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	if code := guardRestart(&task, "handoff", ew); code != 0 {
 		return code
 	}
-	if err := stopWorker(ctx, &task, ew); err != nil {
+	d := newDispatcher(store, w, ew)
+	lctx, release, err := holdRestartLease(ctx, d, &task)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	if release != nil {
+		defer release()
+	}
+	if err := d.StopWorker(lctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -313,7 +383,11 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	}
 	fmt.Fprintf(w, "herder: task %s handed off %s -> %s (attempt %d)\n",
 		updated.ID, prior, *profile, updated.Attempt)
-	return launchTask(ctx, cfg, store, &updated, *profile, prior, w, ew)
+	if err := d.Launch(lctx, cfg, &updated, *profile, prior); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // oneTask resolves the single <id> argument shared by the intervention
@@ -340,26 +414,6 @@ func newProvider(ew io.Writer) *sandbox.DockerProvider {
 	return provider
 }
 
-// stopWorker ends the live session and thaws a paused container so a
-// stop, retry, or handoff never leaves a frozen agent behind. The thaw
-// happens before the pane close: a frozen agent survives `pane close`
-// and would wake on unpause as an orphan running the same task.
-// Inputs: bounded ctx, the task, and the error writer for provider logs.
-// Returns the first failure; a dead session is already the goal.
-func stopWorker(ctx context.Context, task *tasks.Task, ew io.Writer) error {
-	if task.Status == tasks.Paused {
-		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
-			return fmt.Errorf("thaw sandbox: %w", err)
-		}
-	}
-	if task.AgentSessionID != "" {
-		if err := (&agent.Launcher{}).Stop(ctx, task.AgentSessionID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // guardRestart validates the RETRYING transition shared by retry and
 // handoff before either touches the live worker: a refused command must
 // leave the running agent alone, not orphan it mid-flight. QUEUED and
@@ -375,6 +429,24 @@ func guardRestart(task *tasks.Task, verb string, ew io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// holdRestartLease takes the dispatch lease before retry or handoff
+// commits RETRYING, closing the gap where a scheduler reconcile tick
+// would requeue a lease-less RETRYING task as "retry abandoned" and
+// dispatchOne would steal the launch. HoldLease's guard only covers
+// QUEUED/PROVISIONING/RETRYING, so the call passes a copy stamped
+// RETRYING — the state the restart is about to commit — while the
+// stored row still wears its pre-retry state; the lease row keys on
+// the task id, not the status. The caller's copy keeps its real
+// status because StopWorker reads it (a PAUSED task must thaw).
+// Returns HoldLease's triple unchanged: the lease-held context, the
+// release func to defer (nil when a same-owner lease already lives),
+// or a leaseError when a foreign owner holds it.
+func holdRestartLease(ctx context.Context, d *dispatch.Dispatcher, task *tasks.Task) (context.Context, func(), error) {
+	leasing := *task
+	leasing.Status = tasks.Retrying
+	return d.HoldLease(ctx, &leasing)
 }
 
 // requeue lands a RETRYING task back into QUEUED after Retry or Handoff

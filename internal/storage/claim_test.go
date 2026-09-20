@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -15,8 +16,8 @@ func claimInput(delivery, ref string) ClaimRequest {
 		SourceRef:      ref,
 		Repository:     "acme/web",
 		AgentProfile:   "codex-default",
+		Priority:       5,
 		BranchName:     "herder/7",
-		MaxActive:      4,
 		PolicyPayload:  `{"decision":"accepted"}`,
 		ActorType:      "controller",
 		ActorID:        "webhook",
@@ -44,6 +45,9 @@ func TestClaimAcceptsAndQueues(t *testing.T) {
 	}
 	if got.BranchName != "herder/7" || got.AgentProfile != "codex-default" {
 		t.Errorf("branch/agent not recorded: %+v", got)
+	}
+	if got.Priority != 5 {
+		t.Errorf("priority = %d, want 5", got.Priority)
 	}
 
 	events, err := store.ListEvents(got.ID)
@@ -173,38 +177,38 @@ func TestClaimConcurrentDuplicates(t *testing.T) {
 	}
 }
 
-// A breached concurrency cap must deny without creating a task.
-func TestClaimCapDenied(t *testing.T) {
+// A burst beyond the worker cap must still queue: concurrency caps live
+// in the scheduler (issue #7), so Claim accepts every distinct issue and
+// leaves dispatch order to the queue.
+func TestClaimBurstBeyondCapStillQueues(t *testing.T) {
 	store, _ := openTestStore(t)
 
-	in := claimInput("del-1", "acme/web#7")
-	in.MaxActive = 1
-	if _, err := store.Claim(in); err != nil {
-		t.Fatalf("Claim = %v", err)
-	}
-	deniedIn := claimInput("del-2", "acme/web#8")
-	deniedIn.MaxActive = 1
-	out, err := store.Claim(deniedIn)
-	if err != nil {
-		t.Fatalf("Claim = %v", err)
-	}
-	if out.Decision != DecisionPolicyDenied {
-		t.Fatalf("decision = %q, want policy_denied", out.Decision)
+	const burst = 6
+	for i := range burst {
+		ref := fmt.Sprintf("acme/web#%d", i+1)
+		out, err := store.Claim(claimInput(fmt.Sprintf("del-%d", i+1), ref))
+		if err != nil {
+			t.Fatalf("Claim %d = %v", i, err)
+		}
+		if out.Decision != DecisionAccepted {
+			t.Fatalf("claim %d decision = %q, want accepted", i, out.Decision)
+		}
+		if out.Task.Status != tasks.Queued {
+			t.Errorf("claim %d status = %s, want QUEUED", i, out.Task.Status)
+		}
 	}
 
 	found, err := store.ListTasks()
 	if err != nil {
 		t.Fatalf("ListTasks = %v", err)
 	}
-	if len(found) != 1 {
-		t.Fatalf("denied claim created a task: %d tasks", len(found))
+	if len(found) != burst {
+		t.Fatalf("burst created %d tasks, want %d", len(found), burst)
 	}
-	del, err := store.GetDelivery("del-2")
-	if err != nil {
-		t.Fatalf("GetDelivery = %v", err)
-	}
-	if del.Decision != DecisionPolicyDenied || del.Reason == "" {
-		t.Errorf("denial must record decision and reason: %+v", del)
+	for _, task := range found {
+		if task.Status != tasks.Queued {
+			t.Errorf("task %s status = %s, want QUEUED", task.ID, task.Status)
+		}
 	}
 }
 
@@ -288,33 +292,132 @@ func TestClaimDurabilityAcrossReopen(t *testing.T) {
 	if len(events) != 5 {
 		t.Fatalf("want 5 events after reopen, got %d", len(events))
 	}
-	if n, err := reopened.CountActive(); err != nil || n != 1 {
-		t.Fatalf("CountActive after reopen = %d, %v; want 1", n, err)
-	}
 }
 
-// Terminal tasks must free concurrency capacity.
-func TestCountActiveIgnoresTerminal(t *testing.T) {
+// Entering RUNNING must stamp started_at so the agent timeout measures
+// each attempt's wall clock from dispatch; a second run resets it.
+func TestTransitionRunningStampsStartedAt(t *testing.T) {
 	store, _ := openTestStore(t)
 
-	in := claimInput("del-1", "acme/web#7")
-	in.MaxActive = 1
-	claimed, err := store.Claim(in)
+	claimed, err := store.Claim(claimInput("del-1", "acme/web#7"))
 	if err != nil {
 		t.Fatalf("Claim = %v", err)
 	}
-	for _, to := range []tasks.State{tasks.Provisioning, tasks.Running, tasks.Validating, tasks.Reviewing, tasks.Delivering, tasks.PROpen, tasks.Done} {
+	if !claimed.Task.StartedAt.IsZero() {
+		t.Fatalf("queued task must not carry started_at, got %v", claimed.Task.StartedAt)
+	}
+	if _, err := store.Transition(claimed.Task.ID, tasks.Provisioning, "controller", "test"); err != nil {
+		t.Fatalf("Transition to PROVISIONING = %v", err)
+	}
+	if _, err := store.Transition(claimed.Task.ID, tasks.Running, "controller", "test"); err != nil {
+		t.Fatalf("Transition to RUNNING = %v", err)
+	}
+	running, err := store.GetTask(claimed.Task.ID)
+	if err != nil {
+		t.Fatalf("GetTask = %v", err)
+	}
+	if running.StartedAt.IsZero() {
+		t.Fatalf("RUNNING task must carry started_at")
+	}
+	if !running.StartedAt.Equal(running.UpdatedAt) {
+		t.Errorf("started_at %v must equal updated_at %v on the RUNNING transition",
+			running.StartedAt, running.UpdatedAt)
+	}
+
+	// A retry re-enters RUNNING on a fresh attempt: the clock must reset.
+	if _, err := store.Transition(claimed.Task.ID, tasks.Retrying, "controller", "test"); err != nil {
+		t.Fatalf("Transition to RETRYING = %v", err)
+	}
+	if _, err := store.Transition(claimed.Task.ID, tasks.Provisioning, "controller", "test"); err != nil {
+		t.Fatalf("Transition to PROVISIONING = %v", err)
+	}
+	if _, err := store.Transition(claimed.Task.ID, tasks.Running, "controller", "test"); err != nil {
+		t.Fatalf("second Transition to RUNNING = %v", err)
+	}
+	retried, err := store.GetTask(claimed.Task.ID)
+	if err != nil {
+		t.Fatalf("GetTask = %v", err)
+	}
+	if !retried.StartedAt.Equal(retried.UpdatedAt) {
+		t.Errorf("second attempt must reset started_at to updated_at: %v vs %v",
+			retried.StartedAt, retried.UpdatedAt)
+	}
+	if retried.StartedAt.Before(running.StartedAt) {
+		t.Errorf("second attempt moved started_at backwards: %v -> %v",
+			running.StartedAt, retried.StartedAt)
+	}
+}
+
+// Resuming from PAUSED or BLOCKED continues the same attempt, so
+// started_at must survive — otherwise a periodically pausing worker never
+// reaches its timeout. A RETRYING re-entry is a fresh attempt and still
+// resets the clock.
+func TestTransitionResumePreservesStartedAt(t *testing.T) {
+	store, _ := openTestStore(t)
+
+	claimed, err := store.Claim(claimInput("del-1", "acme/web#7"))
+	if err != nil {
+		t.Fatalf("Claim = %v", err)
+	}
+	transition := func(to tasks.State) {
+		t.Helper()
 		if _, err := store.Transition(claimed.Task.ID, to, "controller", "test"); err != nil {
 			t.Fatalf("Transition to %s = %v", to, err)
 		}
 	}
-	next := claimInput("del-2", "acme/web#8")
-	next.MaxActive = 1
-	out, err := store.Claim(next)
-	if err != nil {
-		t.Fatalf("Claim = %v", err)
+	get := func() tasks.Task {
+		t.Helper()
+		task, err := store.GetTask(claimed.Task.ID)
+		if err != nil {
+			t.Fatalf("GetTask = %v", err)
+		}
+		return task
 	}
-	if out.Decision != DecisionAccepted {
-		t.Fatalf("decision after terminal = %q, want accepted", out.Decision)
+
+	transition(tasks.Provisioning)
+	transition(tasks.Running)
+	started := get().StartedAt
+	if started.IsZero() {
+		t.Fatalf("RUNNING task must carry started_at")
+	}
+
+	// PAUSED -> RUNNING resumes the same attempt: keep the stamp.
+	transition(tasks.Paused)
+	transition(tasks.Running)
+	resumed := get()
+	if !resumed.StartedAt.Equal(started) {
+		t.Errorf("resume from PAUSED restamped started_at: %v -> %v",
+			started, resumed.StartedAt)
+	}
+	if resumed.StartedAt.Equal(resumed.UpdatedAt) {
+		t.Errorf("resume from PAUSED must not restamp started_at to updated_at %v",
+			resumed.UpdatedAt)
+	}
+
+	// BLOCKED -> RUNNING resumes the same attempt: keep the stamp.
+	transition(tasks.Blocked)
+	transition(tasks.Running)
+	unblocked := get()
+	if !unblocked.StartedAt.Equal(started) {
+		t.Errorf("resume from BLOCKED restamped started_at: %v -> %v",
+			started, unblocked.StartedAt)
+	}
+	if unblocked.StartedAt.Equal(unblocked.UpdatedAt) {
+		t.Errorf("resume from BLOCKED must not restamp started_at to updated_at %v",
+			unblocked.UpdatedAt)
+	}
+
+	// RETRYING -> RUNNING is a fresh attempt: the clock must reset.
+	transition(tasks.Retrying)
+	transition(tasks.Provisioning)
+	transition(tasks.Running)
+	retried := get()
+	if !retried.StartedAt.Equal(retried.UpdatedAt) {
+		t.Errorf("retry must reset started_at to updated_at: %v vs %v",
+			retried.StartedAt, retried.UpdatedAt)
+	}
+	if retried.StartedAt.Before(started) {
+		t.Errorf("retry moved started_at backwards: %v -> %v",
+			started, retried.StartedAt)
 	}
 }

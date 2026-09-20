@@ -29,9 +29,11 @@ import (
 var ErrNotFound = errors.New("storage: task not found")
 
 // schema creates the v0.1 tables: tasks plus the append-only task_events
-// log that mirrors SPEC sections 46-47, plus the webhook_deliveries log
-// that makes every trigger delivery an inspectable durable decision
-// (SPEC sections 11, 49: dedup by delivery id, one task per issue).
+// log that mirrors SPEC sections 46-47, the webhook_deliveries log that
+// makes every trigger delivery an inspectable durable decision (SPEC
+// sections 11, 49: dedup by delivery id, one task per issue), and the
+// leases table that gives each dispatch an expiring owner (SPEC section
+// 50: heartbeats keep a live lease, expiry returns the task to the queue).
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
 	id TEXT PRIMARY KEY,
@@ -47,6 +49,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 	agent_state TEXT NOT NULL DEFAULT '',
 	attempt INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
+	priority INTEGER NOT NULL DEFAULT 0,
+	started_at TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_provider, source_ref);
@@ -70,6 +74,13 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 	task_id TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS leases (
+	task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+	owner TEXT NOT NULL,
+	acquired_at TEXT NOT NULL,
+	heartbeat_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL
+);
 `
 
 // CreateInput carries the fields needed to open a new task.
@@ -80,8 +91,10 @@ type CreateInput struct {
 	AgentProfile   string
 	BranchName     string
 	Goal           string
-	ActorType      string
-	ActorID        string
+	// Priority orders the dispatch queue (zero is normal).
+	Priority  int
+	ActorType string
+	ActorID   string
 }
 
 // Store is the SQLite-backed task repository.
@@ -140,14 +153,22 @@ func Open(path string) (*Store, error) {
 
 // migrateColumns adds columns introduced after the first databases were
 // written: the task-sandbox-session link columns plus goal, which carries
-// the issue goal text seeded into the agent prompt (issue #4), and
-// agent_state, the normalized Herdr-reported worker condition (issue #5).
-// Fresh databases already carry the columns via schema; legacy files get
-// one ALTER each, and the duplicate-column error on a partially migrated
-// file is the success signal, not a failure.
+// the issue goal text seeded into the agent prompt (issue #4), agent_state,
+// the normalized Herdr-reported worker condition (issue #5), and the
+// scheduler columns priority and started_at (issue #7). Fresh databases
+// already carry the columns via schema; legacy files get one ALTER each,
+// and the duplicate-column error on a partially migrated file is the
+// success signal, not a failure.
 func migrateColumns(db *sql.DB) error {
-	for _, column := range []string{"agent_session_id", "sandbox_id", "goal", "agent_state"} {
-		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''")
+	for _, column := range []string{
+		"agent_session_id TEXT NOT NULL DEFAULT ''",
+		"sandbox_id TEXT NOT NULL DEFAULT ''",
+		"goal TEXT NOT NULL DEFAULT ''",
+		"agent_state TEXT NOT NULL DEFAULT ''",
+		"priority INTEGER NOT NULL DEFAULT 0",
+		"started_at TEXT NOT NULL DEFAULT ''",
+	} {
+		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column)
 		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("storage: migrate columns: %w", err)
 		}
@@ -219,6 +240,7 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
 		Goal:           in.Goal,
+		Priority:       in.Priority,
 	})
 	task.BranchName = in.BranchName
 	actorType, actorID := orDefault(in.ActorType, "controller"), orDefault(in.ActorID, "cli")
@@ -274,8 +296,12 @@ func (s *Store) ListTasks() ([]tasks.Task, error) {
 }
 
 // Transition validates the jump, updates the status, and appends the
-// task.transition event in one transaction. Illegal jumps fail with the
-// state-machine error and change nothing.
+// task.transition event in one transaction. Entering RUNNING stamps
+// started_at so the agent timeout measures each attempt's wall clock from
+// dispatch, not from task creation — except resuming from PAUSED or
+// BLOCKED, which continues the same attempt and keeps the original stamp
+// so an interrupted worker cannot outrun its timeout budget. Illegal jumps
+// fail with the state-machine error and change nothing.
 func (s *Store) Transition(id string, to tasks.State, actorType, actorID string) (tasks.Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -286,12 +312,16 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	if err != nil {
 		return tasks.Event{}, err
 	}
+	from := task.Status
 	event, err := tasks.ApplyTransition(&task, to, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
 	if err != nil {
 		return tasks.Event{}, err
 	}
-	if _, err := tx.Exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-		string(task.Status), formatTime(task.UpdatedAt), task.ID); err != nil {
+	if to == tasks.Running && from != tasks.Paused && from != tasks.Blocked {
+		task.StartedAt = task.UpdatedAt
+	}
+	if _, err := tx.Exec("UPDATE tasks SET status = ?, started_at = ?, updated_at = ? WHERE id = ?",
+		string(task.Status), formatStartedAt(task.StartedAt), formatTime(task.UpdatedAt), task.ID); err != nil {
 		return tasks.Event{}, fmt.Errorf("storage: update status: %w", err)
 	}
 	if err := insertEvent(tx, event); err != nil {
@@ -549,9 +579,8 @@ type ClaimRequest struct {
 	BranchName     string
 	// Goal carries the issue goal text seeded into the agent prompt.
 	Goal string
-	// MaxActive caps tasks in non-terminal states; the count and the
-	// insert share one transaction so the cap cannot be raced.
-	MaxActive int
+	// Priority orders the dispatch queue (zero is normal).
+	Priority int
 	// PolicyPayload is stored on the policy.decision event of an
 	// accepted task so inspect shows the policy outcome end to end.
 	PolicyPayload string
@@ -566,36 +595,29 @@ type ClaimOutcome struct {
 	Task     tasks.Task
 }
 
-// terminalStatusClause lists the states that free worker capacity, as a
-// SQL IN-list fragment for the active-task count.
-const terminalStatusClause = `('DONE','CANCELLED','FAILED')`
-
-// Claim deduplicates one trigger delivery and, when it is new and policy
-// allows, creates exactly one task already walked to QUEUED with its full
-// event timeline. Every path records the delivery row, so redeliveries and
-// denials stay inspectable instead of silent.
+// Claim deduplicates one trigger delivery and, when it is new, creates
+// exactly one task already walked to QUEUED with its full event timeline.
+// Every path records the delivery row, so redeliveries and denials stay
+// inspectable instead of silent. Concurrency caps live in the scheduler
+// (issue #7): a burst queues, it is never denied here.
 // Why: GitHub redelivers webhooks and operators relabel issues; without
 // one atomic check-then-claim, concurrent duplicates open a double-claim
 // window with two workers on one issue (SPEC sections 49, 66.8).
 // Approach: one transaction per claim. UNIQUE(delivery_id) plus
 // UNIQUE(source_provider, source_ref) turn a lost race into a re-read
 // that returns duplicate instead of a second task; ON CONFLICT DO NOTHING
-// keeps that re-read free of fragile error-string matching. The active
-// count and the insert share the transaction so the cap holds.
-// Inputs: validated delivery identity, source, agent profile, branch, cap.
+// keeps that re-read free of fragile error-string matching.
+// Inputs: validated delivery identity, source, agent profile, branch.
 // Flow: known delivery -> duplicate; known source -> duplicate + log on
-// the surviving task; cap breached -> policy_denied; else insert task,
-// created + DISCOVERED->ELIGIBLE->CLAIMED->QUEUED + policy.decision
-// events, and the accepted delivery row, atomically.
+// the surviving task; else insert task, created +
+// DISCOVERED->ELIGIBLE->CLAIMED->QUEUED + policy.decision events, and the
+// accepted delivery row, atomically.
 // Returns: the durable decision with the new or surviving task.
 func (s *Store) Claim(req ClaimRequest) (ClaimOutcome, error) {
 	if strings.TrimSpace(req.DeliveryID) == "" || strings.TrimSpace(req.SourceProvider) == "" ||
 		strings.TrimSpace(req.SourceRef) == "" || strings.TrimSpace(req.Repository) == "" ||
 		strings.TrimSpace(req.AgentProfile) == "" {
 		return ClaimOutcome{}, errors.New("storage: claim needs delivery, source, repository, and agent profile")
-	}
-	if req.MaxActive < 1 {
-		return ClaimOutcome{}, fmt.Errorf("storage: claim needs MaxActive >= 1, got %d", req.MaxActive)
 	}
 	out, err := s.claimOnce(req)
 	if err != nil && isConflict(err) {
@@ -647,31 +669,14 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 		}
 		return ClaimOutcome{Decision: DecisionDuplicate, Reason: reason, Task: survivor}, nil
 	}
-	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status NOT IN ` + terminalStatusClause).Scan(&active); err != nil {
-		return ClaimOutcome{}, fmt.Errorf("storage: count active: %w", err)
-	}
-	if active >= req.MaxActive {
-		reason := fmt.Sprintf("concurrency cap reached: %d active tasks of %d allowed", active, req.MaxActive)
-		if err := insertDeliveryTx(tx, Delivery{
-			DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
-			SourceRef: req.SourceRef, Repository: req.Repository,
-			Decision: DecisionPolicyDenied, Reason: reason,
-			CreatedAt: time.Now().UTC(),
-		}); err != nil {
-			return ClaimOutcome{}, err
-		}
-		if err := tx.Commit(); err != nil {
-			return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
-		}
-		return ClaimOutcome{Decision: DecisionPolicyDenied, Reason: reason}, nil
-	}
+
 	task := tasks.New(tasks.NewInput{
 		SourceProvider: req.SourceProvider,
 		SourceRef:      req.SourceRef,
 		Repository:     req.Repository,
 		AgentProfile:   req.AgentProfile,
 		Goal:           req.Goal,
+		Priority:       req.Priority,
 	})
 	task.BranchName = req.BranchName
 	res, err := insertTaskTx(tx, task, ` ON CONFLICT(source_provider, source_ref) DO NOTHING`)
@@ -865,15 +870,199 @@ func (s *Store) FindTaskBySource(provider, ref string) (tasks.Task, error) {
 	return task, nil
 }
 
-// CountActive reports tasks in non-terminal states holding worker capacity.
-// Purpose: policy input for the concurrency cap and a diagnostic signal.
-// Returns the count of tasks outside DONE/CANCELLED/FAILED.
-func (s *Store) CountActive() (int, error) {
-	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status NOT IN ` + terminalStatusClause).Scan(&n); err != nil {
-		return 0, fmt.Errorf("storage: count active: %w", err)
+// ErrLeaseHeld is returned when a live lease belongs to another owner.
+var ErrLeaseHeld = errors.New("storage: lease held")
+
+// ErrLeaseLost is returned when a heartbeat names a lease the owner no
+// longer holds: expired, released, or never acquired.
+var ErrLeaseLost = errors.New("storage: lease lost")
+
+// Lease is one task's dispatch lease: the owner holding it, when it was
+// taken, the last heartbeat, and when it lapses (SPEC section 50).
+type Lease struct {
+	TaskID      string
+	Owner       string
+	AcquiredAt  time.Time
+	HeartbeatAt time.Time
+	ExpiresAt   time.Time
+}
+
+// leaseColumns lists the leases columns in scanLease order.
+const leaseColumns = `SELECT task_id, owner, acquired_at, heartbeat_at, expires_at FROM leases`
+
+// AcquireLease takes or renews the dispatch lease on one task atomically:
+// the upsert lands only when no lease exists, the stored lease has
+// expired, or the caller already owns it (renew), and the lease.acquired
+// event commits in the same transaction so the grant is always
+// attributable. A live lease under another owner fails with ErrLeaseHeld
+// and changes nothing; an unknown task fails with ErrNotFound.
+// Inputs: task id, the scheduler owner identity, and the lease TTL.
+// Returns wrapped errors only.
+func (s *Store) AcquireLease(taskID, owner string, ttl time.Duration) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("storage: begin: %w", err)
 	}
-	return n, nil
+	defer func() { _ = tx.Rollback() }()
+	if _, err := getTaskTx(tx, taskID); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	expires := now.Add(ttl)
+	res, err := tx.Exec(`INSERT INTO leases (task_id, owner, acquired_at, heartbeat_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(task_id) DO UPDATE SET owner = excluded.owner,
+			acquired_at = excluded.acquired_at, heartbeat_at = excluded.heartbeat_at,
+			expires_at = excluded.expires_at
+		WHERE leases.expires_at <= ? OR leases.owner = excluded.owner`,
+		taskID, owner, formatTime(now), formatTime(now), formatTime(expires), formatTime(now))
+	if err != nil {
+		return fmt.Errorf("storage: acquire lease: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrLeaseHeld
+	}
+	if err := insertEvent(tx, tasks.Event{
+		TaskID: taskID, Type: tasks.EventLeaseAcquired,
+		ActorType: "controller", ActorID: owner,
+		Payload: tasks.EventPayload(map[string]string{
+			"owner": owner, "task_id": taskID, "expires_at": formatTime(expires),
+		}),
+		CreatedAt: now,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storage: commit: %w", err)
+	}
+	return nil
+}
+
+// HeartbeatLease refreshes one owned lease's heartbeat and expiry.
+// Purpose: a live scheduler proves it still holds the dispatch so the
+// lease never lapses mid-run (SPEC section 50). The UPDATE is guarded by
+// owner and a still-valid expiry, so zero rows affected means the lease
+// is gone or stolen and the caller must stop: ErrLeaseLost.
+// Inputs: task id, the claiming owner, and the TTL to re-arm.
+// Returns ErrLeaseLost on zero rows, wrapped errors otherwise.
+func (s *Store) HeartbeatLease(taskID, owner string, ttl time.Duration) error {
+	now := time.Now().UTC()
+	res, err := s.db.Exec(`UPDATE leases SET heartbeat_at = ?, expires_at = ?
+		WHERE task_id = ? AND owner = ? AND expires_at > ?`,
+		formatTime(now), formatTime(now.Add(ttl)), taskID, owner, formatTime(now))
+	if err != nil {
+		return fmt.Errorf("storage: heartbeat lease: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// ReleaseLease drops one owned lease and mints lease.released in the same
+// transaction when a row was actually deleted. Releasing a lease that is
+// absent (or held by someone else) is a no-op so completion paths stay
+// idempotent after a crash.
+// Inputs: task id and the releasing owner. Returns wrapped errors only.
+func (s *Store) ReleaseLease(taskID, owner string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`DELETE FROM leases WHERE task_id = ? AND owner = ?`, taskID, owner)
+	if err != nil {
+		return fmt.Errorf("storage: release lease: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected > 0 {
+		if err := insertEvent(tx, tasks.Event{
+			TaskID: taskID, Type: tasks.EventLeaseReleased,
+			ActorType: "controller", ActorID: owner,
+			Payload: tasks.EventPayload(map[string]string{
+				"owner": owner, "task_id": taskID,
+			}),
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storage: commit: %w", err)
+	}
+	return nil
+}
+
+// ExpireLeases deletes every lease whose expiry has passed and returns
+// the evicted task_id -> owner map. No events are minted here: the
+// scheduler inspects each task's state and decides whether it requeues,
+// so the event belongs to the caller's recovery path.
+// Inputs: the cutoff time. Returns the evicted owners by task id.
+func (s *Store) ExpireLeases(now time.Time) (map[string]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("storage: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(`SELECT task_id, owner FROM leases WHERE expires_at <= ?`, formatTime(now))
+	if err != nil {
+		return nil, fmt.Errorf("storage: list expired leases: %w", err)
+	}
+	expired := map[string]string{}
+	for rows.Next() {
+		var taskID, owner string
+		if err := rows.Scan(&taskID, &owner); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("storage: scan expired lease: %w", err)
+		}
+		expired[taskID] = owner
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("storage: list expired leases: %w", err)
+	}
+	rows.Close()
+	if _, err := tx.Exec(`DELETE FROM leases WHERE expires_at <= ?`, formatTime(now)); err != nil {
+		return nil, fmt.Errorf("storage: expire leases: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("storage: commit: %w", err)
+	}
+	return expired, nil
+}
+
+// GetLease returns one task's lease or ErrNotFound when none is held.
+func (s *Store) GetLease(taskID string) (Lease, error) {
+	lease, err := scanLease(s.db.QueryRow(leaseColumns+` WHERE task_id = ?`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Lease{}, ErrNotFound
+	}
+	if err != nil {
+		return Lease{}, fmt.Errorf("storage: get lease: %w", err)
+	}
+	return lease, nil
+}
+
+// scanLease scans one leaseColumns row and parses its timestamps.
+// Purpose: one schema change touches one place. Inputs: a row in
+// leaseColumns order. Returns the lease, or sql.ErrNoRows unwrapped so
+// callers map it to ErrNotFound.
+func scanLease(row rowScanner) (Lease, error) {
+	var lease Lease
+	var acquiredAt, heartbeatAt, expiresAt string
+	if err := row.Scan(&lease.TaskID, &lease.Owner, &acquiredAt, &heartbeatAt, &expiresAt); err != nil {
+		return Lease{}, err
+	}
+	var perr error
+	if lease.AcquiredAt, perr = parseTime(acquiredAt); perr != nil {
+		return Lease{}, fmt.Errorf("storage: parse lease acquired_at: %w", perr)
+	}
+	if lease.HeartbeatAt, perr = parseTime(heartbeatAt); perr != nil {
+		return Lease{}, fmt.Errorf("storage: parse lease heartbeat_at: %w", perr)
+	}
+	if lease.ExpiresAt, perr = parseTime(expiresAt); perr != nil {
+		return Lease{}, fmt.Errorf("storage: parse lease expires_at: %w", perr)
+	}
+	return lease, nil
 }
 
 // deliveryColumns lists webhook_deliveries columns in scan order.
@@ -919,11 +1108,12 @@ func getTaskBySourceTx(tx *sql.Tx, provider, ref string) (tasks.Task, error) {
 // inspect RowsAffected, plus wrapped errors only.
 func insertTaskTx(tx *sql.Tx, task tasks.Task, conflictSuffix string) (sql.Result, error) {
 	const insert = `INSERT INTO tasks
-		(id, source_provider, source_ref, goal, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)`
+		(id, source_provider, source_ref, goal, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, priority, started_at, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?)`
 	res, err := tx.Exec(insert+conflictSuffix, task.ID, task.SourceProvider, task.SourceRef,
 		task.Goal, string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
-		task.Attempt, formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
+		task.Priority, formatStartedAt(task.StartedAt), task.Attempt,
+		formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("storage: insert task: %w", err)
 	}
@@ -1009,7 +1199,7 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 
 // taskColumns lists the tasks columns in scanTask order.
 const taskColumns = `SELECT id, source_provider, source_ref, goal, status, repository,
-	agent_profile, branch_name, agent_session_id, sandbox_id, agent_state, attempt, created_at, updated_at FROM tasks`
+	agent_profile, branch_name, agent_session_id, sandbox_id, agent_state, priority, started_at, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -1020,17 +1210,22 @@ type rowScanner interface{ Scan(dest ...any) error }
 // unwrapped so callers map it to ErrNotFound.
 func scanTask(row rowScanner) (tasks.Task, error) {
 	var task tasks.Task
-	var status, createdAt, updatedAt string
+	var status, startedAt, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
 		&task.Goal, &status, &task.Repository, &task.AgentProfile, &task.BranchName,
 		&task.AgentSessionID, &task.SandboxID, &task.AgentState,
-		&task.Attempt, &createdAt, &updatedAt); err != nil {
+		&task.Priority, &startedAt, &task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
 	}
 	task.Status = tasks.State(status)
 	var perr error
 	if task.CreatedAt, perr = parseTime(createdAt); perr != nil {
 		return tasks.Task{}, fmt.Errorf("storage: parse created_at: %w", perr)
+	}
+	if startedAt != "" {
+		if task.StartedAt, perr = parseTime(startedAt); perr != nil {
+			return tasks.Task{}, fmt.Errorf("storage: parse started_at: %w", perr)
+		}
 	}
 	if task.UpdatedAt, perr = parseTime(updatedAt); perr != nil {
 		return tasks.Task{}, fmt.Errorf("storage: parse updated_at: %w", perr)
@@ -1068,6 +1263,15 @@ func expandPath(path string) string {
 
 // formatTime stores timestamps in UTC RFC3339Nano for stable round-trips.
 func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// formatStartedAt stores the RUNNING-entry stamp, keeping the empty
+// string for a task that has never run so the column default round-trips.
+func formatStartedAt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return formatTime(t)
+}
 
 // parseTime reads back formatTime output.
 func parseTime(s string) (time.Time, error) { return time.Parse(time.RFC3339Nano, s) }

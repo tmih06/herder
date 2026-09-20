@@ -6,7 +6,8 @@
 // instead of a second worker.
 // Approach: static policy from config (repository known and enabled,
 // trigger label present), then one atomic storage.Claim covering delivery
-// dedup, source dedup, the concurrency cap, and the insert. A mutex
+// dedup, source dedup, and the insert; concurrency caps belong to the
+// scheduler (issue #7), so bursts queue instead of being denied. A mutex
 // serializes same-process deliveries; UNIQUE rows cover sibling processes.
 // Inputs: IssueEvent deliveries plus the loaded config and open store.
 // Flow: Handle validates -> static gate -> Claim or RecordDenied.
@@ -18,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -70,7 +72,10 @@ func New(cfg *config.Config, store *storage.Store) *Handler {
 // ineligible or duplicate delivery becomes a logged non-event" holds.
 // Flow: validate identity -> unknown/disabled repository denied ->
 // missing trigger label denied -> atomic Claim (same-delivery and
-// same-issue redeliveries return duplicate, a breached cap is denied).
+// same-issue redeliveries return duplicate; bursts queue for the
+// scheduler's caps rather than being denied here).
+// A "priority:N" label on the issue seeds the task's queue priority
+// (advisory only; malformed values are ignored, never denied).
 // Malformed events (no delivery id, repository, or issue number) are
 // caller errors, not denials: nothing durable can reference them.
 func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
@@ -125,7 +130,7 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
 		Goal:           goal,
-		MaxActive:      h.cfg.Scheduler.MaxWorkers,
+		Priority:       labelPriority(ev.Labels),
 		PolicyPayload:  string(payload),
 		ActorType:      "controller",
 		ActorID:        "webhook",
@@ -211,6 +216,24 @@ func matchTrigger(have, triggers []string) string {
 		}
 	}
 	return ""
+}
+
+// labelPriority reads the queue priority convention "priority:N" from the
+// issue labels: the highest non-negative integer wins so multiple labels
+// are order-independent, malformed or negative values are skipped, and
+// absent means 0 (normal).
+func labelPriority(labels []string) int {
+	best := 0
+	for _, l := range labels {
+		n, ok := strings.CutPrefix(l, "priority:")
+		if !ok {
+			continue
+		}
+		if v, err := strconv.Atoi(n); err == nil && v > best {
+			best = v
+		}
+	}
+	return best
 }
 
 // sortedLabels copies labels sorted for stable denial reasons and payloads.

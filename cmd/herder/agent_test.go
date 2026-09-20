@@ -426,7 +426,7 @@ func TestTaskStartFailedReseedKeepsLiveBinding(t *testing.T) {
 
 // TestTaskStartSendFailureKeepsLiveBinding proves a send-side failure
 // after a successful launch is not an orphan: the pane exists, so the
-// optimistic binding survives failTaskStart's liveness probe and the
+// optimistic binding survives the launch failure's liveness probe and the
 // task fails with the link intact for attach and a later re-seed.
 func TestTaskStartSendFailureKeepsLiveBinding(t *testing.T) {
 	state := writeFakeBins(t, "ready")
