@@ -219,19 +219,21 @@ func matchTrigger(have, triggers []string) string {
 }
 
 // labelPriority reads the queue priority convention "priority:N" from the
-// issue labels: the first label carrying a non-negative integer wins and
-// malformed or negative values are skipped, so absent means 0 (normal).
+// issue labels: the highest non-negative integer wins so multiple labels
+// are order-independent, malformed or negative values are skipped, and
+// absent means 0 (normal).
 func labelPriority(labels []string) int {
+	best := 0
 	for _, l := range labels {
 		n, ok := strings.CutPrefix(l, "priority:")
 		if !ok {
 			continue
 		}
-		if v, err := strconv.Atoi(n); err == nil && v >= 0 {
-			return v
+		if v, err := strconv.Atoi(n); err == nil && v > best {
+			best = v
 		}
 	}
-	return 0
+	return best
 }
 
 // sortedLabels copies labels sorted for stable denial reasons and payloads.

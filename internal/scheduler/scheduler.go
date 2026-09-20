@@ -45,10 +45,6 @@ const defaultMaxWorkers = 4
 // short enough that a real fix is not delayed.
 const defaultRetryDelay = time.Minute
 
-// heartbeatDivisor spaces lease heartbeats inside the TTL: three beats
-// per lease keeps a live dispatch renewed with slack for a slow store.
-const heartbeatDivisor = 3
-
 // workerStates hold a worker slot: every state between dispatch and the
 // terminal/PR_OPEN states counts against the concurrency caps (SPEC
 // section 15). QUEUED tasks hold no worker yet — they are the queue.
@@ -238,7 +234,7 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 			// a session-less worker on a healthy sandbox is a disconnected
 			// one (SPEC 48).
 			s.disconnect(task, "session gone", map[string]string{
-				"reason": "session gone", "session": "",
+				"session": "",
 			})
 		}
 	}
@@ -300,7 +296,7 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 		if errors.Is(err, sandbox.ErrNotFound) {
 			s.stopWorkerBestEffort(ctx, task)
 			s.disconnect(task, "sandbox gone", map[string]string{
-				"reason": "sandbox gone", "sandbox": container,
+				"sandbox": container,
 			})
 			return false
 		}
@@ -326,19 +322,21 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 	}
 	s.stopWorkerBestEffort(ctx, task)
 	s.disconnect(task, "sandbox "+sb.Status, map[string]string{
-		"reason": "sandbox " + sb.Status, "sandbox": container,
+		"sandbox": container,
 	})
 	return false
 }
 
-// disconnect lands a workerless task WAITING_FOR_HUMAN and records why:
-// the session or sandbox is gone, so a human decides whether the
-// preserved work retries or stops (SPEC section 48).
+// disconnect lands a workerless task WAITING_FOR_HUMAN and records why
+// as the event's reason: the session or sandbox is gone, so a human
+// decides whether the preserved work retries or stops (SPEC section
+// 48).
 func (s *Scheduler) disconnect(task *tasks.Task, why string, payload map[string]string) {
 	if _, err := s.Store.Transition(task.ID, tasks.WaitingForHuman, "controller", s.owner()); err != nil {
 		s.logf("herder: scheduler: reconcile %s: %s: %v", task.ID, why, err)
 		return
 	}
+	payload["reason"] = why
 	s.appendDisconnectEvent(task, payload)
 }
 
@@ -418,11 +416,11 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 		if !s.dispatchable(task.ID, now) {
 			continue
 		}
-		if cap, ok := s.Cfg.Scheduler.PerRepository[task.Repository]; ok && repos[task.Repository] >= cap {
+		if limit, ok := s.Cfg.Scheduler.PerRepository[task.Repository]; ok && repos[task.Repository] >= limit {
 			continue
 		}
 		kind := s.kindOf(task)
-		if cap, ok := s.Cfg.Scheduler.PerAgent[kind]; ok && kinds[kind] >= cap {
+		if limit, ok := s.Cfg.Scheduler.PerAgent[kind]; ok && kinds[kind] >= limit {
 			continue
 		}
 		s.mu.Lock()
@@ -541,7 +539,7 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 func (s *Scheduler) heartbeat(ctx context.Context, taskID, owner string, cancel context.CancelFunc) (<-chan struct{}, func()) {
 	lost := make(chan struct{})
 	done := make(chan struct{})
-	interval := s.leaseTTL() / heartbeatDivisor
+	interval := s.leaseTTL() / dispatch.HeartbeatDivisor
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -636,7 +634,7 @@ func (s *Scheduler) requeueDispatch(task tasks.Task, reason string) {
 	}
 	s.mu.Lock()
 	s.maps()
-	s.backoff[task.ID] = time.Now().Add(s.retryDelay())
+	s.backoff[task.ID] = time.Now().Add(defaultRetryDelay)
 	s.mu.Unlock()
 }
 
@@ -717,11 +715,6 @@ func (s *Scheduler) leaseTTL() time.Duration {
 		return s.Cfg.Scheduler.LeaseTTLDuration()
 	}
 	return config.DefaultLeaseTTL
-}
-
-// retryDelay suppresses re-dispatch after a failed attempt.
-func (s *Scheduler) retryDelay() time.Duration {
-	return defaultRetryDelay
 }
 
 // maxWorkers reads the global cap with the applyDefaults fallback so a

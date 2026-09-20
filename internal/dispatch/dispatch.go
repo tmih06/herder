@@ -10,9 +10,9 @@
 // Approach: the Dispatcher bundles the store, the Herdr launcher, the
 // Docker provider, and the delivery engine behind the same Runner seams
 // the leaf packages use, so tests script subprocesses and the scheduler
-// injects its owner identity. QUEUED tasks take a store lease —
-// heartbeated for the life of the call — before any subprocess so two
-// dispatchers never start the same task.
+// injects its owner identity. QUEUED and PROVISIONING tasks take a
+// store lease — heartbeated for the life of the call — before any
+// subprocess so two dispatchers never start the same task.
 // Inputs: config, the task row, an optional profile override, and the
 // prior agent's name on handoffs.
 // Flow: lease -> resolve profile -> sandbox inspect -> build prompt ->
@@ -42,6 +42,11 @@ import (
 	"github.com/tmih06/herder/internal/tasks"
 )
 
+// HeartbeatDivisor spaces lease heartbeats inside the TTL: three beats
+// per lease keeps a live dispatch renewed with slack for a slow store.
+// Exported for the scheduler's own dispatch heartbeat.
+const HeartbeatDivisor = 3
+
 // Dispatcher runs the shared worker pipeline: provision, launch, stop,
 // and issue-label bookkeeping for one task at a time.
 // Store is required; Launcher, Provider, and Engine lazily default to
@@ -60,7 +65,8 @@ type Dispatcher struct {
 	// Engine performs controller-side delivery ops (issue labels); nil
 	// defaults to a zero-value engine.
 	Engine *deliver.Engine
-	// Owner names this dispatcher in the task lease; empty means "cli".
+	// Owner names this dispatcher in the task lease; empty means
+	// "cli-<pid>" so two concurrent CLI processes never share an owner.
 	Owner string
 	// LeaseTTL bounds one dispatch attempt; zero means
 	// config.DefaultLeaseTTL.
@@ -127,12 +133,14 @@ func (d *Dispatcher) warnf(format string, args ...any) {
 	}
 }
 
-// owner names this dispatcher in the task lease.
+// owner names this dispatcher in the task lease. The CLI default is
+// per-process so two `herder task start` invocations cannot both pass
+// the same-owner check and double-dispatch one task.
 func (d *Dispatcher) owner() string {
 	if d.Owner != "" {
 		return d.Owner
 	}
-	return "cli"
+	return fmt.Sprintf("cli-%d", os.Getpid())
 }
 
 // leaseTTL bounds one dispatch attempt with its default.
@@ -206,11 +214,13 @@ func SandboxRoot(dbPath string) string {
 // here would mark the task RUNNING before any agent exists, and
 // reconcile would read the session-less worker as dead. Dirty work
 // fails with a preservation note.
-// A QUEUED task takes the dispatch lease first — the same mutual
-// exclusion Launch applies — so a manual provision never races the
-// scheduler's dispatch of the same task (SPEC section 50); the lease
-// heartbeats for the life of the call so a slow provision never lapses
-// into a duplicate dispatch.
+// A QUEUED or PROVISIONING task takes the dispatch lease first — the
+// same mutual exclusion Launch applies — so a manual provision never
+// races the scheduler's dispatch of the same task (SPEC section 50);
+// the lease heartbeats for the life of the call so a slow provision
+// never lapses into a duplicate dispatch. All work runs on the
+// lease-held context: a lost heartbeat cancels it, aborting the
+// provider call instead of finishing a dispatch the store requeued.
 // Inputs: bounded ctx, config, and the task row. Returns the first
 // failure; the success line goes to Logf.
 func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *tasks.Task) error {
@@ -219,7 +229,7 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 	} else if repo.Sandbox.Provider != "docker" {
 		return fmt.Errorf("provider %q unsupported here (want docker)", repo.Sandbox.Provider)
 	}
-	release, err := d.holdLease(ctx, task)
+	hctx, release, err := d.holdLease(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -227,14 +237,14 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 		defer release()
 	}
 	spec := SpecForTask(cfg, *task)
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(hctx, 10*time.Minute)
 	defer cancel()
 	sb, err := d.provider().Provision(ctx, spec)
 	if err != nil {
 		return err
 	}
 	d.logf("herder: sandbox %s running (branch %s)", sb.ID, sb.Branch)
-	if err := d.advanceToProvisioning(task); err != nil {
+	if err := d.advanceToProvisioning(ctx, task); err != nil {
 		return err
 	}
 	payload, _ := json.Marshal(map[string]string{
@@ -257,7 +267,7 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 // re-provisioning an active task is normal. Returns the first rejected
 // transition so callers can stop instead of reporting a started agent
 // for a task the store no longer considers launchable.
-func (d *Dispatcher) advanceToRunning(task *tasks.Task, relaunch bool) error {
+func (d *Dispatcher) advanceToRunning(ctx context.Context, task *tasks.Task, relaunch bool) error {
 	var path []tasks.State
 	switch task.Status {
 	case tasks.Queued:
@@ -272,14 +282,19 @@ func (d *Dispatcher) advanceToRunning(task *tasks.Task, relaunch bool) error {
 	default:
 		return nil
 	}
-	return d.walkPath(task, path)
+	return d.walkPath(ctx, task, path)
 }
 
 // walkPath applies one transition chain, stamping each step and
-// advancing task.Status so the in-memory row tracks the store. Returns
-// the first rejected transition wrapped with the from/to states.
-func (d *Dispatcher) walkPath(task *tasks.Task, path []tasks.State) error {
+// advancing task.Status so the in-memory row tracks the store. ctx is
+// re-checked before every step: a lease-lost dispatch must not mark a
+// requeued task RUNNING. Returns the first rejected transition wrapped
+// with the from/to states.
+func (d *Dispatcher) walkPath(ctx context.Context, task *tasks.Task, path []tasks.State) error {
 	for _, next := range path {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, next, err)
+		}
 		if _, err := d.Store.Transition(task.ID, next, d.actorType(), d.actorID()); err != nil {
 			return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, next, err)
 		}
@@ -294,11 +309,11 @@ func (d *Dispatcher) walkPath(task *tasks.Task, path []tasks.State) error {
 // Returns the rejected transition so callers can stop instead of
 // reporting a provisioned sandbox for a task the store no longer
 // considers launchable.
-func (d *Dispatcher) advanceToProvisioning(task *tasks.Task) error {
+func (d *Dispatcher) advanceToProvisioning(ctx context.Context, task *tasks.Task) error {
 	if task.Status != tasks.Queued {
 		return nil
 	}
-	return d.walkPath(task, []tasks.State{tasks.Provisioning})
+	return d.walkPath(ctx, task, []tasks.State{tasks.Provisioning})
 }
 
 // StopWorker ends the live session and thaws a paused container so a
@@ -332,35 +347,40 @@ func (d *Dispatcher) leaseError(taskID string, err error) error {
 		taskID, owner, err)
 }
 
-// holdLease takes the task's dispatch lease for a QUEUED task unless the
-// caller already holds it: a live same-owner lease means an outer
-// dispatch (the scheduler's dispatchOne) owns the lifecycle, so this
-// call neither renews nor releases it. A lease this call acquires gets a
-// heartbeat goroutine ticking every TTL/3 on ctx — a provision longer
-// than the TTL must not let the lease lapse into a duplicate dispatch.
-// A lost lease only warns and ends the beat: the caller's own
-// transitions remain the guard against acting on a stolen task.
-// Returns the release func for the caller to defer — nil when the task
-// is not QUEUED or the lease was already ours — or a leaseError when a
-// foreign owner holds it. Release is idempotent: it stops the beat then
-// drops the lease.
-func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (func(), error) {
-	if task.Status != tasks.Queued {
-		return nil, nil
+// holdLease takes the task's dispatch lease for a QUEUED or
+// PROVISIONING task unless the caller already holds it: a live
+// same-owner lease means an outer dispatch (the scheduler's
+// dispatchOne) owns the lifecycle, so this call neither renews nor
+// releases it. A lease this call acquires gets a heartbeat goroutine
+// ticking every TTL/HeartbeatDivisor on hctx — a provision longer than
+// the TTL must not let the lease lapse into a duplicate dispatch.
+// Any heartbeat failure warns and cancels hctx, mirroring
+// dispatchOne's pctx-cancel-on-ErrLeaseLost: a stale CLI must not keep
+// working toward a duplicate worker, and the ctx re-checks in walkPath
+// stop it from marking a requeued task RUNNING.
+// Returns the lease-held context and the release func for the caller
+// to defer — ctx unchanged and nil release when the task is not
+// QUEUED/PROVISIONING or the lease was already ours — or a leaseError
+// when a foreign owner holds it. Release is idempotent: it stops the
+// beat, cancels hctx, then drops the lease.
+func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (context.Context, func(), error) {
+	if task.Status != tasks.Queued && task.Status != tasks.Provisioning {
+		return ctx, nil, nil
 	}
 	owner := d.owner()
 	if lease, err := d.Store.GetLease(task.ID); err == nil &&
 		lease.Owner == owner && lease.ExpiresAt.After(time.Now().UTC()) {
-		return nil, nil
+		return ctx, nil, nil
 	}
 	if err := d.Store.AcquireLease(task.ID, owner, d.leaseTTL()); err != nil {
 		if errors.Is(err, storage.ErrLeaseHeld) {
-			return nil, d.leaseError(task.ID, err)
+			return nil, nil, d.leaseError(task.ID, err)
 		}
-		return nil, err
+		return nil, nil, err
 	}
+	hctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	interval := d.leaseTTL() / 3
+	interval := d.leaseTTL() / HeartbeatDivisor
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -371,20 +391,22 @@ func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (func(), e
 			select {
 			case <-done:
 				return
-			case <-ctx.Done():
+			case <-hctx.Done():
 				return
 			case <-ticker.C:
 				if err := d.Store.HeartbeatLease(task.ID, owner, d.leaseTTL()); err != nil {
 					d.warnf("herder: dispatch %s: lease heartbeat: %v", task.ID, err)
+					cancel()
 					return
 				}
 			}
 		}
 	}()
 	var once sync.Once
-	return func() {
+	return hctx, func() {
 		once.Do(func() {
 			close(done)
+			cancel()
 			_ = d.Store.ReleaseLease(task.ID, owner)
 		})
 	}, nil

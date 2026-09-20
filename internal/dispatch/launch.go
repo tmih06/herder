@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/tasks"
 )
+
+// launchTimeout bounds one Launch call like Provision's 10m bound: a
+// hung herdr call must not heartbeat forever and burn a worker slot.
+const launchTimeout = 10 * time.Minute
 
 // Launch runs the shared launch flow behind start, retry, handoff, and
 // the scheduler: resolve profile -> sandbox inspect reports running ->
@@ -18,24 +23,31 @@ import (
 // event. priorAgent names the previous worker on a handoff so the
 // prompt tells the new agent it inherits existing work instead of
 // starting cold.
-// A QUEUED task takes the dispatch lease before any subprocess so two
-// dispatchers never start it twice; the lease heartbeats until the call
-// returns and releases on exit, unless an outer dispatch already owns it.
+// A QUEUED or PROVISIONING task takes the dispatch lease before any
+// subprocess so two dispatchers never start it twice; the lease
+// heartbeats until the call returns and releases on exit, unless an
+// outer dispatch already owns it. All work runs on the lease-held
+// context bounded by launchTimeout: a lost heartbeat cancels it so a
+// stale CLI stops instead of finishing a dispatch the store requeued,
+// and a hung subprocess dies at the bound instead of beating forever.
 // Returns the first failure carrying the operator-facing message; the
 // success line goes to Logf.
 func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks.Task, override, priorAgent string) error {
-	// The dispatch lease serializes QUEUED launches (SPEC section 50):
-	// a second dispatcher sees ErrLeaseHeld instead of double-starting.
-	// Non-QUEUED relaunches (retry, handoff) are already serialized by
-	// the caller's own transition, so they run lease-free. A live
-	// same-owner lease means an outer dispatch owns the lifecycle.
-	release, err := d.holdLease(ctx, task)
+	// The dispatch lease serializes QUEUED and PROVISIONING launches
+	// (SPEC section 50): a second dispatcher sees ErrLeaseHeld instead
+	// of double-starting. Relaunches (retry, handoff) are already
+	// serialized by the caller's own transition, so they run
+	// lease-free. A live same-owner lease means an outer dispatch owns
+	// the lifecycle.
+	hctx, release, err := d.holdLease(ctx, task)
 	if err != nil {
 		return err
 	}
 	if release != nil {
 		defer release()
 	}
+	ctx, cancel := context.WithTimeout(hctx, launchTimeout)
+	defer cancel()
 	repo, ok := cfg.Repositories[task.Repository]
 	if !ok {
 		return d.failTaskStart(ctx, task, fmt.Sprintf("repository %q not in config", task.Repository))
@@ -110,7 +122,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		d.actorType(), d.actorID()); err != nil {
 		d.warnf("herder: record agent state: %v", err)
 	}
-	if err := d.advanceToRunning(task, true); err != nil {
+	if err := d.advanceToRunning(ctx, task, true); err != nil {
 		return err
 	}
 	if err := d.emitEvent(task.ID, "agent.started", map[string]string{
@@ -144,7 +156,7 @@ func (d *Dispatcher) reuseSession(ctx context.Context, task *tasks.Task,
 			return d.failTaskStart(ctx, task, err.Error())
 		}
 	}
-	if err := d.advanceToRunning(task, true); err != nil {
+	if err := d.advanceToRunning(ctx, task, true); err != nil {
 		return err
 	}
 	if err := d.emitEvent(task.ID, "agent.started", payload); err != nil {

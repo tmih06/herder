@@ -101,33 +101,34 @@ const DefaultLeaseTTL = 2 * time.Minute
 // omitted.
 const DefaultDispatchInterval = 2 * time.Second
 
-// LeaseTTLDuration parses the configured lease TTL with its default.
-// Purpose: one place owns the string->duration rule the validator
-// already checked. Returns DefaultLeaseTTL on empty or invalid input.
-func (s SchedulerConfig) LeaseTTLDuration() time.Duration {
-	if d, err := time.ParseDuration(s.LeaseTTL); err == nil && d > 0 {
+// durationOr parses raw as a positive Go duration, returning def on
+// empty or invalid input. Purpose: one place owns the string->duration
+// rule the validator already checked. Inputs: raw config string and
+// fallback. Returns the parsed duration or def.
+func durationOr(raw string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 		return d
 	}
-	return DefaultLeaseTTL
+	return def
+}
+
+// LeaseTTLDuration parses the configured lease TTL with its default.
+// Returns DefaultLeaseTTL on empty or invalid input.
+func (s SchedulerConfig) LeaseTTLDuration() time.Duration {
+	return durationOr(s.LeaseTTL, DefaultLeaseTTL)
 }
 
 // DispatchIntervalDuration parses the configured dispatch interval with
 // its default. Returns DefaultDispatchInterval on empty or invalid input.
 func (s SchedulerConfig) DispatchIntervalDuration() time.Duration {
-	if d, err := time.ParseDuration(s.DispatchInterval); err == nil && d > 0 {
-		return d
-	}
-	return DefaultDispatchInterval
+	return durationOr(s.DispatchInterval, DefaultDispatchInterval)
 }
 
 // TimeoutDuration parses an agent profile's timeout; zero means no limit.
 // Purpose: the scheduler's time-limit enforcement needs the duration the
 // validator already checked. Returns 0 on empty or invalid input.
 func (a AgentConfig) TimeoutDuration() time.Duration {
-	if d, err := time.ParseDuration(a.Timeout); err == nil && d > 0 {
-		return d
-	}
-	return 0
+	return durationOr(a.Timeout, 0)
 }
 
 // RepositoryConfig is the per-repo policy: trigger, agent, sandbox,
@@ -272,33 +273,37 @@ func (c *Config) validate() []error {
 	if c.Scheduler.MaxWorkers < 1 {
 		errs = append(errs, fmt.Errorf("scheduler.max_workers must be >= 1, got %d", c.Scheduler.MaxWorkers))
 	}
-	for name, cap := range c.Scheduler.PerRepository {
+	for name, limit := range c.Scheduler.PerRepository {
 		if _, ok := c.Repositories[name]; !ok {
 			errs = append(errs, fmt.Errorf("scheduler.per_repository.%q is not a configured repository (defined: %s)",
 				name, strings.Join(sortedKeys(c.Repositories), ", ")))
 		}
-		if cap < 1 {
-			errs = append(errs, fmt.Errorf("scheduler.per_repository.%q must be >= 1, got %d", name, cap))
+		if limit < 1 {
+			errs = append(errs, fmt.Errorf("scheduler.per_repository.%q must be >= 1, got %d", name, limit))
 		}
 	}
-	for kind, cap := range c.Scheduler.PerAgent {
+	for kind, limit := range c.Scheduler.PerAgent {
 		if !contains(supportedAgentKinds, kind) {
 			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q is not a supported agent kind (want one of %s)",
 				kind, strings.Join(supportedAgentKinds, ", ")))
 		}
-		if cap < 1 {
-			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q must be >= 1, got %d", kind, cap))
+		if limit < 1 {
+			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q must be >= 1, got %d", kind, limit))
 		}
 	}
-	for field, raw := range map[string]string{
-		"scheduler.lease_ttl":         c.Scheduler.LeaseTTL,
-		"scheduler.dispatch_interval": c.Scheduler.DispatchInterval,
+	// Slice, not map: errors must come out in declaration order.
+	for _, d := range []struct {
+		field string
+		raw   string
+	}{
+		{"scheduler.lease_ttl", c.Scheduler.LeaseTTL},
+		{"scheduler.dispatch_interval", c.Scheduler.DispatchInterval},
 	} {
-		if raw == "" {
+		if d.raw == "" {
 			continue
 		}
-		if d, err := time.ParseDuration(raw); err != nil || d <= 0 {
-			errs = append(errs, fmt.Errorf("%s %q must be a positive Go duration (example \"2m\")", field, raw))
+		if parsed, err := time.ParseDuration(d.raw); err != nil || parsed <= 0 {
+			errs = append(errs, fmt.Errorf("%s %q must be a positive Go duration (example \"2m\")", d.field, d.raw))
 		}
 	}
 	if len(c.Repositories) == 0 {

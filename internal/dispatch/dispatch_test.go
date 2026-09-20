@@ -352,7 +352,7 @@ func TestAdvanceToRunningRejectsCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Dispatcher{Store: store}
-	if err := d.advanceToRunning(&task, true); err == nil {
+	if err := d.advanceToRunning(context.Background(), &task, true); err == nil {
 		t.Fatal("advance on a cancelled task should fail, got nil")
 	}
 	if task.Status != tasks.Queued {
