@@ -120,7 +120,7 @@ var allowed = map[State][]State{
 	Queued:          {Provisioning, Paused, Cancelled, Failed},
 	Provisioning:    {Running, Queued, Retrying, Cancelled, Failed},
 	Running:         {Validating, Blocked, WaitingForHuman, Paused, Retrying, TimedOut, Cancelled, Failed},
-	Validating:      {Reviewing, WaitingForHuman, Retrying, Cancelled, Failed},
+	Validating:      {Reviewing, Running, WaitingForHuman, Retrying, Cancelled, Failed},
 	Reviewing:       {Delivering, Validating, Done, WaitingForHuman, Retrying, Cancelled, Failed},
 	Delivering:      {PROpen, Validating, Reviewing, Retrying, Cancelled, Failed},
 	PROpen:          {Done, Cancelled, Failed},

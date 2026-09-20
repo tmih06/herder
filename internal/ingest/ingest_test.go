@@ -13,7 +13,7 @@ import (
 )
 
 // testSetup loads the example config over a throwaway store: repository
-// tmih06/meltiply with trigger agent-ready, agent codex-default, cap 4.
+// owner/repo with trigger agent-ready, agent codex-default, cap 4.
 func testSetup(t *testing.T) (*config.Config, *storage.Store, *ingest.Handler) {
 	t.Helper()
 	cfg, err := config.Load("../../examples/herder.yaml")
@@ -31,7 +31,7 @@ func testSetup(t *testing.T) (*config.Config, *storage.Store, *ingest.Handler) {
 func eligibleEvent(delivery string, issue int) ingest.IssueEvent {
 	return ingest.IssueEvent{
 		DeliveryID:  delivery,
-		Repository:  "tmih06/meltiply",
+		Repository:  "owner/repo",
 		IssueNumber: issue,
 		Title:       "Fix OAuth refresh race",
 		Body:        "Refresh tokens race on expiry",
@@ -54,7 +54,7 @@ func TestHandleAccepts(t *testing.T) {
 	if out.Task.Status != tasks.Queued {
 		t.Errorf("status = %s, want QUEUED", out.Task.Status)
 	}
-	if out.Task.SourceRef != "tmih06/meltiply#182" || out.Task.SourceProvider != "github" {
+	if out.Task.SourceRef != "owner/repo#182" || out.Task.SourceProvider != "github" {
 		t.Errorf("source identity lost: %+v", out.Task)
 	}
 	if out.Task.BranchName != "herder/182-fix-oauth-refresh-race" {
@@ -197,9 +197,9 @@ func TestHandleDenies(t *testing.T) {
 // A disabled repository denies even with the trigger label present.
 func TestHandleDisabledRepo(t *testing.T) {
 	cfg, _, _ := testSetup(t)
-	repo := cfg.Repositories["tmih06/meltiply"]
+	repo := cfg.Repositories["owner/repo"]
 	repo.Enabled = false
-	cfg.Repositories["tmih06/meltiply"] = repo
+	cfg.Repositories["owner/repo"] = repo
 
 	store, err := storage.Open(t.TempDir() + "/herder.db")
 	if err != nil {
@@ -326,9 +326,9 @@ func TestHandleValidation(t *testing.T) {
 	_, _, h := testSetup(t)
 
 	for name, ev := range map[string]ingest.IssueEvent{
-		"no delivery id": {Repository: "tmih06/meltiply", IssueNumber: 1, Labels: []string{"agent-ready"}},
+		"no delivery id": {Repository: "owner/repo", IssueNumber: 1, Labels: []string{"agent-ready"}},
 		"no repository":  {DeliveryID: "d", IssueNumber: 1, Labels: []string{"agent-ready"}},
-		"no issue":       {DeliveryID: "d", Repository: "tmih06/meltiply", Labels: []string{"agent-ready"}},
+		"no issue":       {DeliveryID: "d", Repository: "owner/repo", Labels: []string{"agent-ready"}},
 	} {
 		if _, err := h.Handle(ev); err == nil {
 			t.Errorf("Handle(%s) must fail", name)
@@ -344,12 +344,12 @@ func TestParseGitHubIssuesEvent(t *testing.T) {
 		"issue":{"number":182,"title":"Fix OAuth refresh race",
 			"body":"Refresh tokens race on expiry",
 			"labels":[{"name":"bug"},{"name":"agent-ready"}]},
-		"repository":{"full_name":"tmih06/meltiply"}}`
+		"repository":{"full_name":"owner/repo"}}`
 	ev, ignored, err := ingest.ParseGitHubIssuesEvent("del-1", []byte(body))
 	if err != nil || ignored {
 		t.Fatalf("Parse = %+v, %v, %v; want event", ev, ignored, err)
 	}
-	if ev.Repository != "tmih06/meltiply" || ev.IssueNumber != 182 || ev.DeliveryID != "del-1" {
+	if ev.Repository != "owner/repo" || ev.IssueNumber != 182 || ev.DeliveryID != "del-1" {
 		t.Errorf("event mistranslated: %+v", ev)
 	}
 	if ev.Body != "Refresh tokens race on expiry" {
@@ -366,7 +366,7 @@ func TestParseGitHubIssuesEvent(t *testing.T) {
 	}
 
 	opened := `{"action":"opened","issue":{"number":1,"title":"x","labels":[]},
-		"repository":{"full_name":"tmih06/meltiply"}}`
+		"repository":{"full_name":"owner/repo"}}`
 	if _, ignored, err := ingest.ParseGitHubIssuesEvent("d", []byte(opened)); err != nil || !ignored {
 		t.Errorf("opened action must be ignored, got %v, %v", ignored, err)
 	}

@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -63,12 +64,26 @@ func CommandForKind(kind string) (string, bool) {
 	return cmd, ok
 }
 
+// sessionNameSafe mirrors sandbox.ContainerName's charset rule: Herdr
+// session names must match ^[a-z][a-z0-9_-]{0,31}$, so anything outside
+// the class becomes a dash instead of failing `agent rename` at launch.
+var sessionNameSafe = regexp.MustCompile(`[^a-z0-9_-]+`)
+
 // SessionName derives the deterministic Herdr session for a task.
 // Purpose: relaunching the same task converges on one session instead of
-// orphaning panes. Inputs: task id (already charset-safe). Returns the
-// herder-<task> session name.
+// orphaning panes. Inputs: task id. Returns the herder-<task> session
+// name, sanitized to Herdr's name class and truncated to fit.
 func SessionName(taskID string) string {
-	return "herder-" + strings.ToLower(strings.TrimSpace(taskID))
+	s := strings.ToLower(strings.TrimSpace(taskID))
+	s = sessionNameSafe.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = "task"
+	}
+	if len(s) > 25 {
+		s = s[:25]
+	}
+	return "herder-" + s
 }
 
 // ResolveProfile selects the agent profile for a task: an explicit override
@@ -351,6 +366,22 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		return StartResult{}, err
 	}
 	run := l.runner()
+	// `pane run` joins its argv with raw spaces and the pane's shell
+	// re-parses the result, so every token must be space- and
+	// metachar-free: shim path (under the state dir), container name,
+	// and the agent command. A violation would type a broken or
+	// injected command line into the pane — refuse before it runs.
+	shimArgv := []string{shim, "exec", "-it", in.Container, cmd}
+	for _, tok := range shimArgv {
+		if strings.ContainsAny(tok, " \t\n\"'\\$`;&|<>(){}[]") {
+			return StartResult{}, fmt.Errorf("agent: pane run token %q is not shell-safe", tok)
+		}
+	}
+	// A previous launch under this session name can leave a dead
+	// workspace behind (Herdr restart restores panes as shells; the
+	// name record is gone but the workspace lingers). Close same-label
+	// workspaces so relaunches converge on one workspace per session.
+	l.closeStaleWorkspaces(ctx, in.Session)
 	out, err := run(ctx, "herdr", "workspace", "create",
 		"--label", in.Session, "--cwd", in.Workspace,
 		"--env", "HERDR_AGENT="+in.AgentKind, "--no-focus")
@@ -367,11 +398,10 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 	res := StartResult{PaneID: paneID, WorkspaceID: workspaceID}
 	// From here on, failure must not leak the pane/workspace.
 	fail := func(err error) (StartResult, error) {
-		l.closePaneBestEffort(paneID)
+		l.closePaneBestEffort(paneID, in.Container)
 		return res, err
 	}
-	if out, err := run(ctx, "herdr", "pane", "run", paneID,
-		shim, "exec", "-it", in.Container, cmd); err != nil {
+	if out, err := run(ctx, "herdr", append([]string{"pane", "run", paneID}, shimArgv...)...); err != nil {
 		return fail(fmt.Errorf("agent: pane run %s: %w", in.Session, err))
 	} else if out.ExitCode != 0 {
 		return fail(fmt.Errorf("agent: pane run %s: %s", in.Session, textutil.FirstLine(out.Stderr)))
@@ -448,13 +478,81 @@ func (l *Launcher) waitDetected(ctx context.Context, paneID, kind string) error 
 	}
 }
 
-// closePaneBestEffort closes a pane after a failed launch: the pane's
-// process tree dies with it, and closing the workspace's last pane removes
-// the workspace. Errors are swallowed — the launch error is authoritative.
-func (l *Launcher) closePaneBestEffort(paneID string) {
+// closePaneBestEffort closes a pane after a failed launch and kills the
+// in-container agent process: `pane close` only drops the host-side
+// exec client — the docker exec'd agent keeps running deaf inside the
+// container, burning tokens and writing files after Herder believes it
+// stopped. Closing the workspace's last pane removes the workspace.
+// Errors are swallowed — the launch error is authoritative.
+func (l *Launcher) closePaneBestEffort(paneID, container string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, _ = l.runner()(ctx, "herdr", "pane", "close", paneID)
+	l.killContainerAgent(ctx, container)
+}
+
+// killContainerAgent kills the agent process inside the task container:
+// `docker top` lists container processes with host PIDs, and the agent
+// command (or a script wrapper carrying its path in argv) is matched and
+// killed from the host — no tools required inside the image. A missing
+// container or a dead agent is a no-op; errors are swallowed because the
+// caller's outcome is already decided.
+func (l *Launcher) killContainerAgent(ctx context.Context, container string) {
+	if container == "" {
+		return
+	}
+	out, err := l.runner()(ctx, "docker", "top", container, "-eo", "pid,comm,args")
+	if err != nil || out.ExitCode != 0 {
+		return
+	}
+	for _, line := range strings.Split(out.Stdout, "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, comm, args := fields[0], fields[1], strings.Join(fields[2:], " ")
+		// The agent is the docker exec'd command: match its comm (direct
+		// binary) or its path inside argv (script wrapper like the demo's
+		// `sh /usr/local/bin/codex`). Skip the container's own init.
+		if pid == "1" {
+			continue
+		}
+		for _, kind := range []string{"codex", "claude", "opencode", "gemini"} {
+			if filepath.Base(comm) == kind || strings.Contains(args, kind) {
+				_, _ = l.runner()(ctx, "kill", "-9", pid)
+				break
+			}
+		}
+	}
+}
+
+// closeStaleWorkspaces closes workspaces still carrying the session
+// label: a Herdr restart restores panes as shells with no agent record,
+// so relaunching under the deterministic session name would otherwise
+// accumulate dead workspaces. `workspace list` labels are the durable
+// handle; close failures are ignored — a wedged workspace must not
+// block the launch that replaces it.
+func (l *Launcher) closeStaleWorkspaces(ctx context.Context, session string) {
+	out, err := l.runner()(ctx, "herdr", "workspace", "list")
+	if err != nil || out.ExitCode != 0 {
+		return
+	}
+	var parsed struct {
+		Result struct {
+			Workspaces []struct {
+				ID    string `json:"workspace_id"`
+				Label string `json:"label"`
+			} `json:"workspaces"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil {
+		return
+	}
+	for _, ws := range parsed.Result.Workspaces {
+		if ws.Label == session {
+			_, _ = l.runner()(ctx, "herdr", "workspace", "close", ws.ID)
+		}
+	}
 }
 
 // SendPrompt delivers the seeded prompt to a live Herdr session via
@@ -624,10 +722,14 @@ func (l *Launcher) Read(ctx context.Context, session string, lines int) (string,
 	return strings.TrimRight(out.Stdout, "\n"), nil
 }
 
-// Stop ends one live Herdr session by closing its pane: the agent process
-// dies with the pane while the sandbox and workspace stay intact for
-// inspection or a fresh attempt. A session that is already gone is a
-// no-op — the desired end state holds either way.
+// Stop ends one live Herdr session: the pane closes AND the agent
+// process inside the task container is killed — `pane close` alone
+// only drops the host-side exec client, leaving the docker exec'd
+// agent running deaf inside the container (verified: it survives
+// indefinitely, writing files and burning tokens after Herder believes
+// it stopped). The sandbox and workspace stay intact for inspection or
+// a fresh attempt. A session that is already gone is a no-op — the
+// desired end state holds either way.
 func (l *Launcher) Stop(ctx context.Context, session string) error {
 	info, err := l.Get(ctx, session)
 	if err != nil {
@@ -646,6 +748,9 @@ func (l *Launcher) Stop(ctx context.Context, session string) error {
 	if out.ExitCode != 0 {
 		return fmt.Errorf("agent: stop %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
+	// The session name IS the container name (both herder-<taskid>):
+	// kill the deaf agent the pane close orphaned.
+	l.killContainerAgent(ctx, session)
 	return nil
 }
 

@@ -26,7 +26,7 @@ func writeTestConfig(t *testing.T) string {
 	dir := t.TempDir()
 	body := strings.ReplaceAll(config.ExampleYAML,
 		"~/.local/state/herder/herder.db", filepath.Join(dir, "herder.db"))
-	body = strings.ReplaceAll(body, "tmih06/meltiply", "acme/web")
+	body = strings.ReplaceAll(body, "owner/repo", "acme/web")
 	body += `
   claude-reviewer:
     kind: claude

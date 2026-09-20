@@ -3,34 +3,39 @@
 #
 # Why: the end-to-end demo must run on one machine with no agent account
 # or API key. This script plays the agent's part deterministically: it
-# reads the seeded task contract and any human messages line by line,
-# records each input, writes the fix the task asked for, commits it on
-# the task branch, and exits so Herdr reports the session gone and the
-# operator can run validation and delivery.
+# consumes the seeded task contract and any human messages line by line
+# (`herdr agent prompt` delivers multi-line text one read per line),
+# records each input, and on the finish sentinel writes the fix the task
+# asked for, commits it on the task branch, and exits.
 #
-# Protocol (one line per input, delivered by `herdr agent prompt`):
-#   any line            -> echoed and appended to .herder-messages
-#   a line containing "finish" -> write FIX.md, git commit, print
-#                          HERDER_DONE, exit 0
-#   EOF / 5-minute idle -> commit whatever is pending and exit
+# Protocol (one line per input):
+#   any line                       -> appended to .herder-messages
+#   a line containing "finish"     -> write FIX.md, git commit, exit 0
+#   EOF / 5-minute idle            -> commit whatever is pending, exit
+#
+# Output stays terse and declarative: Herdr classifies agent_status from
+# screen heuristics, so prompt-like text (a trailing "?", "blocked",
+# "done"-style idle banners) would misreport the session as blocked and
+# `agent prompt` would refuse with agent_blocked.
 set -u
 cd /workspace 2>/dev/null || exit 1
 
-echo "codex demo agent ready (task ${HERDER_TASK:-unknown})"
+echo "codex demo agent ready"
 
 finish() {
 	echo "fix for ${HERDER_TASK:-task}" > FIX.md
 	git add -A >/dev/null 2>&1
 	git -c user.name="herder-demo" -c user.email="demo@herder.local" \
 		commit -qm "herder: demo fix" >/dev/null 2>&1
-	echo "HERDER_DONE"
+	echo "work committed"
 	exit 0
 }
 
-# Read inputs until the finish sentinel, EOF, or a long idle gap.
+# Read inputs until the finish sentinel or EOF. The seeded contract
+# arrives line by line; only the sentinel acts. (No idle timeout: the
+# worker image's /bin/sh is dash, whose read has no -t.)
 while IFS= read -r line || [ -n "$line" ]; do
 	printf '%s\n' "$line" >> .herder-messages
-	echo "got: $line"
 	case "$line" in
 	*finish*) finish ;;
 	esac

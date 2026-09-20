@@ -468,11 +468,13 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 			fmt.Fprintf(ew, "herder: bump attempt: %v\n", err)
 			return 1
 		}
-		for _, next := range []tasks.State{tasks.Retrying, tasks.Running} {
-			if err := transition(store, task, next, ew); err != nil {
-				fmt.Fprintf(ew, "herder: %v\n", err)
-				return 1
-			}
+		// One atomic hop back to RUNNING: the agent never stopped, so a
+		// RETRYING waypoint would only open a window where reconcile's
+		// lease check requeues the task mid-transition and a second
+		// dispatch launches a duplicate worker.
+		if err := transition(store, task, tasks.Running, ew); err != nil {
+			fmt.Fprintf(ew, "herder: %v\n", err)
+			return 1
 		}
 		prompt := fmt.Sprintf("Herder validation failed (attempt %d). Fix the issues below, commit your work, and report done again.\n\n%s",
 			bumped.Attempt, summary)
