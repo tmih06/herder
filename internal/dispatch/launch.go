@@ -106,7 +106,9 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 	}
 	res, err := d.launcher().Start(ctx, agent.StartInput{
 		Session: session, AgentKind: prof.Kind,
-		Workspace: workspace, Container: container, Prompt: prompt,
+		Workspace: workspace, Container: container,
+		ShimDir: agent.ShimRoot(cfg.Database.Path),
+		Prompt:  prompt,
 	})
 	if err != nil {
 		// Record the binding optimistically so a session that did start

@@ -37,8 +37,17 @@ func (s *scriptedHerdr) run(ctx context.Context, name string, args ...string) (R
 			`{"result":{"agent":{"agent":"codex","agent_status":%q,"pane_id":"w9:p-%s","workspace_id":"w9"}}}`,
 			status, session)}, nil
 	case "agent read":
-		return RunResult{Stdout: fmt.Sprintf(
-			`{"result":{"read":{"text":%q}}}`, s.readText)}, nil
+		// herdr 0.9.x prints the pane tail directly, no JSON envelope.
+		return RunResult{Stdout: s.readText + "\n"}, nil
+	case "pane process-info":
+		// The shim stays foreground while the session lives; a gone
+		// session's pane fell back to its shell.
+		pane := args[3]
+		sess := strings.TrimPrefix(pane, "w9:p-")
+		if s.gone[sess] {
+			return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"fish"}]}}}`}, nil
+		}
+		return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
 	}
 	return RunResult{}, nil
 }
@@ -388,7 +397,7 @@ func TestGetGoneSession(t *testing.T) {
 	}
 }
 
-// TestReadReturnsTail proves `agent read` JSON lands as plain text.
+// TestReadReturnsTail proves `agent read` raw text lands as plain text.
 func TestReadReturnsTail(t *testing.T) {
 	fake := &scriptedHerdr{readText: "line one\nline two"}
 	l := &Launcher{Runner: fake.run}
