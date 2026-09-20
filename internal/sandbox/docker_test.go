@@ -201,6 +201,44 @@ func TestProvisionReusesRunningContainer(t *testing.T) {
 	}
 }
 
+// TestProvisionUnpausesPausedContainer proves a QUEUED task on a paused
+// sandbox thaws before docker start: start alone cannot wake a paused
+// container, so unpause must precede it in the call log.
+func TestProvisionUnpausesPausedContainer(t *testing.T) {
+	f := &fakeRunner{}
+	f.respond = func(name string, args []string) (RunResult, error) {
+		if out, err := okGit(name, args); name == "git" {
+			return out, err
+		}
+		argv := strings.Join(args, " ")
+		if name == "docker" && strings.HasPrefix(argv, "inspect --format") {
+			return RunResult{Stdout: "paused\n"}, nil
+		}
+		return RunResult{}, nil
+	}
+	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	if _, err := p.Provision(context.Background(), testSpec()); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	unpause, start := -1, -1
+	for i, c := range f.calls {
+		if len(c) >= 2 && c[0] == "docker" {
+			switch c[1] {
+			case "unpause":
+				unpause = i
+			case "start":
+				start = i
+			}
+		}
+	}
+	if unpause < 0 || start < 0 || unpause > start {
+		t.Errorf("paused container must unpause before start, calls %v", f.calls)
+	}
+	if argvOf(f.calls, "docker", "create") != nil {
+		t.Error("paused container must be thawed, not recreated")
+	}
+}
+
 func TestExecReturnsOutputAndExit(t *testing.T) {
 	f := &fakeRunner{}
 	f.respond = func(name string, args []string) (RunResult, error) {

@@ -96,7 +96,8 @@ func (p *DockerProvider) logf(format string, args ...any) {
 // spec, never discarding uncommitted work.
 // Why: re-provisioning the same task must converge, not destroy.
 // Flow: validate -> ensure repo -> dirty guard -> checkout branch ->
-// create-or-start container. Dirty work fails with *DirtyError before any
+// create-or-start container, unpausing first when paused (docker start
+// cannot wake one). Dirty work fails with *DirtyError before any
 // container call; missing containers are created least-privilege.
 func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, error) {
 	if err := validateSpec(spec); err != nil {
@@ -134,6 +135,13 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	}
 	if state == "" {
 		if err := p.create(ctx, spec, name, workspace); err != nil {
+			return nil, err
+		}
+	}
+	// docker start fails on a paused container, which would requeue a
+	// QUEUED task forever; thaw before the start below.
+	if state == "paused" {
+		if err := p.Unpause(ctx, name); err != nil {
 			return nil, err
 		}
 	}

@@ -130,8 +130,9 @@ func taskLogs(store *storage.Store, args []string, w, ew io.Writer) int {
 // The container must actually exist: claiming PAUSED on a vanished
 // sandbox would lie about the freeze. The task lands PAUSED before the
 // freeze so a reconcile tick between the two cannot strand the
-// transition; a failed freeze still reports the error with the task
-// already PAUSED, which `task resume` unwinds.
+// transition; a failed freeze rolls the task back to RUNNING so the
+// still-running container never escapes supervision while the task
+// claims PAUSED.
 func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "pause", ew)
 	if code != 0 {
@@ -154,6 +155,12 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 		return 1
 	}
 	if err := provider.Pause(ctx, container); err != nil {
+		// The task landed PAUSED but the container kept running; roll
+		// back to RUNNING so the worker stays supervised instead of
+		// escaping the timeout behind a PAUSED label.
+		if _, rerr := store.Transition(task.ID, tasks.Running, "human", "cli"); rerr != nil {
+			fmt.Fprintf(ew, "herder: revert pause on task %s: %v\n", task.ID, rerr)
+		}
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -162,9 +169,11 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 }
 
 // taskResume continues a paused task: the container thaws and the task
-// returns to RUNNING so the supervisor picks the session back up. The
-// thaw happens before the transition so a failed unpause leaves the task
-// honestly PAUSED.
+// returns to RUNNING so the supervisor picks the session back up.
+// EnsureRunning converges instead of a bare unpause so a PAUSED task on
+// an already-running container — a failed pause rollback or external
+// docker drift — still resumes. The thaw happens before the transition
+// so a failed converge leaves the task honestly PAUSED.
 func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "resume", ew)
 	if code != 0 {
@@ -177,7 +186,7 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
 	provider := newProvider(ew)
-	if err := provider.Unpause(ctx, sandbox.ContainerName(task.ID)); err != nil {
+	if err := provider.EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -195,24 +204,43 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 // binding clears so attach cannot resolve a dead session. A paused
 // container thaws first so the agent process actually dies with the pane
 // instead of staying frozen inside the sandbox — StopWorker reads the
-// pre-transition task.Status for that, so it stays Paused here. The
-// sandbox and its workspace stay for inspection — `sandbox destroy`
-// owns their removal.
+// pre-transition task.Status for that, so it stays Paused here. A task
+// already CANCELLED with a live binding means an earlier stop died
+// mid-teardown, so the verb retries the teardown instead of
+// early-returning. The sandbox and its workspace stay for inspection —
+// `sandbox destroy` owns their removal.
 func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "stop", ew)
 	if code != 0 {
 		return code
 	}
 	switch task.Status {
-	case tasks.Done, tasks.Cancelled, tasks.Failed:
+	case tasks.Done, tasks.Failed:
 		fmt.Fprintf(ew, "herder: task %s already %s\n", task.ID, task.Status)
 		return 1
+	case tasks.Cancelled:
+		// CANCELLED has no outgoing edges; only a leftover binding
+		// justifies continuing into the teardown below.
+		if task.AgentSessionID == "" && task.SandboxID == "" {
+			fmt.Fprintf(ew, "herder: task %s already %s\n", task.ID, task.Status)
+			return 1
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	if _, err := store.Transition(task.ID, tasks.Cancelled, "human", "cli"); err != nil {
-		fmt.Fprintf(ew, "herder: stop task %s: %v\n", task.ID, err)
-		return 1
+	if task.Status != tasks.Cancelled {
+		if _, err := store.Transition(task.ID, tasks.Cancelled, "human", "cli"); err != nil {
+			fmt.Fprintf(ew, "herder: stop task %s: %v\n", task.ID, err)
+			return 1
+		}
+	} else if task.SandboxID != "" {
+		// The earlier stop may have died before thawing a frozen
+		// container; EnsureRunning is a no-op on a running one, and a
+		// missing container already killed the agent inside, so a thaw
+		// failure only warns — the pane close below still converges.
+		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
+			fmt.Fprintf(ew, "herder: thaw sandbox: %v\n", err)
+		}
 	}
 	if err := newDispatcher(store, w, ew).StopWorker(ctx, &task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)

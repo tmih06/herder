@@ -45,6 +45,14 @@ const defaultMaxWorkers = 4
 // short enough that a real fix is not delayed.
 const defaultRetryDelay = time.Minute
 
+// reconcileCallTimeout bounds each external call inside a reconcile
+// pass — sandbox inspect, worker stop, session stop — so one wedged
+// docker or herdr subprocess cannot stall the whole tick. It matches
+// the dispatcher's 30-second bound for quick subprocess calls (issue
+// label advance); Provision and Launch get the longer dispatchTimeout
+// because provisioning is legitimately slow.
+const reconcileCallTimeout = 30 * time.Second
+
 // workerStates hold a worker slot: every state between dispatch and the
 // terminal/PR_OPEN states counts against the concurrency caps (SPEC
 // section 15). QUEUED tasks hold no worker yet — they are the queue.
@@ -184,11 +192,12 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 // A PROVISIONING task with no live lease is an abandoned dispatch —
 // the owner died between Provision and Launch, or a manual provision
 // was left staged — so it requeues with a dispatch_failed event
-// instead of holding a worker slot forever. A session-less RETRYING
-// task with no live lease is the same shape: `task retry` died
-// between the RETRYING commit and the QUEUED requeue, so it requeues
-// the same way. A RETRYING task still bound to a session is the
-// live-agent retry path and is left alone.
+// instead of holding a worker slot forever. A RETRYING task with no
+// live lease is the same shape: `task retry` died between the
+// RETRYING commit and the QUEUED requeue, or Launch bound the session
+// then died before RUNNING — either way it is stranded (not
+// dispatched, not supervised, holding no worker slot), so it requeues
+// the same way after stopping any orphaned session binding.
 // Uncertain inspect answers only log — the next tick retries — because
 // acting on a maybe-wrong reading could strand real work. No path ever
 // destroys a sandbox or workspace: dirty work is preserved for a human.
@@ -205,14 +214,19 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 	}
 	for i := range found {
 		task := &found[i]
-		if task.Status == tasks.Provisioning ||
-			(task.Status == tasks.Retrying && task.AgentSessionID == "") {
+		if task.Status == tasks.Provisioning || task.Status == tasks.Retrying {
 			if s.leaseHeld(task.ID) {
 				continue
 			}
 			stage, reason := "provision", "provisioning abandoned: no dispatch lease"
 			if task.Status == tasks.Retrying {
 				stage, reason = "retry", "retry abandoned: no dispatch lease"
+			}
+			// A bound session means Launch died after binding but before
+			// RUNNING: the orphaned pane is stopped best-effort before
+			// the task requeues.
+			if task.AgentSessionID != "" {
+				s.stopWorkerSession(ctx, task)
 			}
 			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
 				s.logf("herder: scheduler: reconcile %s: requeue abandoned %s: %v", task.ID, stage, err)
@@ -289,18 +303,21 @@ func (s *Scheduler) enforceTimeout(ctx context.Context, task *tasks.Task) bool {
 // missing container disconnects the worker, an OOM kill fails the task
 // with the resource-limit reason, and any other non-running status
 // waits for a human. The dispatcher's provider nil-defaults to the real
-// Docker provider, so only a nil Dispatcher skips the check. An inspect
-// error is uncertain — logged and skipped, never acted on — and
-// nothing here ever destroys the sandbox or workspace (SPEC section
-// 48). Returns true only when the sandbox is confirmed running, so the
-// caller may still check the session binding; every other outcome
-// already handled the task.
+// Docker provider, so only a nil Dispatcher skips the check. The
+// inspect runs under reconcileCallTimeout so a wedged provider call
+// cannot stall the whole pass. An inspect error is uncertain — logged
+// and skipped, never acted on — and nothing here ever destroys the
+// sandbox or workspace (SPEC section 48). Returns true only when the
+// sandbox is confirmed running, so the caller may still check the
+// session binding; every other outcome already handled the task.
 func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 	if s.Dispatcher == nil {
 		return true
 	}
 	container := sandbox.ContainerName(task.ID)
-	sb, err := s.Dispatcher.SandboxProvider().Inspect(ctx, container)
+	ictx, cancel := context.WithTimeout(ctx, reconcileCallTimeout)
+	sb, err := s.Dispatcher.SandboxProvider().Inspect(ictx, container)
+	cancel()
 	if err != nil {
 		if errors.Is(err, sandbox.ErrNotFound) {
 			s.stopWorkerBestEffort(ctx, task)
@@ -657,11 +674,14 @@ func (s *Scheduler) requeueDispatch(task tasks.Task, reason string) {
 
 // stopWorker ends the task's live session (and thaws a paused sandbox)
 // through the dispatcher; a nil dispatcher reports success so the
-// reconcile state change still lands.
+// reconcile state change still lands. The call runs under
+// reconcileCallTimeout so a wedged subprocess cannot stall the pass.
 func (s *Scheduler) stopWorker(ctx context.Context, task *tasks.Task) error {
 	if s.Dispatcher == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, reconcileCallTimeout)
+	defer cancel()
 	return s.Dispatcher.StopWorker(ctx, task)
 }
 
@@ -676,10 +696,14 @@ func (s *Scheduler) stopWorkerBestEffort(ctx context.Context, task *tasks.Task) 
 
 // stopWorkerSession closes the task's deterministic Herdr pane,
 // best-effort: the pane is usually already gone with its dead owner.
+// The call runs under reconcileCallTimeout so a wedged herdr
+// subprocess cannot stall the pass.
 func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
 	if s.Dispatcher == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, reconcileCallTimeout)
+	defer cancel()
 	if err := s.Dispatcher.SessionLauncher().Stop(ctx, agent.SessionName(task.ID)); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}
