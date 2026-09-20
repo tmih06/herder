@@ -593,8 +593,33 @@ func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error
 				continue
 			}
 		}
+		// A stalled or timed-out prompt is ambiguous: herdr may have
+		// delivered the text before reporting failure. Check the pane
+		// tail for the prompt's first line — present means delivered,
+		// so report success instead of letting a retry send it twice.
+		if l.PromptDelivered(ctx, session, text) {
+			return nil
+		}
 		return fmt.Errorf("agent: prompt %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
+}
+
+// PromptDelivered reports whether the pane tail already shows the
+// prompt's first line: `agent prompt` can deliver the text and still
+// return agent_prompt_stalled, so the tail is the ground truth for
+// "did it land". Re-seed callers use it to skip a resend that would
+// queue the contract twice. A read failure answers false — the
+// caller's error path is the honest report.
+func (l *Launcher) PromptDelivered(ctx context.Context, session, text string) bool {
+	first := text
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		first = text[:i]
+	}
+	if strings.TrimSpace(first) == "" {
+		return false
+	}
+	tail, err := l.Read(ctx, session, 50)
+	return err == nil && strings.Contains(tail, first)
 }
 
 // AgentInfo is the parsed `agent get` report for one live session: the

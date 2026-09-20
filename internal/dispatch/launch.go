@@ -184,8 +184,13 @@ func (d *Dispatcher) reuseSession(ctx context.Context, task *tasks.Task,
 		return fmt.Errorf("record sandbox binding: %w", err)
 	}
 	if task.Status != tasks.Running {
-		if err := d.launcher().SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
-			return d.failTaskStart(ctx, task, err.Error())
+		// Re-seed only when the pane doesn't already show the contract:
+		// an ambiguous prompt failure (agent_prompt_stalled) can leave
+		// the text delivered, and a blind resend queues it twice.
+		if !d.launcher().PromptDelivered(ctx, task.AgentSessionID, prompt) {
+			if err := d.launcher().SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
+				return d.failTaskStart(ctx, task, err.Error())
+			}
 		}
 	}
 	if err := d.advanceToRunning(ctx, task, true); err != nil {
