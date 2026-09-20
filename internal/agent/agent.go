@@ -466,6 +466,17 @@ func (l *Launcher) closePaneBestEffort(paneID string) {
 // agent with agent_blocked — that refusal is the honest answer, so it is
 // returned rather than bypassed with raw pane input.
 func (l *Launcher) SendPrompt(ctx context.Context, session, prompt string) error {
+	// `agent prompt` types the text into the session's pane: when the
+	// agent is dead the pane sits at its shell and the prompt executes
+	// as host commands. Refuse unless the shim is still foreground —
+	// a stale named record is not a live agent.
+	info, err := l.Get(ctx, session)
+	if err != nil {
+		return fmt.Errorf("agent: prompt %s: %w", session, err)
+	}
+	if !info.Running {
+		return fmt.Errorf("agent: prompt %s: %w", session, ErrSessionGone)
+	}
 	text := strings.TrimRight(prompt, "\n") + "\n"
 	deadline := time.Now().Add(promptReadyTimeout)
 	for {

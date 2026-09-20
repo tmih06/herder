@@ -127,7 +127,7 @@ func gateOrRoute(ctx context.Context, cfg *config.Config, store *storage.Store,
 // returns to the live agent or to a human with the failure attached.
 func taskValidate(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, repo, provider, code := prepareTask(cfg, store, args, "validate",
-		[]tasks.State{tasks.Running, tasks.Validating}, ew)
+		[]tasks.State{tasks.Running, tasks.Validating, tasks.WaitingForHuman}, ew)
 	if code >= 0 {
 		return code
 	}
@@ -146,18 +146,21 @@ func taskValidate(cfg *config.Config, store *storage.Store, args []string, w, ew
 // REVIEWING/DELIVERING pick up after it, PR_OPEN is already delivered.
 func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, repo, provider, code := prepareTask(cfg, store, args, "deliver",
-		[]tasks.State{tasks.Running, tasks.Validating, tasks.Reviewing, tasks.Delivering, tasks.PROpen}, ew)
+		[]tasks.State{tasks.Running, tasks.Validating, tasks.WaitingForHuman,
+			tasks.Reviewing, tasks.Delivering, tasks.PROpen}, ew)
 	if code >= 0 {
 		return code
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gateTimeout)
 	defer cancel()
+	// The gate runs for RUNNING/VALIDATING tasks and for
+	// WAITING_FOR_HUMAN ones whose worker disconnected before the gate
+	// ever ran; REVIEWING and beyond already passed it (resume after a
+	// crash mid-delivery). A branch that moved since the recorded pass
+	// re-enters the gate instead of shipping unverified commits.
+	if task.Status == tasks.Running || task.Status == tasks.Validating ||
+		task.Status == tasks.WaitingForHuman {
 
-	// The gate runs for RUNNING/VALIDATING tasks; REVIEWING and beyond
-	// already passed it (resume after a crash mid-delivery). A branch
-	// that moved since the recorded pass re-enters the gate instead of
-	// shipping unverified commits.
-	if task.Status == tasks.Running || task.Status == tasks.Validating {
 		if code, passed := gateOrRoute(ctx, cfg, store, provider, &task, repo, w, ew); !passed {
 			return code
 		}

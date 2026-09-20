@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,8 @@ func startRespond(calls *[][]string) Runner {
 			return RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 		case strings.HasPrefix(argv, "agent get"):
 			return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
+		case strings.HasPrefix(argv, "pane process-info"):
+			return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
 		}
 		return RunResult{Stdout: `{}`}, nil
 	}
@@ -252,6 +255,13 @@ func TestSendPromptRetriesNotReady(t *testing.T) {
 	n := 0
 	l := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
+			argv := strings.Join(args, " ")
+			switch {
+			case strings.HasPrefix(argv, "agent get"):
+				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
+			case strings.HasPrefix(argv, "pane process-info"):
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+			}
 			n++
 			if n < 3 {
 				return RunResult{ExitCode: 1, Stderr: "agent_not_ready"}, nil
@@ -264,6 +274,30 @@ func TestSendPromptRetriesNotReady(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("prompt calls = %d, want 3", n)
+	}
+}
+
+// TestSendPromptRefusesDeadAgent proves the prompt never reaches a pane
+// whose agent exited: herdr would type the text into the pane's shell
+// and execute it as host commands.
+func TestSendPromptRefusesDeadAgent(t *testing.T) {
+	l := &Launcher{
+		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
+			argv := strings.Join(args, " ")
+			switch {
+			case strings.HasPrefix(argv, "agent get"):
+				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
+			case strings.HasPrefix(argv, "pane process-info"):
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"fish"}]}}}`}, nil
+			case strings.HasPrefix(argv, "agent prompt"):
+				t.Error("prompt must never reach a dead agent's pane")
+			}
+			return RunResult{}, nil
+		},
+	}
+	err := l.SendPrompt(context.Background(), "herder-task_x", "rm -rf /")
+	if !errors.Is(err, ErrSessionGone) {
+		t.Fatalf("dead agent prompt = %v, want ErrSessionGone", err)
 	}
 }
 

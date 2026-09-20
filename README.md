@@ -8,6 +8,18 @@
 Open-source control plane for autonomous coding-agent fleets, powered by Herdr.
 See [SPEC.md](SPEC.md) for the full architecture.
 
+## Documentation
+
+- [SPEC.md](SPEC.md) — full architecture and rationale (authoritative)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — package map, state machine, event log
+- [ROADMAP.md](ROADMAP.md) — v0.1 → v1.0
+- [docs/setup.md](docs/setup.md) — install, config, quickstart
+- [docs/deployment.md](docs/deployment.md) — native + container deployment
+- [docs/security-boundary.md](docs/security-boundary.md) — trust model, enforced vs aspirational
+- [docs/troubleshooting.md](docs/troubleshooting.md) — doctor output, common failures
+- [docs/adr/](docs/adr/) — architecture decision records
+- [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+
 ## Install
 
 Requires Go 1.22+.
@@ -96,3 +108,7 @@ go test ./cmd/... ./internal/...
 Scope commands to `./cmd/... ./internal/...`: the repo also contains
 synced skill example sources under `agent/` that are not part of this
 module's build.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

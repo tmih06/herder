@@ -1,0 +1,66 @@
+# Herder controller deployment (SPEC section 45).
+#
+# Herder owns orchestration: tasks, issue integration, scheduling,
+# sandboxes, policy, credentials, validation, delivery, durable state.
+# Herdr owns the runtime: terminal sessions, agent detection/lifecycle,
+# panes, prompting, human attachment. Herder reaches Herdr only through
+# its public CLI/socket API — never a fork — and workers never see the
+# raw socket.
+#
+# This service is the control plane: it alone holds the Docker socket,
+# the Herdr socket, and the GitHub credentials. Sandboxed workers never
+# inherit them (SPEC sections 28-29, 66).
+#
+# Required container-side values in the mounted herder.yaml:
+#
+#   server:
+#     listen: 0.0.0.0:8787          # not 127.0.0.1 — must leave the container
+#   database:
+#     path: /srv/herder/herder.db   # inside the state bind mount below
+#   herdr:
+#     mode: socket
+#
+# Before `docker compose up`:
+#   1. cp examples/herder.yaml herder.yaml and edit it (see above).
+#   2. export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+#   3. mkdir -p /srv/herder && sudo chown 1000:1000 /srv/herder
+#   4. Put the GitHub App private key at ./github-app-key.pem.
+
+services:
+  herder:
+    build: ..
+    image: herder:latest
+    user: "1000:1000"
+    # The container's herder user needs the host docker group to open the
+    # socket. DOCKER_GID is the HOST gid: stat -c %g /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    environment:
+      HERDER_CONFIG: /etc/herder/herder.yaml
+      # herdr CLI is a client here; the server runs on the host.
+      HERDR_SOCKET_PATH: /run/herdr/herdr.sock
+      # gh auth git-credential turns this into clone AND push auth.
+      GH_TOKEN: ${GH_TOKEN:?set GH_TOKEN}
+      HERDER_GITHUB_APP_ID: ${HERDER_GITHUB_APP_ID:?set HERDER_GITHUB_APP_ID}
+      HERDER_GITHUB_PRIVATE_KEY: /run/secrets/github-app-key.pem
+    volumes:
+      # Controller only: sandboxes get no socket (SPEC section 24).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Host Herdr server socket; the CLI inside reaches it via
+      # HERDR_SOCKET_PATH. Workers never see it (SPEC section 29).
+      - ${HOME}/.config/herdr/herdr.sock:/run/herdr/herdr.sock
+      # State dir. The container path MUST equal the host path: sandbox
+      # workspaces live under it and `docker --volume` sources are always
+      # host paths, so the daemon resolves them on the host, not in here.
+      - /srv/herder:/srv/herder
+      - ./herder.yaml:/etc/herder/herder.yaml:ro
+    secrets:
+      - source: github-app-key
+        target: github-app-key.pem
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+secrets:
+  github-app-key:
+    file: ./github-app-key.pem
