@@ -96,7 +96,8 @@ func (p *DockerProvider) logf(format string, args ...any) {
 // spec, never discarding uncommitted work.
 // Why: re-provisioning the same task must converge, not destroy.
 // Flow: validate -> ensure repo -> dirty guard -> checkout branch ->
-// create-or-start container. Dirty work fails with *DirtyError before any
+// create-or-start container, unpausing first when paused (docker start
+// cannot wake one). Dirty work fails with *DirtyError before any
 // container call; missing containers are created least-privilege.
 func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, error) {
 	if err := validateSpec(spec); err != nil {
@@ -134,6 +135,13 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 	}
 	if state == "" {
 		if err := p.create(ctx, spec, name, workspace); err != nil {
+			return nil, err
+		}
+	}
+	// docker start fails on a paused container, which would requeue a
+	// QUEUED task forever; thaw before the start below.
+	if state == "paused" {
+		if err := p.Unpause(ctx, name); err != nil {
 			return nil, err
 		}
 	}
@@ -277,7 +285,8 @@ type inspectJSON struct {
 		Image string `json:"Image"`
 	} `json:"Config"`
 	State struct {
-		Status string `json:"Status"`
+		Status    string `json:"Status"`
+		OOMKilled bool   `json:"OOMKilled"`
 	} `json:"State"`
 	Mounts []struct {
 		Source      string `json:"Source"`
@@ -309,6 +318,7 @@ func (p *DockerProvider) Inspect(ctx context.Context, id string) (*Sandbox, erro
 	sb := &Sandbox{
 		ID: strings.TrimPrefix(info.Name, "/"), ContainerID: info.ID,
 		Image: info.Config.Image, Status: info.State.Status,
+		OOMKilled: info.State.OOMKilled,
 	}
 	for _, m := range info.Mounts {
 		if m.Destination == "/workspace" {

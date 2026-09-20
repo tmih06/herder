@@ -73,9 +73,62 @@ type GithubConfig struct {
 	PrivateKeyFile string `yaml:"private_key_file"`
 }
 
-// SchedulerConfig bounds concurrent workers.
+// SchedulerConfig bounds concurrent workers and paces the dispatch loop
+// (SPEC section 15): a global cap, optional per-repository and per-agent
+// -kind caps, the dispatch lease TTL, and the poll interval.
 type SchedulerConfig struct {
+	// MaxWorkers caps workers fleet-wide.
 	MaxWorkers int `yaml:"max_workers"`
+	// PerRepository caps workers per repository name; absent means the
+	// global cap alone applies.
+	PerRepository map[string]int `yaml:"per_repository"`
+	// PerAgent caps workers per agent kind (codex, claude, ...); absent
+	// means the global cap alone applies.
+	PerAgent map[string]int `yaml:"per_agent"`
+	// LeaseTTL bounds one dispatch lease as a Go duration; an owner that
+	// stops heartbeating loses the task back to the queue.
+	LeaseTTL string `yaml:"lease_ttl"`
+	// DispatchInterval spaces scheduler passes as a Go duration.
+	DispatchInterval string `yaml:"dispatch_interval"`
+}
+
+// DefaultLeaseTTL applies when scheduler.lease_ttl is omitted: long
+// enough for a slow provision between heartbeats, short enough that a
+// dead dispatcher's task requeues promptly.
+const DefaultLeaseTTL = 2 * time.Minute
+
+// DefaultDispatchInterval applies when scheduler.dispatch_interval is
+// omitted.
+const DefaultDispatchInterval = 2 * time.Second
+
+// durationOr parses raw as a positive Go duration, returning def on
+// empty or invalid input. Purpose: one place owns the string->duration
+// rule the validator already checked. Inputs: raw config string and
+// fallback. Returns the parsed duration or def.
+func durationOr(raw string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// LeaseTTLDuration parses the configured lease TTL with its default.
+// Returns DefaultLeaseTTL on empty or invalid input.
+func (s SchedulerConfig) LeaseTTLDuration() time.Duration {
+	return durationOr(s.LeaseTTL, DefaultLeaseTTL)
+}
+
+// DispatchIntervalDuration parses the configured dispatch interval with
+// its default. Returns DefaultDispatchInterval on empty or invalid input.
+func (s SchedulerConfig) DispatchIntervalDuration() time.Duration {
+	return durationOr(s.DispatchInterval, DefaultDispatchInterval)
+}
+
+// TimeoutDuration parses an agent profile's timeout; zero means no limit.
+// Purpose: the scheduler's time-limit enforcement needs the duration the
+// validator already checked. Returns 0 on empty or invalid input.
+func (a AgentConfig) TimeoutDuration() time.Duration {
+	return durationOr(a.Timeout, 0)
 }
 
 // RepositoryConfig is the per-repo policy: trigger, agent, sandbox,
@@ -219,6 +272,39 @@ func (c *Config) validate() []error {
 	}
 	if c.Scheduler.MaxWorkers < 1 {
 		errs = append(errs, fmt.Errorf("scheduler.max_workers must be >= 1, got %d", c.Scheduler.MaxWorkers))
+	}
+	for name, limit := range c.Scheduler.PerRepository {
+		if _, ok := c.Repositories[name]; !ok {
+			errs = append(errs, fmt.Errorf("scheduler.per_repository.%q is not a configured repository (defined: %s)",
+				name, strings.Join(sortedKeys(c.Repositories), ", ")))
+		}
+		if limit < 1 {
+			errs = append(errs, fmt.Errorf("scheduler.per_repository.%q must be >= 1, got %d", name, limit))
+		}
+	}
+	for kind, limit := range c.Scheduler.PerAgent {
+		if !contains(supportedAgentKinds, kind) {
+			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q is not a supported agent kind (want one of %s)",
+				kind, strings.Join(supportedAgentKinds, ", ")))
+		}
+		if limit < 1 {
+			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q must be >= 1, got %d", kind, limit))
+		}
+	}
+	// Slice, not map: errors must come out in declaration order.
+	for _, d := range []struct {
+		field string
+		raw   string
+	}{
+		{"scheduler.lease_ttl", c.Scheduler.LeaseTTL},
+		{"scheduler.dispatch_interval", c.Scheduler.DispatchInterval},
+	} {
+		if d.raw == "" {
+			continue
+		}
+		if parsed, err := time.ParseDuration(d.raw); err != nil || parsed <= 0 {
+			errs = append(errs, fmt.Errorf("%s %q must be a positive Go duration (example \"2m\")", d.field, d.raw))
+		}
 	}
 	if len(c.Repositories) == 0 {
 		errs = append(errs, errors.New("repositories must define at least one repository (example \"owner/repo\")"))
