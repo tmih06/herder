@@ -19,7 +19,8 @@ import (
 // prompt tells the new agent it inherits existing work instead of
 // starting cold.
 // A QUEUED task takes the dispatch lease before any subprocess so two
-// dispatchers never start it twice; the lease releases on every exit.
+// dispatchers never start it twice; the lease heartbeats until the call
+// returns and releases on exit, unless an outer dispatch already owns it.
 // Returns the first failure carrying the operator-facing message; the
 // success line goes to Logf.
 func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks.Task, override, priorAgent string) error {
@@ -28,7 +29,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 	// Non-QUEUED relaunches (retry, handoff) are already serialized by
 	// the caller's own transition, so they run lease-free. A live
 	// same-owner lease means an outer dispatch owns the lifecycle.
-	release, err := d.holdLease(task)
+	release, err := d.holdLease(ctx, task)
 	if err != nil {
 		return err
 	}

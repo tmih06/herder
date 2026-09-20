@@ -15,8 +15,8 @@
 // dead scheduler's task requeues instead of stranding.
 // Inputs: the store, the shared dispatcher, config, and the owner name
 // the daemon stamps on leases (daemon-<pid>).
-// Flow: Run -> Tick per Interval -> expireLeases -> reconcile ->
-// dispatch; dispatchOne runs per task in its own goroutine.
+// Flow: Run -> Tick per configured interval -> expireLeases ->
+// reconcile -> dispatch; dispatchOne runs per task in its own goroutine.
 // Returns: nothing; failures log through Logf and the next tick retries.
 package scheduler
 
@@ -66,9 +66,7 @@ var workerStates = map[tasks.State]bool{
 // Scheduler runs the dispatch loop: one ticker, three passes per tick.
 // Store and Cfg are required; Dispatcher carries the pipeline seams
 // (nil fields inside it default like the CLI's). Owner names this
-// scheduler in task leases, Interval spaces ticks, LeaseTTL bounds one
-// dispatch lease, RetryDelay suppresses immediate re-dispatch after a
-// failed attempt, and Logf receives non-fatal errors.
+// scheduler in task leases, and Logf receives non-fatal errors.
 type Scheduler struct {
 	Store      *storage.Store
 	Dispatcher *dispatch.Dispatcher
@@ -77,15 +75,6 @@ type Scheduler struct {
 	// empty means Dispatcher.Owner, then "scheduler" (the daemon passes
 	// "daemon-<pid>").
 	Owner string
-	// Interval spaces ticks; zero means
-	// Cfg.Scheduler.DispatchIntervalDuration().
-	Interval time.Duration
-	// LeaseTTL bounds one dispatch lease; zero means
-	// Cfg.Scheduler.LeaseTTLDuration().
-	LeaseTTL time.Duration
-	// RetryDelay suppresses re-dispatch after a failed attempt; zero
-	// means defaultRetryDelay.
-	RetryDelay time.Duration
 	// Logf receives non-fatal errors; nil discards them.
 	Logf func(format string, args ...any)
 
@@ -105,9 +94,9 @@ type Scheduler struct {
 }
 
 // Run ticks immediately — a daemon restart reconciles right away — then
-// once per Interval until ctx is done. In-flight dispatches drain
-// before Run returns so a graceful shutdown never abandons a half-run
-// launch.
+// once per configured interval until ctx is done. In-flight dispatches
+// drain before Run returns so a graceful shutdown never abandons a
+// half-run launch.
 func (s *Scheduler) Run(ctx context.Context) {
 	s.Tick(ctx)
 	ticker := time.NewTicker(s.interval())
@@ -203,6 +192,11 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 // Uncertain inspect answers only log — the next tick retries — because
 // acting on a maybe-wrong reading could strand real work. No path ever
 // destroys a sandbox or workspace: dirty work is preserved for a human.
+// VALIDATING, REVIEWING, DELIVERING, PR_OPEN, WAITING_FOR_HUMAN, and
+// PAUSED are deliberately not reconciled: they are parked or
+// post-agent operator-gated stages with no live session to supervise,
+// so a dead sandbox there surfaces as a command error, not a
+// disconnect.
 func (s *Scheduler) reconcile(ctx context.Context) {
 	found, err := s.Store.ListTasks()
 	if err != nil {
@@ -289,17 +283,19 @@ func (s *Scheduler) enforceTimeout(ctx context.Context, task *tasks.Task) bool {
 // checkSandbox reconciles one worker against the sandbox provider: a
 // missing container disconnects the worker, an OOM kill fails the task
 // with the resource-limit reason, and any other non-running status
-// waits for a human. An inspect error is uncertain — logged and
-// skipped, never acted on — and nothing here ever destroys the
-// sandbox or workspace (SPEC section 48). Returns true only when the
-// sandbox is confirmed running, so the caller may still check the
-// session binding; every other outcome already handled the task.
+// waits for a human. The dispatcher's provider nil-defaults to the real
+// Docker provider, so only a nil Dispatcher skips the check. An inspect
+// error is uncertain — logged and skipped, never acted on — and
+// nothing here ever destroys the sandbox or workspace (SPEC section
+// 48). Returns true only when the sandbox is confirmed running, so the
+// caller may still check the session binding; every other outcome
+// already handled the task.
 func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
-	if s.Dispatcher == nil || s.Dispatcher.Provider == nil {
+	if s.Dispatcher == nil {
 		return true
 	}
 	container := sandbox.ContainerName(task.ID)
-	sb, err := s.Dispatcher.Provider.Inspect(ctx, container)
+	sb, err := s.Dispatcher.SandboxProvider().Inspect(ctx, container)
 	if err != nil {
 		if errors.Is(err, sandbox.ErrNotFound) {
 			s.stopWorkerBestEffort(ctx, task)
@@ -666,10 +662,10 @@ func (s *Scheduler) stopWorkerBestEffort(ctx context.Context, task *tasks.Task) 
 // stopWorkerSession closes the task's deterministic Herdr pane,
 // best-effort: the pane is usually already gone with its dead owner.
 func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
-	if s.Dispatcher == nil || s.Dispatcher.Launcher == nil {
+	if s.Dispatcher == nil {
 		return
 	}
-	if err := s.Dispatcher.Launcher.Stop(ctx, agent.SessionName(task.ID)); err != nil {
+	if err := s.Dispatcher.SessionLauncher().Stop(ctx, agent.SessionName(task.ID)); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}
 }
@@ -709,9 +705,6 @@ func (s *Scheduler) owner() string {
 
 // interval spaces ticks with the configured default.
 func (s *Scheduler) interval() time.Duration {
-	if s.Interval > 0 {
-		return s.Interval
-	}
 	if s.Cfg != nil {
 		return s.Cfg.Scheduler.DispatchIntervalDuration()
 	}
@@ -720,9 +713,6 @@ func (s *Scheduler) interval() time.Duration {
 
 // leaseTTL bounds one dispatch lease with the configured default.
 func (s *Scheduler) leaseTTL() time.Duration {
-	if s.LeaseTTL > 0 {
-		return s.LeaseTTL
-	}
 	if s.Cfg != nil {
 		return s.Cfg.Scheduler.LeaseTTLDuration()
 	}
@@ -731,9 +721,6 @@ func (s *Scheduler) leaseTTL() time.Duration {
 
 // retryDelay suppresses re-dispatch after a failed attempt.
 func (s *Scheduler) retryDelay() time.Duration {
-	if s.RetryDelay > 0 {
-		return s.RetryDelay
-	}
 	return defaultRetryDelay
 }
 

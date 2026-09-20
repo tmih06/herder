@@ -252,6 +252,38 @@ func TestHandleBurstStillQueues(t *testing.T) {
 	}
 }
 
+// A "priority:N" label seeds the task's queue priority; malformed values
+// are ignored (priority is advisory, never a denial reason).
+func TestHandlePriorityLabel(t *testing.T) {
+	_, _, h := testSetup(t)
+
+	ev := eligibleEvent("del-1", 182)
+	ev.Labels = append(ev.Labels, "priority:5")
+	out, err := h.Handle(ev)
+	if err != nil {
+		t.Fatalf("Handle = %v", err)
+	}
+	if out.Decision != storage.DecisionAccepted {
+		t.Fatalf("decision = %q, want accepted", out.Decision)
+	}
+	if out.Task.Priority != 5 {
+		t.Errorf("priority = %d, want 5", out.Task.Priority)
+	}
+
+	ev = eligibleEvent("del-2", 183)
+	ev.Labels = append(ev.Labels, "priority:high")
+	out, err = h.Handle(ev)
+	if err != nil {
+		t.Fatalf("Handle = %v", err)
+	}
+	if out.Decision != storage.DecisionAccepted {
+		t.Fatalf("malformed priority must still be accepted, got %+v", out)
+	}
+	if out.Task.Priority != 0 {
+		t.Errorf("priority = %d, want 0 for malformed label", out.Task.Priority)
+	}
+}
+
 // Concurrent duplicate deliveries converge on one task.
 func TestHandleConcurrentDuplicates(t *testing.T) {
 	_, store, h := testSetup(t)

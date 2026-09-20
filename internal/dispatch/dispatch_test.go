@@ -14,6 +14,7 @@ import (
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/testutil"
 )
 
 // testConfig builds one repo with a default codex profile, a docker
@@ -37,18 +38,6 @@ func testConfig() *config.Config {
 	}
 }
 
-// testStore opens a real store in a temp dir so lease and transition
-// behavior is exercised against SQLite, not a stub.
-func testStore(t *testing.T) *storage.Store {
-	t.Helper()
-	store, err := storage.Open(filepath.Join(t.TempDir(), "herder.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return store
-}
-
 // queueTask creates a task and walks it to QUEUED, returning the row.
 func queueTask(t *testing.T, store *storage.Store) tasks.Task {
 	t.Helper()
@@ -67,32 +56,6 @@ func queueTask(t *testing.T, store *storage.Store) tasks.Task {
 	}
 	task.Status = tasks.Queued
 	return task
-}
-
-// recorder scripts subprocess results by argv and records every call;
-// one script feeds the docker, herdr, and gh runners alike.
-type recorder struct {
-	calls   [][]string
-	respond func(name string, args []string) (sandbox.RunResult, error)
-}
-
-func (r *recorder) run(_ context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	r.calls = append(r.calls, append([]string{name}, args...))
-	if r.respond != nil {
-		return r.respond(name, args)
-	}
-	return sandbox.RunResult{}, nil
-}
-
-// dockerRun adapts the script to the sandbox.Runner seam.
-func (r *recorder) dockerRun(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	return r.run(ctx, name, args...)
-}
-
-// herdrRun adapts the script to the agent.Runner seam.
-func (r *recorder) herdrRun(ctx context.Context, name string, args ...string) (agent.RunResult, error) {
-	out, err := r.run(ctx, name, args...)
-	return agent.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
 }
 
 // launchRespond scripts a ready sandbox plus a successful Herdr start:
@@ -145,30 +108,6 @@ func provisionThenLaunchRespond(name string, args []string) (sandbox.RunResult, 
 	return sandbox.RunResult{}, nil
 }
 
-// eventTypes lists a task's recorded event types in order.
-func eventTypes(t *testing.T, store *storage.Store, taskID string) []string {
-	t.Helper()
-	events, err := store.ListEvents(taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	types := make([]string, len(events))
-	for i, e := range events {
-		types[i] = e.Type
-	}
-	return types
-}
-
-// hasEvent reports whether the type list contains want.
-func hasEvent(types []string, want string) bool {
-	for _, typ := range types {
-		if typ == want {
-			return true
-		}
-	}
-	return false
-}
-
 // TestBranchForTaskFallback derives the deterministic branch: claimed
 // branch first, then herder/<issue> from the source ref, then the id.
 func TestBranchForTaskFallback(t *testing.T) {
@@ -210,15 +149,15 @@ func TestSpecForTask(t *testing.T) {
 // the dispatch lease before any subprocess, releases it on success, and
 // lands the task RUNNING with the agent.started event.
 func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
-	rec := &recorder{respond: launchRespond}
+	rec := &testutil.Recorder{Respond: launchRespond}
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.herdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
-		Engine:   &deliver.Engine{Runner: rec.dockerRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
 	}
 	if err := d.Launch(context.Background(), testConfig(), &task, "", ""); err != nil {
@@ -242,9 +181,9 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 	if _, err := store.GetLease(task.ID); !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("GetLease after launch = %v, want ErrNotFound", err)
 	}
-	types := eventTypes(t, store, task.ID)
+	types := testutil.EventTypes(t, store, task.ID)
 	for _, want := range []string{tasks.EventLeaseAcquired, tasks.EventLeaseReleased, "agent.started"} {
-		if !hasEvent(types, want) {
+		if !testutil.HasEvent(types, want) {
 			t.Errorf("events %v missing %q", types, want)
 		}
 	}
@@ -263,16 +202,16 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 // launch before any subprocess runs: no Herdr call, no state change,
 // and the error names the holding owner.
 func TestLaunchQueuedLeaseHeld(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
 	if err := store.AcquireLease(task.ID, "sched-1", config.DefaultLeaseTTL); err != nil {
 		t.Fatal(err)
 	}
-	rec := &recorder{respond: launchRespond}
+	rec := &testutil.Recorder{Respond: launchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.herdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	err := d.Launch(context.Background(), testConfig(), &task, "", "")
 	if err == nil {
@@ -281,8 +220,8 @@ func TestLaunchQueuedLeaseHeld(t *testing.T) {
 	if !strings.Contains(err.Error(), task.ID) || !strings.Contains(err.Error(), "sched-1") {
 		t.Errorf("error should name the task and the lease owner, got %v", err)
 	}
-	if len(rec.calls) != 0 {
-		t.Errorf("no subprocess may run under a foreign lease, ran %v", rec.calls)
+	if len(rec.Calls()) != 0 {
+		t.Errorf("no subprocess may run under a foreign lease, ran %v", rec.Calls())
 	}
 	got, err := store.GetTask(task.ID)
 	if err != nil {
@@ -303,13 +242,13 @@ func TestLaunchQueuedLeaseHeld(t *testing.T) {
 // PROVISIONING and stops there — RUNNING is Launch's job once a session
 // is bound — and records sandbox.provisioned.
 func TestProvisionEmitsEventAndAdvances(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
-	rec := &recorder{respond: provisionRespond}
+	rec := &testutil.Recorder{Respond: provisionRespond}
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
 	}
 	if err := d.Provision(context.Background(), testConfig(), &task); err != nil {
@@ -325,7 +264,7 @@ func TestProvisionEmitsEventAndAdvances(t *testing.T) {
 	if got.Status != tasks.Provisioning {
 		t.Errorf("stored status = %s, want PROVISIONING", got.Status)
 	}
-	if !hasEvent(eventTypes(t, store, task.ID), "sandbox.provisioned") {
+	if !testutil.HasEvent(testutil.EventTypes(t, store, task.ID), "sandbox.provisioned") {
 		t.Error("sandbox.provisioned event missing")
 	}
 	var running bool
@@ -344,14 +283,14 @@ func TestProvisionEmitsEventAndAdvances(t *testing.T) {
 // Launch binds the session — the started_at stamp lands with the agent,
 // not with the container.
 func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
-	rec := &recorder{respond: provisionThenLaunchRespond}
+	rec := &testutil.Recorder{Respond: provisionThenLaunchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.herdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
-		Engine:   &deliver.Engine{Runner: rec.dockerRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 	}
 	if err := d.Provision(context.Background(), testConfig(), &task); err != nil {
 		t.Fatalf("Provision = %v", err)
@@ -375,9 +314,9 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 	if got.AgentSessionID != agent.SessionName(task.ID) {
 		t.Errorf("session binding = %q, want %q", got.AgentSessionID, agent.SessionName(task.ID))
 	}
-	types := eventTypes(t, store, task.ID)
+	types := testutil.EventTypes(t, store, task.ID)
 	for _, want := range []string{"sandbox.provisioned", "agent.started"} {
-		if !hasEvent(types, want) {
+		if !testutil.HasEvent(types, want) {
 			t.Errorf("events %v missing %q", types, want)
 		}
 	}
@@ -386,17 +325,17 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 // TestProvisionRejectsUnconfiguredRepo proves the repo gate fails before
 // any subprocess with the original message.
 func TestProvisionRejectsUnconfiguredRepo(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
 	task.Repository = "acme/unknown"
-	rec := &recorder{respond: provisionRespond}
-	d := &Dispatcher{Store: store, Provider: &sandbox.DockerProvider{Runner: rec.dockerRun}}
+	rec := &testutil.Recorder{Respond: provisionRespond}
+	d := &Dispatcher{Store: store, Provider: &sandbox.DockerProvider{Runner: rec.DockerRun}}
 	err := d.Provision(context.Background(), testConfig(), &task)
 	if err == nil || !strings.Contains(err.Error(), `task repository "acme/unknown" not in config`) {
 		t.Fatalf("Provision = %v, want the not-in-config error", err)
 	}
-	if len(rec.calls) != 0 {
-		t.Errorf("repo gate must fail before any subprocess, ran %v", rec.calls)
+	if len(rec.Calls()) != 0 {
+		t.Errorf("repo gate must fail before any subprocess, ran %v", rec.Calls())
 	}
 }
 
@@ -405,7 +344,7 @@ func TestProvisionRejectsUnconfiguredRepo(t *testing.T) {
 // fails the QUEUED -> PROVISIONING transition and the caller sees the
 // error instead of emitting agent.started for a cancelled task.
 func TestAdvanceToRunningRejectsCancelled(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
 	// The operator cancels after the dispatcher fetched the row: the
 	// in-memory copy still reads QUEUED while the store moved on.
@@ -437,9 +376,9 @@ func TestStaleLabels(t *testing.T) {
 // TestMarkIssueRunningWarnsNeverFails proves a broken gh warns through
 // Warnf without failing the launch path.
 func TestMarkIssueRunningWarnsNeverFails(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		if name == "gh" {
 			return sandbox.RunResult{ExitCode: 1, Stderr: "gh: command not found"}, nil
 		}
@@ -448,7 +387,7 @@ func TestMarkIssueRunningWarnsNeverFails(t *testing.T) {
 	var warns []string
 	d := &Dispatcher{
 		Store:  store,
-		Engine: &deliver.Engine{Runner: rec.dockerRun},
+		Engine: &deliver.Engine{Runner: rec.DockerRun},
 		Warnf:  func(format string, args ...any) { warns = append(warns, fmt.Sprintf(format, args...)) },
 	}
 	d.MarkIssueRunning(&task, testConfig().Repositories["acme/web"])
@@ -461,7 +400,7 @@ func TestMarkIssueRunningWarnsNeverFails(t *testing.T) {
 // before the session's pane closes: a frozen agent would survive the
 // close and wake as an orphan.
 func TestStopWorkerThawsBeforeStopping(t *testing.T) {
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		argv := strings.Join(args, " ")
 		switch {
 		case name == "docker" && strings.HasPrefix(argv, "inspect "):
@@ -472,15 +411,15 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		return sandbox.RunResult{}, nil
 	}}
 	d := &Dispatcher{
-		Launcher: &agent.Launcher{Runner: rec.herdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	task := &tasks.Task{ID: "task_abc", Status: tasks.Paused, AgentSessionID: "herder-task_abc"}
 	if err := d.StopWorker(context.Background(), task); err != nil {
 		t.Fatalf("StopWorker = %v", err)
 	}
 	unpause, paneClose := -1, -1
-	for i, c := range rec.calls {
+	for i, c := range rec.Calls() {
 		argv := strings.Join(c, " ")
 		if strings.Contains(argv, "docker unpause") {
 			unpause = i
@@ -490,7 +429,7 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		}
 	}
 	if unpause < 0 || paneClose < 0 {
-		t.Fatalf("want docker unpause and pane close, ran %v", rec.calls)
+		t.Fatalf("want docker unpause and pane close, ran %v", rec.Calls())
 	}
 	if unpause > paneClose {
 		t.Errorf("unpause (call %d) must precede pane close (call %d)", unpause, paneClose)

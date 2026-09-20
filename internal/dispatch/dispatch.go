@@ -10,9 +10,9 @@
 // Approach: the Dispatcher bundles the store, the Herdr launcher, the
 // Docker provider, and the delivery engine behind the same Runner seams
 // the leaf packages use, so tests script subprocesses and the scheduler
-// injects its owner identity. QUEUED tasks take a short-lived store
-// lease before any subprocess so two dispatchers never start the same
-// task.
+// injects its owner identity. QUEUED tasks take a store lease —
+// heartbeated for the life of the call — before any subprocess so two
+// dispatchers never start the same task.
 // Inputs: config, the task row, an optional profile override, and the
 // prior agent's name on handoffs.
 // Flow: lease -> resolve profile -> sandbox inspect -> build prompt ->
@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tmih06/herder/internal/agent"
@@ -98,6 +99,18 @@ func (d *Dispatcher) engine() *deliver.Engine {
 		return d.Engine
 	}
 	return &deliver.Engine{}
+}
+
+// SandboxProvider exposes the nil-defaulted provider seam for the
+// scheduler's reconcile path.
+func (d *Dispatcher) SandboxProvider() *sandbox.DockerProvider {
+	return d.provider()
+}
+
+// SessionLauncher exposes the nil-defaulted launcher seam for the
+// scheduler's reconcile path.
+func (d *Dispatcher) SessionLauncher() *agent.Launcher {
+	return d.launcher()
 }
 
 // logf reports a success/info line, discarding when unset.
@@ -195,7 +208,9 @@ func SandboxRoot(dbPath string) string {
 // fails with a preservation note.
 // A QUEUED task takes the dispatch lease first — the same mutual
 // exclusion Launch applies — so a manual provision never races the
-// scheduler's dispatch of the same task (SPEC section 50).
+// scheduler's dispatch of the same task (SPEC section 50); the lease
+// heartbeats for the life of the call so a slow provision never lapses
+// into a duplicate dispatch.
 // Inputs: bounded ctx, config, and the task row. Returns the first
 // failure; the success line goes to Logf.
 func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *tasks.Task) error {
@@ -204,7 +219,7 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 	} else if repo.Sandbox.Provider != "docker" {
 		return fmt.Errorf("provider %q unsupported here (want docker)", repo.Sandbox.Provider)
 	}
-	release, err := d.holdLease(task)
+	release, err := d.holdLease(ctx, task)
 	if err != nil {
 		return err
 	}
@@ -257,6 +272,13 @@ func (d *Dispatcher) advanceToRunning(task *tasks.Task, relaunch bool) error {
 	default:
 		return nil
 	}
+	return d.walkPath(task, path)
+}
+
+// walkPath applies one transition chain, stamping each step and
+// advancing task.Status so the in-memory row tracks the store. Returns
+// the first rejected transition wrapped with the from/to states.
+func (d *Dispatcher) walkPath(task *tasks.Task, path []tasks.State) error {
 	for _, next := range path {
 		if _, err := d.Store.Transition(task.ID, next, d.actorType(), d.actorID()); err != nil {
 			return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, next, err)
@@ -276,12 +298,7 @@ func (d *Dispatcher) advanceToProvisioning(task *tasks.Task) error {
 	if task.Status != tasks.Queued {
 		return nil
 	}
-	if _, err := d.Store.Transition(task.ID, tasks.Provisioning,
-		d.actorType(), d.actorID()); err != nil {
-		return fmt.Errorf("herder: advance %s -> %s: %w", task.Status, tasks.Provisioning, err)
-	}
-	task.Status = tasks.Provisioning
-	return nil
+	return d.walkPath(task, []tasks.State{tasks.Provisioning})
 }
 
 // StopWorker ends the live session and thaws a paused container so a
@@ -318,10 +335,16 @@ func (d *Dispatcher) leaseError(taskID string, err error) error {
 // holdLease takes the task's dispatch lease for a QUEUED task unless the
 // caller already holds it: a live same-owner lease means an outer
 // dispatch (the scheduler's dispatchOne) owns the lifecycle, so this
-// call neither renews nor releases it. Returns the release func for the
-// caller to defer — nil when the task is not QUEUED or the lease was
-// already ours — or a leaseError when a foreign owner holds it.
-func (d *Dispatcher) holdLease(task *tasks.Task) (func(), error) {
+// call neither renews nor releases it. A lease this call acquires gets a
+// heartbeat goroutine ticking every TTL/3 on ctx — a provision longer
+// than the TTL must not let the lease lapse into a duplicate dispatch.
+// A lost lease only warns and ends the beat: the caller's own
+// transitions remain the guard against acting on a stolen task.
+// Returns the release func for the caller to defer — nil when the task
+// is not QUEUED or the lease was already ours — or a leaseError when a
+// foreign owner holds it. Release is idempotent: it stops the beat then
+// drops the lease.
+func (d *Dispatcher) holdLease(ctx context.Context, task *tasks.Task) (func(), error) {
 	if task.Status != tasks.Queued {
 		return nil, nil
 	}
@@ -336,5 +359,33 @@ func (d *Dispatcher) holdLease(task *tasks.Task) (func(), error) {
 		}
 		return nil, err
 	}
-	return func() { _ = d.Store.ReleaseLease(task.ID, owner) }, nil
+	done := make(chan struct{})
+	interval := d.leaseTTL() / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := d.Store.HeartbeatLease(task.ID, owner, d.leaseTTL()); err != nil {
+					d.warnf("herder: dispatch %s: lease heartbeat: %v", task.ID, err)
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			_ = d.Store.ReleaseLease(task.ID, owner)
+		})
+	}, nil
 }

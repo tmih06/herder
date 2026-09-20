@@ -347,3 +347,77 @@ func TestTransitionRunningStampsStartedAt(t *testing.T) {
 			running.StartedAt, retried.StartedAt)
 	}
 }
+
+// Resuming from PAUSED or BLOCKED continues the same attempt, so
+// started_at must survive — otherwise a periodically pausing worker never
+// reaches its timeout. A RETRYING re-entry is a fresh attempt and still
+// resets the clock.
+func TestTransitionResumePreservesStartedAt(t *testing.T) {
+	store, _ := openTestStore(t)
+
+	claimed, err := store.Claim(claimInput("del-1", "acme/web#7"))
+	if err != nil {
+		t.Fatalf("Claim = %v", err)
+	}
+	transition := func(to tasks.State) {
+		t.Helper()
+		if _, err := store.Transition(claimed.Task.ID, to, "controller", "test"); err != nil {
+			t.Fatalf("Transition to %s = %v", to, err)
+		}
+	}
+	get := func() tasks.Task {
+		t.Helper()
+		task, err := store.GetTask(claimed.Task.ID)
+		if err != nil {
+			t.Fatalf("GetTask = %v", err)
+		}
+		return task
+	}
+
+	transition(tasks.Provisioning)
+	transition(tasks.Running)
+	started := get().StartedAt
+	if started.IsZero() {
+		t.Fatalf("RUNNING task must carry started_at")
+	}
+
+	// PAUSED -> RUNNING resumes the same attempt: keep the stamp.
+	transition(tasks.Paused)
+	transition(tasks.Running)
+	resumed := get()
+	if !resumed.StartedAt.Equal(started) {
+		t.Errorf("resume from PAUSED restamped started_at: %v -> %v",
+			started, resumed.StartedAt)
+	}
+	if resumed.StartedAt.Equal(resumed.UpdatedAt) {
+		t.Errorf("resume from PAUSED must not restamp started_at to updated_at %v",
+			resumed.UpdatedAt)
+	}
+
+	// BLOCKED -> RUNNING resumes the same attempt: keep the stamp.
+	transition(tasks.Blocked)
+	transition(tasks.Running)
+	unblocked := get()
+	if !unblocked.StartedAt.Equal(started) {
+		t.Errorf("resume from BLOCKED restamped started_at: %v -> %v",
+			started, unblocked.StartedAt)
+	}
+	if unblocked.StartedAt.Equal(unblocked.UpdatedAt) {
+		t.Errorf("resume from BLOCKED must not restamp started_at to updated_at %v",
+			unblocked.UpdatedAt)
+	}
+
+	// RETRYING -> RUNNING is a fresh attempt: the clock must reset.
+	transition(tasks.Retrying)
+	transition(tasks.Provisioning)
+	transition(tasks.Running)
+	retried := get()
+	if !retried.StartedAt.Equal(retried.UpdatedAt) {
+		t.Errorf("retry must reset started_at to updated_at: %v vs %v",
+			retried.StartedAt, retried.UpdatedAt)
+	}
+	if retried.StartedAt.Before(started) {
+		t.Errorf("retry moved started_at backwards: %v -> %v",
+			started, retried.StartedAt)
+	}
+}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
+	"github.com/tmih06/herder/internal/testutil"
 )
 
 // testConfig builds two repos sharing one codex profile so per-repo and
@@ -41,18 +41,6 @@ func testConfig() *config.Config {
 	}
 }
 
-// testStore opens a real store in a temp dir so lease, transition, and
-// event behavior is exercised against SQLite, not a stub.
-func testStore(t *testing.T) *storage.Store {
-	t.Helper()
-	store, err := storage.Open(filepath.Join(t.TempDir(), "herder.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return store
-}
-
 // queueTask creates a task and walks it to QUEUED, returning the row.
 func queueTask(t *testing.T, store *storage.Store, repo, ref string, priority int) tasks.Task {
 	t.Helper()
@@ -71,77 +59,6 @@ func queueTask(t *testing.T, store *storage.Store, repo, ref string, priority in
 	}
 	task.Status = tasks.Queued
 	return task
-}
-
-// recorder scripts subprocess results by argv and records every call;
-// one script feeds the docker, herdr, and gh runners alike. The mutex
-// makes it safe under concurrent dispatchOne goroutines.
-type recorder struct {
-	mu      sync.Mutex
-	calls   [][]string
-	respond func(name string, args []string) (sandbox.RunResult, error)
-}
-
-func (r *recorder) run(_ context.Context, name string, args []string) (sandbox.RunResult, error) {
-	r.mu.Lock()
-	r.calls = append(r.calls, append([]string{name}, args...))
-	r.mu.Unlock()
-	if r.respond != nil {
-		return r.respond(name, args)
-	}
-	return sandbox.RunResult{}, nil
-}
-
-// called reports whether any recorded argv contains every fragment.
-func (r *recorder) called(fragments ...string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, call := range r.calls {
-		joined := strings.Join(call, " ")
-		ok := true
-		for _, f := range fragments {
-			if !strings.Contains(joined, f) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
-}
-
-// countCalls reports how many recorded argv contain every fragment.
-func (r *recorder) countCalls(fragments ...string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := 0
-	for _, call := range r.calls {
-		joined := strings.Join(call, " ")
-		ok := true
-		for _, f := range fragments {
-			if !strings.Contains(joined, f) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			n++
-		}
-	}
-	return n
-}
-
-// dockerRun adapts the script to the sandbox.Runner seam.
-func (r *recorder) dockerRun(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	return r.run(ctx, name, args)
-}
-
-// herdrRun adapts the script to the agent.Runner seam.
-func (r *recorder) herdrRun(ctx context.Context, name string, args ...string) (agent.RunResult, error) {
-	out, err := r.run(ctx, name, args)
-	return agent.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
 }
 
 // happyRespond scripts a healthy fleet: existing clean repo, running
@@ -172,15 +89,15 @@ func inspectJSON(status string, oom bool) string {
 // newScheduler wires a scheduler over scripted runners: the same
 // recorder feeds the Docker provider, the Herdr launcher, and the gh
 // engine so one script drives the whole dispatch pipeline.
-func newScheduler(store *storage.Store, cfg *config.Config, rec *recorder) *Scheduler {
+func newScheduler(store *storage.Store, cfg *config.Config, rec *testutil.Recorder) *Scheduler {
 	return &Scheduler{
 		Store: store,
 		Cfg:   cfg,
 		Dispatcher: &dispatch.Dispatcher{
 			Store:    store,
-			Launcher: &agent.Launcher{Runner: rec.herdrRun},
-			Provider: &sandbox.DockerProvider{Runner: rec.dockerRun},
-			Engine:   &deliver.Engine{Runner: rec.dockerRun},
+			Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+			Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+			Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		},
 	}
 }
@@ -189,30 +106,6 @@ func newScheduler(store *storage.Store, cfg *config.Config, rec *recorder) *Sche
 // assertions observe the settled state, not a mid-flight write.
 func waitDispatch(s *Scheduler) {
 	s.wg.Wait()
-}
-
-// eventTypes lists a task's recorded event types in order.
-func eventTypes(t *testing.T, store *storage.Store, taskID string) []string {
-	t.Helper()
-	events, err := store.ListEvents(taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	types := make([]string, len(events))
-	for i, e := range events {
-		types[i] = e.Type
-	}
-	return types
-}
-
-// hasEvent reports whether the type list contains want.
-func hasEvent(types []string, want string) bool {
-	for _, typ := range types {
-		if typ == want {
-			return true
-		}
-	}
-	return false
 }
 
 // taskStatus reloads one task's status.
@@ -230,9 +123,9 @@ func taskStatus(t *testing.T, store *storage.Store, taskID string) tasks.State {
 // the tie: the high-priority task and the oldest normal task run while
 // the newest normal task stays queued.
 func TestDispatchHonorsCapsAndPriority(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	oldest := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -251,7 +144,7 @@ func TestDispatchHonorsCapsAndPriority(t *testing.T) {
 	if got := taskStatus(t, store, newest.ID); got != tasks.Queued {
 		t.Errorf("newest task = %s, want QUEUED (cap reached)", got)
 	}
-	if n := rec.countCalls("herdr", "agent", "start"); n != 2 {
+	if n := rec.CountCalls("herdr", "agent", "start"); n != 2 {
 		t.Errorf("agent starts = %d, want exactly 2", n)
 	}
 }
@@ -260,11 +153,11 @@ func TestDispatchHonorsCapsAndPriority(t *testing.T) {
 // only that repo's tasks: the third acme/web task stays queued while
 // acme/api's task dispatches into the remaining global slot.
 func TestDispatchPerRepositoryCap(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	cfg.Scheduler.MaxWorkers = 3
 	cfg.Scheduler.PerRepository = map[string]int{"acme/web": 1}
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	web1 := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -288,11 +181,11 @@ func TestDispatchPerRepositoryCap(t *testing.T) {
 // TestDispatchPerAgentCap proves the per-agent bucket keys on the
 // resolved kind: two codex tasks under per_agent.codex=1 dispatch one.
 func TestDispatchPerAgentCap(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	cfg.Scheduler.MaxWorkers = 3
 	cfg.Scheduler.PerAgent = map[string]int{"codex": 1}
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	first := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -314,10 +207,10 @@ func TestDispatchPerAgentCap(t *testing.T) {
 // and the requeued task does not instantly re-dispatch because the
 // worker slot is still occupied.
 func TestExpiredLeaseRequeues(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	cfg.Scheduler.MaxWorkers = 1
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	// A healthy RUNNING task occupies the one worker slot.
@@ -348,8 +241,8 @@ func TestExpiredLeaseRequeues(t *testing.T) {
 	if got := taskStatus(t, store, victim.ID); got != tasks.Queued {
 		t.Errorf("expired-lease task = %s, want QUEUED", got)
 	}
-	types := eventTypes(t, store, victim.ID)
-	if !hasEvent(types, tasks.EventLeaseExpired) {
+	types := testutil.EventTypes(t, store, victim.ID)
+	if !testutil.HasEvent(types, tasks.EventLeaseExpired) {
 		t.Errorf("want lease.expired event, got %v", types)
 	}
 	if got := taskStatus(t, store, occupant.ID); got != tasks.Running {
@@ -363,10 +256,10 @@ func TestExpiredLeaseRequeues(t *testing.T) {
 // task.dispatch_failed event instead of holding a worker slot forever,
 // while a PROVISIONING task under a live lease is left to its owner.
 func TestAbandonedProvisioningRequeues(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	cfg.Scheduler.MaxWorkers = 1
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	// A mid-dispatch task under a live lease: reconcile must skip it.
@@ -409,7 +302,7 @@ func TestAbandonedProvisioningRequeues(t *testing.T) {
 	if got := taskStatus(t, store, leased.ID); got != tasks.Provisioning {
 		t.Errorf("leased task = %s, want PROVISIONING (mid-dispatch, untouched)", got)
 	}
-	if types := eventTypes(t, store, leased.ID); hasEvent(types, tasks.EventDispatchFailed) {
+	if types := testutil.EventTypes(t, store, leased.ID); testutil.HasEvent(types, tasks.EventDispatchFailed) {
 		t.Errorf("leased task must not record dispatch_failed, got %v", types)
 	}
 }
@@ -420,13 +313,13 @@ func TestAbandonedProvisioningRequeues(t *testing.T) {
 // not count it again — a second queued task still fits the remaining
 // slot while a third stays queued.
 func TestInflightProvisionedCountsOnce(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	// Gate the Herdr start so first's dispatchOne stays inflight after
 	// Provision lands PROVISIONING — the exact window where a second
 	// count would double-book the slot.
 	release := make(chan struct{})
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		if name == "herdr" && strings.HasPrefix(strings.Join(args, " "), "agent start") {
 			<-release
 		}
@@ -468,9 +361,9 @@ func TestInflightProvisionedCountsOnce(t *testing.T) {
 // binding is gone lands WAITING_FOR_HUMAN with worker.disconnected —
 // the recovery policy after the supervisor clears a dead binding.
 func TestMissingSessionDisconnects(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -488,8 +381,8 @@ func TestMissingSessionDisconnects(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.WaitingForHuman {
 		t.Errorf("session-less task = %s, want WAITING_FOR_HUMAN", got)
 	}
-	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventWorkerDisconnected) {
+	types := testutil.EventTypes(t, store, task.ID)
+	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -498,10 +391,10 @@ func TestMissingSessionDisconnects(t *testing.T) {
 // profile's timeout stops the live pane and lands TIMED_OUT with the
 // task.timed_out event (SPEC section 15: time limits enforced).
 func TestAgentTimeoutStopsWorker(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
 	cfg.Agents["codex-default"] = config.AgentConfig{Kind: "codex", Timeout: "1ms"}
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -524,11 +417,11 @@ func TestAgentTimeoutStopsWorker(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.TimedOut {
 		t.Errorf("timed-out task = %s, want TIMED_OUT", got)
 	}
-	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventTaskTimedOut) {
+	types := testutil.EventTypes(t, store, task.ID)
+	if !testutil.HasEvent(types, tasks.EventTaskTimedOut) {
 		t.Errorf("want task.timed_out event, got %v", types)
 	}
-	if !rec.called("herdr", "pane", "close") {
+	if !rec.Called("herdr", "pane", "close") {
 		t.Error("timed-out worker's pane should be closed")
 	}
 }
@@ -537,9 +430,9 @@ func TestAgentTimeoutStopsWorker(t *testing.T) {
 // engine OOM-killed lands FAILED with the resource-limit reason — the
 // kill is a verdict on the work, not a transient disconnect.
 func TestOOMKilledSandboxFails(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect ") {
 			return sandbox.RunResult{Stdout: inspectJSON("exited", true)}, nil
@@ -565,8 +458,8 @@ func TestOOMKilledSandboxFails(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.Failed {
 		t.Errorf("OOM-killed task = %s, want FAILED", got)
 	}
-	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventWorkerDisconnected) {
+	types := testutil.EventTypes(t, store, task.ID)
+	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -576,9 +469,9 @@ func TestOOMKilledSandboxFails(t *testing.T) {
 // a blocked worker is still a worker, so losing its session follows the
 // same recovery policy as RUNNING.
 func TestBlockedSessionGoneDisconnects(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -599,8 +492,8 @@ func TestBlockedSessionGoneDisconnects(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.WaitingForHuman {
 		t.Errorf("blocked session-less task = %s, want WAITING_FOR_HUMAN", got)
 	}
-	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventWorkerDisconnected) {
+	types := testutil.EventTypes(t, store, task.ID)
+	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -611,9 +504,9 @@ func TestBlockedSessionGoneDisconnects(t *testing.T) {
 // FAILED with the resource-limit reason, not WAITING_FOR_HUMAN with a
 // generic "session gone".
 func TestOOMKilledAfterSessionClearedFails(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect ") {
 			return sandbox.RunResult{Stdout: inspectJSON("exited", true)}, nil
@@ -658,9 +551,9 @@ func TestOOMKilledAfterSessionClearedFails(t *testing.T) {
 // immediate second attempt: a tick inside RetryDelay runs no new
 // provision.
 func TestProvisionFailureBacksOff(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
 		argv := strings.Join(args, " ")
 		switch {
 		case name == "docker" && strings.HasPrefix(argv, "inspect --format"):
@@ -680,17 +573,17 @@ func TestProvisionFailureBacksOff(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.Queued {
 		t.Errorf("failed provision task = %s, want QUEUED", got)
 	}
-	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventDispatchFailed) {
+	types := testutil.EventTypes(t, store, task.ID)
+	if !testutil.HasEvent(types, tasks.EventDispatchFailed) {
 		t.Errorf("want task.dispatch_failed event, got %v", types)
 	}
-	creates := rec.countCalls("docker", "create")
+	creates := rec.CountCalls("docker", "create")
 
 	// A second tick inside the backoff window must not retry.
 	s.Tick(context.Background())
 	waitDispatch(s)
 
-	if got := rec.countCalls("docker", "create"); got != creates {
+	if got := rec.CountCalls("docker", "create"); got != creates {
 		t.Errorf("backoff should suppress re-dispatch: creates %d -> %d", creates, got)
 	}
 	if got := taskStatus(t, store, task.ID); got != tasks.Queued {
@@ -702,9 +595,9 @@ func TestProvisionFailureBacksOff(t *testing.T) {
 // a live lease: its dispatch attempt ends at AcquireLease and no second
 // session ever starts (SPEC section 50).
 func TestForeignLeaseBlocksDispatch(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -716,7 +609,7 @@ func TestForeignLeaseBlocksDispatch(t *testing.T) {
 	s.Tick(context.Background())
 	waitDispatch(s)
 
-	if rec.called("herdr", "agent", "start") {
+	if rec.Called("herdr", "agent", "start") {
 		t.Error("foreign-held lease must block the launch: no agent start")
 	}
 	if got := taskStatus(t, store, task.ID); got != tasks.Queued {
@@ -737,9 +630,9 @@ func TestForeignLeaseBlocksDispatch(t *testing.T) {
 // not read a healthy mid-dispatch task as a dead worker. Once the
 // lease lapses the same task disconnects normally.
 func TestLiveLeaseSkipsReconcile(t *testing.T) {
-	store := testStore(t)
+	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &recorder{respond: happyRespond}
+	rec := &testutil.Recorder{Respond: happyRespond}
 	s := newScheduler(store, cfg, rec)
 
 	task := queueTask(t, store, "acme/web", "acme/web#1", 0)
@@ -761,7 +654,7 @@ func TestLiveLeaseSkipsReconcile(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.Running {
 		t.Errorf("leased task = %s, want RUNNING (mid-dispatch, untouched)", got)
 	}
-	if types := eventTypes(t, store, task.ID); hasEvent(types, tasks.EventWorkerDisconnected) {
+	if types := testutil.EventTypes(t, store, task.ID); testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("live lease must suppress worker.disconnected, got %v", types)
 	}
 
@@ -776,7 +669,7 @@ func TestLiveLeaseSkipsReconcile(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.WaitingForHuman {
 		t.Errorf("expired-lease task = %s, want WAITING_FOR_HUMAN", got)
 	}
-	if types := eventTypes(t, store, task.ID); !hasEvent(types, tasks.EventWorkerDisconnected) {
+	if types := testutil.EventTypes(t, store, task.ID); !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected after lease lapse, got %v", types)
 	}
 }

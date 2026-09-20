@@ -201,10 +201,10 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	}
 	go supervisor.Run(supCtx)
 	d := &dispatch.Dispatcher{
-		Store: store, Owner: "daemon",
+		Store: store, Owner: fmt.Sprintf("daemon-%d", os.Getpid()),
 		Provider: newProvider(ew), Launcher: &agent.Launcher{},
 		Engine:    &deliver.Engine{},
-		ActorType: "controller", ActorID: "daemon",
+		ActorType: "controller", ActorID: fmt.Sprintf("daemon-%d", os.Getpid()),
 		Logf: logf, Warnf: logf,
 	}
 	sched := &scheduler.Scheduler{

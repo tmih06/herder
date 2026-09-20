@@ -296,10 +296,12 @@ func (s *Store) ListTasks() ([]tasks.Task, error) {
 }
 
 // Transition validates the jump, updates the status, and appends the
-// task.transition event in one transaction. Entering RUNNING also stamps
+// task.transition event in one transaction. Entering RUNNING stamps
 // started_at so the agent timeout measures each attempt's wall clock from
-// dispatch, not from task creation. Illegal jumps fail with the
-// state-machine error and change nothing.
+// dispatch, not from task creation — except resuming from PAUSED or
+// BLOCKED, which continues the same attempt and keeps the original stamp
+// so an interrupted worker cannot outrun its timeout budget. Illegal jumps
+// fail with the state-machine error and change nothing.
 func (s *Store) Transition(id string, to tasks.State, actorType, actorID string) (tasks.Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -310,11 +312,12 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	if err != nil {
 		return tasks.Event{}, err
 	}
+	from := task.Status
 	event, err := tasks.ApplyTransition(&task, to, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
 	if err != nil {
 		return tasks.Event{}, err
 	}
-	if to == tasks.Running {
+	if to == tasks.Running && from != tasks.Paused && from != tasks.Blocked {
 		task.StartedAt = task.UpdatedAt
 	}
 	if _, err := tx.Exec("UPDATE tasks SET status = ?, started_at = ?, updated_at = ? WHERE id = ?",

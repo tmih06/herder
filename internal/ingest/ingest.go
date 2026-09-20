@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -73,6 +74,8 @@ func New(cfg *config.Config, store *storage.Store) *Handler {
 // missing trigger label denied -> atomic Claim (same-delivery and
 // same-issue redeliveries return duplicate; bursts queue for the
 // scheduler's caps rather than being denied here).
+// A "priority:N" label on the issue seeds the task's queue priority
+// (advisory only; malformed values are ignored, never denied).
 // Malformed events (no delivery id, repository, or issue number) are
 // caller errors, not denials: nothing durable can reference them.
 func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
@@ -127,6 +130,7 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
 		Goal:           goal,
+		Priority:       labelPriority(ev.Labels),
 		PolicyPayload:  string(payload),
 		ActorType:      "controller",
 		ActorID:        "webhook",
@@ -212,6 +216,22 @@ func matchTrigger(have, triggers []string) string {
 		}
 	}
 	return ""
+}
+
+// labelPriority reads the queue priority convention "priority:N" from the
+// issue labels: the first label carrying a non-negative integer wins and
+// malformed or negative values are skipped, so absent means 0 (normal).
+func labelPriority(labels []string) int {
+	for _, l := range labels {
+		n, ok := strings.CutPrefix(l, "priority:")
+		if !ok {
+			continue
+		}
+		if v, err := strconv.Atoi(n); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // sortedLabels copies labels sorted for stable denial reasons and payloads.
