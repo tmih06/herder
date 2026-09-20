@@ -439,6 +439,13 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 // fresh pane can take it. The holder's pane stays open for post-mortem
 // reads; only the name is released.
 func (l *Launcher) clearSessionName(ctx context.Context, session string) error {
+	// Guard: only release the name when the holder's shim is confirmed
+	// gone. If the record still answers and its shim is foreground, the
+	// name belongs to a live agent — stealing it would orphan that
+	// agent's identity while it keeps running.
+	if info, err := l.Get(ctx, session); err == nil && info.Running {
+		return fmt.Errorf("session %s held by a live agent", session)
+	}
 	out, err := l.runner()(ctx, "herdr", "agent", "rename", session, "--clear")
 	if err != nil {
 		return err
@@ -685,7 +692,10 @@ func (l *Launcher) Get(ctx context.Context, session string) (AgentInfo, error) {
 // maybe-dead reading, so it returns an error rather than a guess.
 func (l *Launcher) shimRunning(ctx context.Context, info AgentInfo) (bool, error) {
 	if info.PaneID == "" || info.Kind == "" {
-		return false, nil
+		// A record without pane_id or kind is malformed/transient —
+		// uncertain, not dead. Error so callers retry instead of
+		// clearing a live session's binding.
+		return false, fmt.Errorf("agent: record incomplete (kind=%q pane=%q)", info.Kind, info.PaneID)
 	}
 	out, err := l.runner()(ctx, "herdr", "pane", "process-info", "--pane", info.PaneID)
 	if err != nil {

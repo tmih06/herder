@@ -415,7 +415,9 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		case name == "docker" && strings.HasPrefix(argv, "inspect "):
 			return sandbox.RunResult{Stdout: "paused"}, nil
 		case name == "herdr" && strings.HasPrefix(argv, "agent get"):
-			return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent_status":"working","pane_id":"w1:p1"}}}`}, nil
+			return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w1:p1"}}}`}, nil
+		case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
+			return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
 		}
 		return sandbox.RunResult{}, nil
 	}}
