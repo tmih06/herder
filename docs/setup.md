@@ -33,8 +33,13 @@ go build -o herder ./cmd/herder
 ./herder doctor   # controller, storage, Herdr, Docker reported distinctly
 ```
 
-`scripts/demo.sh` runs the full end-to-end demo: labeled issue → task →
-sandbox → agent → validation → PR.
+`demo/demo.sh` runs the full end-to-end demo on one machine (~1 min):
+labeled issue → claimed task → Docker sandbox → visible agent → human
+message round-trip → validation gate → pushed branch → open PR → issue
+labels → done, plus kill -9 restart resilience and duplicate-webhook
+dedup. It needs `gh`, `docker`, and `herdr`; it creates a scratch
+GitHub repo (deleted afterwards) and a deterministic fake `codex`
+worker image, so no agent account is required.
 
 ## Configuration
 
@@ -59,14 +64,14 @@ github:
 scheduler:
   max_workers: 4                # global concurrency cap
   per_repository:               # optional per-repo caps
-    tmih06/meltiply: 3
+    owner/repo: 3
   per_agent:                    # optional per-agent-kind caps
     codex: 4
   lease_ttl: 2m                 # dispatch lease lifetime (default 2m)
   dispatch_interval: 2s         # scheduler poll interval (default 2s)
 
 repositories:
-  tmih06/meltiply:
+  owner/repo:
     enabled: true               # disabled repos are policy-denied
     trigger:
       labels:

@@ -48,6 +48,19 @@ go build -o herder ./cmd/herder
 ./herder doctor   # controller, storage, Herdr, Docker reported distinctly
 ```
 
+## End-to-end demo
+
+```bash
+demo/demo.sh   # ~1 min; needs gh + docker + herdr, no agent account
+```
+
+Proves the whole v0.1 story on one machine: labeled issue → claimed
+task → Docker sandbox → visible agent → human message round-trip →
+validation gate → pushed branch → open PR → updated issue labels →
+done, plus kill -9 restart resilience and duplicate-webhook dedup. It
+creates a scratch GitHub repo (deleted on exit) and a deterministic
+fake `codex` worker image under `demo/`.
+
 ## Task workflow
 
 ```bash
