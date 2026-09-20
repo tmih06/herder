@@ -527,20 +527,34 @@ func (l *Launcher) killContainerAgent(ctx context.Context, container string) {
 		if len(fields) < 3 {
 			continue
 		}
-		pid, comm, args := fields[0], fields[1], strings.Join(fields[2:], " ")
+		pid, comm := fields[0], fields[1]
 		// The agent is the docker exec'd command: match its comm (direct
-		// binary) or its path inside argv (script wrapper like the demo's
-		// `sh /usr/local/bin/codex`). Skip the container's own init.
+		// binary) or an argv token whose basename is the kind (script
+		// wrapper like `sh /usr/local/bin/codex`). A bare substring would
+		// kill unrelated processes that merely mention the name. Skip
+		// the container's own init.
 		if pid == "1" {
 			continue
 		}
 		for kind := range agentCommands {
-			if filepath.Base(comm) == kind || strings.Contains(args, kind) {
+			if filepath.Base(comm) == kind || argvHasBasename(fields[2:], kind) {
 				_, _ = l.runner()(ctx, "kill", "-9", pid)
 				break
 			}
 		}
 	}
+}
+
+// argvHasBasename reports whether any argv token's basename equals name:
+// `sh /usr/local/bin/codex` matches "codex" while `grep codex` in an
+// unrelated process does not.
+func argvHasBasename(argv []string, name string) bool {
+	for _, a := range argv {
+		if filepath.Base(a) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // closeStaleWorkspaces closes workspaces still carrying the session
@@ -780,6 +794,10 @@ func (l *Launcher) Stop(ctx context.Context, session, container string) error {
 	info, err := l.Get(ctx, session)
 	if err != nil {
 		if errors.Is(err, ErrSessionGone) {
+			// The pane/record is gone but the docker exec'd agent may
+			// still run deaf inside the container (e.g. after a Herdr
+			// restart killed the pane but not the exec'd process).
+			l.killContainerAgent(ctx, container)
 			return nil
 		}
 		return err

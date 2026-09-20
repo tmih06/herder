@@ -41,7 +41,7 @@ event, and failure lands as a structured event — the event log answers
 
 | Symptom | Cause | Fix |
 | ------- | ----- | --- |
-| `agent: start …` fails, task FAILED with `agent.start_failed` | Herdr server not running (or `herdr` missing) | Start Herdr (`herdr`), re-check `herder doctor`, then `herder task retry <id>` |
+| `agent: workspace create …` fails, task FAILED with `agent.start_failed` | Herdr server not running (or `herdr` missing) | Start Herdr (`herdr`), re-check `herder doctor`, then `herder task retry <id>` |
 | `agent prompt` retries then fails (`agent_not_ready`) | Herdr pane exists but the agent inside hasn't come up | Check the pane via `herder task attach <id>` / `task logs`; retry once the agent binary is installed in the sandbox image |
 | `docker found but daemon not answering` / `permission denied … docker.sock` | dockerd down, or your user lacks socket access | Start dockerd; add user to the `docker` group or fix socket permissions |
 | Provision fails with a dirty-workspace error (`DirtyError`) | Re-provisioning would discard uncommitted work | Inspect `<statedir>/sandboxes/<task>/`, commit or clean by hand, then re-provision — Herder refuses rather than destroys |
