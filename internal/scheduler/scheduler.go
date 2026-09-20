@@ -167,8 +167,14 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 		}
 		// The dead owner may have left a Herdr pane running the task;
 		// stopWorkerSession thaws the sandbox then closes the pane,
-		// best-effort because both are usually gone too.
+		// best-effort because both are usually gone too. The binding is
+		// cleared so `task attach` cannot exec a dead pane.
 		s.stopWorkerSession(ctx, &task)
+		if task.AgentSessionID != "" {
+			if err := s.Store.ClearSessionBinding(task.ID); err != nil {
+				s.logf("herder: scheduler: expired lease: clear binding %s: %v", task.ID, err)
+			}
+		}
 		if task.Status != tasks.Queued {
 			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
 				s.logf("herder: scheduler: expired lease: requeue %s: %v", task.ID, err)
@@ -192,6 +198,10 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 // resource-limit reason instead of a generic disconnect. A task under
 // a live dispatch lease is skipped entirely: the lease owner is
 // responsible until the lease lapses.
+// Session liveness is the supervisor's job — it clears the binding on
+// ErrSessionGone — so reconcile never probes sessions itself: a
+// transport error is indistinguishable from a dead session, and acting
+// on it could strand live work.
 // A PROVISIONING task with no live lease is an abandoned dispatch —
 // the owner died between Provision and Launch, or a manual provision
 // was left staged — so it requeues through requeueDispatch with a
@@ -227,10 +237,14 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 				stage, reason = "retry", "retry abandoned: no dispatch lease"
 			}
 			// A bound session means Launch died after binding but before
-			// RUNNING: the orphaned pane is stopped best-effort before
-			// the task requeues.
+			// RUNNING: the orphaned pane is stopped best-effort and the
+			// binding cleared so `task attach` cannot exec a dead pane
+			// before the next Launch rebinds.
 			if task.AgentSessionID != "" {
 				s.stopWorkerSession(ctx, task)
+				if err := s.Store.ClearSessionBinding(task.ID); err != nil {
+					s.logf("herder: scheduler: reconcile %s: clear session binding: %v", task.ID, err)
+				}
 			}
 			s.requeueDispatch(*task, stage, reason)
 			continue
@@ -647,15 +661,25 @@ func (s *Scheduler) failDispatch(task tasks.Task, reason string, preserved bool)
 // dispatch and stamps its backoff so the next tick does not retry
 // immediately. The transition is skipped when the task already sits in
 // QUEUED — the store rejects same-state jumps — and logged when it
-// races elsewhere. Stage names the dispatch_failed event's stage:
+// races elsewhere. The dispatch_failed event and the backoff stamp land
+// only when the task is or lands QUEUED: a rejected transition means
+// the task raced to RUNNING or CANCELLED, where a failure event would
+// be a spurious audit entry and a stale backoff would delay the next
+// legitimate dispatch. Stage names the dispatch_failed event's stage:
 // "provision" for a failed attempt, "retry" for an abandoned one.
 func (s *Scheduler) requeueDispatch(task tasks.Task, stage, reason string) {
+	queued := false
 	if cur, err := s.Store.GetTask(task.ID); err != nil {
 		s.logf("herder: scheduler: dispatch %s: re-read: %v", task.ID, err)
-	} else if cur.Status != tasks.Queued {
-		if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
-			s.logf("herder: scheduler: dispatch %s: requeue: %v", task.ID, err)
-		}
+	} else if cur.Status == tasks.Queued {
+		queued = true
+	} else if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
+		s.logf("herder: scheduler: dispatch %s: requeue: %v", task.ID, err)
+	} else {
+		queued = true
+	}
+	if !queued {
+		return
 	}
 	if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
 		"controller", s.owner(), tasks.EventPayload(map[string]any{

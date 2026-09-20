@@ -31,8 +31,10 @@ import (
 // Returns the first failure carrying the operator-facing message; the
 // success line goes to Logf.
 // An advance failure after a bound start — the task left the
-// launchable set mid-dispatch, e.g. CANCELLED — stops the fresh pane
-// and clears the binding so no unsupervised session outlives it.
+// launchable set mid-dispatch — stops the fresh pane and clears the
+// binding only when the stored status is terminal: a lost lease
+// requeues the task, so the pane may already serve a replacement
+// dispatch under the same deterministic session name.
 func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks.Task, override, priorAgent string) error {
 	// The dispatch lease serializes QUEUED, PROVISIONING, and RETRYING
 	// launches (SPEC section 50): a second dispatcher sees ErrLeaseHeld
@@ -129,18 +131,27 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		d.warnf("herder: record agent state: %v", err)
 	}
 	if err := d.advanceToRunning(ctx, task, true); err != nil {
-		// The task left the launchable set mid-dispatch (CANCELLED has
-		// no outgoing edges), so nothing supervises it: stop the
-		// just-bound pane on a fresh bounded ctx — a cancelled parent
-		// must not skip cleanup — and drop the binding so attach
-		// reports no session instead of landing on an orphaned pane.
-		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer stopCancel()
-		if stopErr := d.launcher().Stop(stopCtx, session); stopErr != nil {
-			d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
-		}
-		if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {
-			d.warnf("herder: clear orphaned session binding: %v", clearErr)
+		// The task left the launchable set mid-dispatch, so nothing
+		// supervises the just-bound pane — unless the failure is a
+		// lost lease, where expireLeases already requeued the task
+		// and a replacement dispatch may own a live pane under the
+		// same deterministic session name. Re-read the task and run
+		// cleanup only on a terminal stored status (CANCELLED or
+		// FAILED, the orphan case): QUEUED/PROVISIONING/RUNNING means
+		// the pane belongs to the new owner or its reuseSession path
+		// will adopt it, and a failed re-read is uncertain — never
+		// destroy. The stop runs on a fresh bounded ctx so a
+		// cancelled parent cannot skip cleanup.
+		stored, getErr := d.Store.GetTask(task.ID)
+		if getErr == nil && (stored.Status == tasks.Cancelled || stored.Status == tasks.Failed) {
+			stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer stopCancel()
+			if stopErr := d.launcher().Stop(stopCtx, session); stopErr != nil {
+				d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
+			}
+			if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {
+				d.warnf("herder: clear orphaned session binding: %v", clearErr)
+			}
 		}
 		return err
 	}
