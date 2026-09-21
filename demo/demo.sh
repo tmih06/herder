@@ -66,7 +66,12 @@ cleanup() {
 		done
 		docker rm -f "herder-$TASK_ID" >/dev/null 2>&1
 	fi
-	[ -n "$REPO" ] && gh repo delete "$REPO" --yes >/dev/null 2>&1
+	if [ -n "$REPO" ]; then
+		if ! gh repo delete "$REPO" --yes >/dev/null 2>&1; then
+			echo "WARN: could not delete $REPO — gh token lacks the delete_repo" >&2
+			echo "      scope (gh auth refresh -s delete_repo) or delete it by hand." >&2
+		fi
+	fi
 	[ $KEEP -eq 0 ] && rm -rf "$DEMO_DIR" || echo "kept: $DEMO_DIR"
 }
 trap cleanup EXIT
@@ -91,7 +96,7 @@ ok "worker image $IMAGE (fake codex inside)"
 say "Create scratch GitHub repo + issue"
 OWNER=$(gh api user -q .login)
 REPO="$OWNER/herder-demo-$(date +%H%M%S)"
-gh repo create "$REPO" --public --add-readme >/dev/null
+gh repo create "$REPO" --private --add-readme >/dev/null
 # Stage labels must exist before delivery can move them (gh issue edit
 # --add-label fails on unknown labels, and that failure is fatal).
 for l in agent-ready agent-running agent-review completed; do
