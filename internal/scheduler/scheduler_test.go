@@ -98,7 +98,7 @@ func newScheduler(store *storage.Store, cfg *config.Config, rec *testutil.Record
 		Cfg:   cfg,
 		Dispatcher: &dispatch.Dispatcher{
 			Store:    store,
-			Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+			Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 			Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 			Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		},

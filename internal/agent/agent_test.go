@@ -117,17 +117,10 @@ func TestSessionNameIsStable(t *testing.T) {
 	}
 }
 
-// stubLookPath points EnsureShim at a fake docker binary inside dir so
-// Start's shim step never needs a real install.
-func stubLookPath(t *testing.T, dir string) {
-	t.Helper()
-	docker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(docker, []byte("#!/bin/sh\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	old := lookPath
-	lookPath = func(name string) (string, error) { return filepath.Join(dir, name), nil }
-	t.Cleanup(func() { lookPath = old })
+// fakeLookPath resolves every binary to a path inside dir so Start's
+// shim step never needs a real docker install.
+func fakeLookPath(dir string) func(string) (string, error) {
+	return func(name string) (string, error) { return filepath.Join(dir, name), nil }
 }
 
 // startRespond scripts the full herdr 0.9.x launch flow: workspace create
@@ -155,9 +148,9 @@ func startRespond(calls *[][]string) Runner {
 // renamed session (SPEC sections 24, 26).
 func TestStartArgv(t *testing.T) {
 	dir := t.TempDir()
-	stubLookPath(t, dir)
+	lookPath := fakeLookPath(dir)
 	var calls [][]string
-	l := &Launcher{Runner: startRespond(&calls)}
+	l := &Launcher{Runner: startRespond(&calls), LookPath: lookPath}
 	res, err := l.Start(context.Background(), StartInput{
 		Session: "herder-task_abc123", AgentKind: "codex",
 		Workspace: "/state/sandboxes/task_abc123",
@@ -213,9 +206,10 @@ func TestStartArgv(t *testing.T) {
 // exists cleans it up: a detection timeout must not leak the workspace.
 func TestStartClosesPaneOnFailure(t *testing.T) {
 	dir := t.TempDir()
-	stubLookPath(t, dir)
+	lookPath := fakeLookPath(dir)
 	var calls [][]string
 	l := &Launcher{
+		LookPath:      lookPath,
 		DetectTimeout: 50 * time.Millisecond,
 		PollInterval:  5 * time.Millisecond,
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
@@ -340,8 +334,9 @@ func TestStartRefusesUnknownKind(t *testing.T) {
 // error, so the caller fails the task instead of pretending it runs.
 func TestStartSurfacesHerdrFailure(t *testing.T) {
 	dir := t.TempDir()
-	stubLookPath(t, dir)
+	lookPath := fakeLookPath(dir)
 	l := &Launcher{
+		LookPath: lookPath,
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
 			return RunResult{ExitCode: 1, Stderr: "no such server"}, nil
 		},
@@ -371,8 +366,8 @@ func TestParseWorkspaceCreate(t *testing.T) {
 // kind, recreated when the link target drifts.
 func TestEnsureShim(t *testing.T) {
 	dir := t.TempDir()
-	stubLookPath(t, dir)
-	shim, err := EnsureShim(filepath.Join(dir, "shims"), "codex")
+	lookPath := fakeLookPath(dir)
+	shim, err := EnsureShim(filepath.Join(dir, "shims"), "codex", lookPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +385,7 @@ func TestEnsureShim(t *testing.T) {
 	if err := os.Symlink("/nonexistent", shim); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EnsureShim(filepath.Join(dir, "shims"), "codex"); err != nil {
+	if _, err := EnsureShim(filepath.Join(dir, "shims"), "codex", lookPath); err != nil {
 		t.Fatal(err)
 	}
 	if target, _ := os.Readlink(shim); target != filepath.Join(dir, "docker") {

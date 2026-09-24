@@ -146,8 +146,10 @@ func taskValidate(cfg *config.Config, store *storage.Store, args []string, w, ew
 // REVIEWING/DELIVERING pick up after it, PR_OPEN is already delivered.
 func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, repo, provider, code := prepareTask(cfg, store, args, "deliver",
-		[]tasks.State{tasks.Running, tasks.Validating, tasks.WaitingForHuman,
-			tasks.Reviewing, tasks.Delivering, tasks.PROpen}, ew)
+		[]tasks.State{
+			tasks.Running, tasks.Validating, tasks.WaitingForHuman,
+			tasks.Reviewing, tasks.Delivering, tasks.PROpen,
+		}, ew)
 	if code >= 0 {
 		return code
 	}
@@ -160,7 +162,6 @@ func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	// re-enters the gate instead of shipping unverified commits.
 	if task.Status == tasks.Running || task.Status == tasks.Validating ||
 		task.Status == tasks.WaitingForHuman {
-
 		if code, passed := gateOrRoute(ctx, cfg, store, provider, &task, repo, w, ew); !passed {
 			return code
 		}

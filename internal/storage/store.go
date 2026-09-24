@@ -1003,24 +1003,31 @@ func (s *Store) ExpireLeases(now time.Time) (map[string]string, error) {
 		return nil, fmt.Errorf("storage: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.Query(`SELECT task_id, owner FROM leases WHERE expires_at <= ?`, formatTime(now))
-	if err != nil {
-		return nil, fmt.Errorf("storage: list expired leases: %w", err)
-	}
+	// The scan runs in a closure so rows.Close is deferred like every
+	// other query in this file — the tx's single connection must be free
+	// before the DELETE below runs on it.
 	expired := map[string]string{}
-	for rows.Next() {
-		var taskID, owner string
-		if err := rows.Scan(&taskID, &owner); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("storage: scan expired lease: %w", err)
+	err = func() error {
+		rows, err := tx.Query(`SELECT task_id, owner FROM leases WHERE expires_at <= ?`, formatTime(now))
+		if err != nil {
+			return fmt.Errorf("storage: list expired leases: %w", err)
 		}
-		expired[taskID] = owner
+		defer rows.Close()
+		for rows.Next() {
+			var taskID, owner string
+			if err := rows.Scan(&taskID, &owner); err != nil {
+				return fmt.Errorf("storage: scan expired lease: %w", err)
+			}
+			expired[taskID] = owner
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("storage: list expired leases: %w", err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return nil, err
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("storage: list expired leases: %w", err)
-	}
-	rows.Close()
 	if _, err := tx.Exec(`DELETE FROM leases WHERE expires_at <= ?`, formatTime(now)); err != nil {
 		return nil, fmt.Errorf("storage: expire leases: %w", err)
 	}

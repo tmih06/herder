@@ -261,6 +261,9 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 type Launcher struct {
 	// Runner executes subprocesses; nil means DefaultRunner.
 	Runner Runner
+	// LookPath resolves binaries for the shim link; nil means
+	// exec.LookPath. Tests inject a fake so no docker install is needed.
+	LookPath func(name string) (string, error)
 	// DetectTimeout bounds the agent-detection wait after pane run.
 	DetectTimeout time.Duration
 	// PollInterval spaces detection probes.
@@ -305,10 +308,6 @@ func ShimRoot(dbPath string) string {
 	return filepath.Join(filepath.Dir(dbPath), "shims")
 }
 
-// lookPath resolves binaries; a variable so tests point EnsureShim at a
-// fake docker instead of requiring a real install.
-var lookPath = exec.LookPath
-
 // EnsureShim links the agent-kind shim into dir and returns its path.
 // Why a symlink to docker: Herdr classifies a pane's foreground process by
 // comm — the invoked basename — so `<kind> exec -it <ctr> <cmd>` is
@@ -317,7 +316,7 @@ var lookPath = exec.LookPath
 // nothing, and tracks docker upgrades automatically. A stale or wrong
 // symlink is recreated; a non-symlink file at the path is left alone and
 // reported — removing someone's real file to make room is not ours to do.
-func EnsureShim(dir, kind string) (string, error) {
+func EnsureShim(dir, kind string, lookPath func(name string) (string, error)) (string, error) {
 	dockerPath, err := lookPath("docker")
 	if err != nil {
 		return "", fmt.Errorf("agent: docker CLI not found (needed for the %s shim): %w", kind, err)
@@ -366,7 +365,7 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 	if in.ShimDir == "" {
 		return StartResult{}, fmt.Errorf("agent: no shim directory configured")
 	}
-	shim, err := EnsureShim(in.ShimDir, in.AgentKind)
+	shim, err := EnsureShim(in.ShimDir, in.AgentKind, l.lookPath())
 	if err != nil {
 		return StartResult{}, err
 	}
@@ -889,4 +888,12 @@ func (l *Launcher) runner() Runner {
 		return l.Runner
 	}
 	return DefaultRunner
+}
+
+// lookPath returns the configured binary resolver or exec.LookPath.
+func (l *Launcher) lookPath() func(name string) (string, error) {
+	if l.LookPath != nil {
+		return l.LookPath
+	}
+	return exec.LookPath
 }

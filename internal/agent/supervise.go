@@ -20,9 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/tmih06/herder/internal/textutil"
 	"strings"
 	"time"
+
+	"github.com/tmih06/herder/internal/textutil"
 
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"

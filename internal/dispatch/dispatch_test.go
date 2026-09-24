@@ -164,7 +164,7 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
@@ -219,7 +219,7 @@ func TestLaunchQueuedLeaseHeld(t *testing.T) {
 	rec := &testutil.Recorder{Respond: launchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	err := d.Launch(context.Background(), testConfig(), &task, "", "")
@@ -297,7 +297,7 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 	rec := &testutil.Recorder{Respond: provisionThenLaunchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 	}
@@ -422,7 +422,7 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		return sandbox.RunResult{}, nil
 	}}
 	d := &Dispatcher{
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	task := &tasks.Task{ID: "task_abc", Status: tasks.Paused, AgentSessionID: "herder-task_abc"}
