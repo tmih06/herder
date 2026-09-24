@@ -40,14 +40,11 @@ jobs:
           go mod verify
           go mod download
 
-      # Bare `go mod tidy` also walks the synced skill examples under
-      # agent/, which are not part of this module's build; -e tolerates
-      # that unrelated failure while still normalizing our requirements.
       # Pinned to the floor toolchain so no newer Go rewrites go.mod.
       - name: Check go mod tidy
         if: matrix.go == '1.22'
         run: |
-          go mod tidy -e
+          go mod tidy
           git diff --exit-code go.mod go.sum
 
       - name: Build
