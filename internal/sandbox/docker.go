@@ -375,16 +375,21 @@ func (p *DockerProvider) ensureRepo(ctx context.Context, spec Spec, workspace st
 	} else if out.ExitCode == 0 {
 		return nil
 	}
-	remote := fmt.Sprintf("https://github.com/%s.git", spec.Repository)
+	remote := spec.RemoteURL
+	if remote == "" {
+		remote = fmt.Sprintf("https://github.com/%s.git", spec.Repository)
+	}
 	// The clone runs on the controller host under the controller's own
 	// GitHub identity: the gh credential helper authenticates private
 	// repositories without a token ever entering the sandbox (same
-	// pattern as deliver.PushBranch; helper is host-scoped so a
-	// non-GitHub remote never sees the token).
-	if out, err := p.run(ctx, "git",
-		"-c", "credential.helper=",
-		"-c", "credential.https://github.com.helper=!gh auth git-credential",
-		"clone", remote, workspace); err != nil {
+	// pattern as deliver.PushBranch). It attaches only to https remotes —
+	// a local path must never shell out to gh at all.
+	args := []string{"-c", "credential.helper="}
+	if strings.HasPrefix(remote, "https://") {
+		args = append(args, "-c", "credential.https://github.com.helper=!gh auth git-credential")
+	}
+	args = append(args, "clone", remote, workspace)
+	if out, err := p.run(ctx, "git", args...); err != nil {
 		return err
 	} else if out.ExitCode != 0 {
 		return fmt.Errorf("sandbox: clone %s: %s", remote, textutil.FirstLine(out.Stderr))

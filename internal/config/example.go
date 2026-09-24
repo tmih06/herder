@@ -44,6 +44,10 @@ scheduler:
 repositories:
   owner/repo:
     enabled: true
+    # local: /srv/git/owner-repo.git   # clone/push a filesystem path instead
+    #                                  # of github.com — no forge, no PR, no
+    #                                  # issue labels; delivery pushes the
+    #                                  # task branch straight to this path.
     trigger:
       labels:
         - agent-ready

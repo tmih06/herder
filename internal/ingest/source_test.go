@@ -359,3 +359,52 @@ func TestAPIEventClaimsEndToEnd(t *testing.T) {
 		t.Errorf("task events must record actor api, got %+v", events[0])
 	}
 }
+
+// Local repositories have no issue tracker: the issue field is optional
+// and the delivery id becomes the source coordinate so distinct
+// submissions stay distinct tasks. Non-local repos still require it.
+func TestAPIAdapterParseLocalIssueOptional(t *testing.T) {
+	cfg, _, _ := testSetup(t)
+	cfg.API.Secret = "s3cret"
+	repo := cfg.Repositories["owner/repo"]
+	repo.Local = "/srv/git/owner-repo.git"
+	cfg.Repositories["owner/repo"] = repo
+	adapter := ingest.NewAPIAdapter(cfg)
+
+	// Idempotency-Key doubles as the issue ref for local submissions.
+	body := `{"repository":"owner/repo","title":"Fix it"}`
+	ev, _, err := adapter.Parse(apiReq(body, "s3cret", "ci-9"), []byte(body))
+	if err != nil {
+		t.Fatalf("local submission without issue must parse: %v", err)
+	}
+	if ev.IssueRef != "ci-9" || ev.DeliveryID != "ci-9" {
+		t.Errorf("issue ref must fall back to the idempotency key: %+v", ev)
+	}
+	// No key at all: a generated ref keeps submissions distinct.
+	ev, _, err = adapter.Parse(apiReq(body, "s3cret", ""), []byte(body))
+	if err != nil || !strings.HasPrefix(ev.IssueRef, "api-") {
+		t.Errorf("missing key must generate a unique ref: %+v, %v", ev, err)
+	}
+	// An explicit issue still wins for local repos.
+	withIssue := `{"repository":"owner/repo","issue":"work-1"}`
+	ev, _, err = adapter.Parse(apiReq(withIssue, "s3cret", "k"), []byte(withIssue))
+	if err != nil || ev.IssueRef != "work-1" {
+		t.Errorf("explicit issue must win: %+v, %v", ev, err)
+	}
+	// Non-local and unknown repositories still require the issue.
+	for name, repoName := range map[string]string{
+		"github repo": "other/repo",
+		"unknown repo": "nobody/nothing",
+	} {
+		cfg2, _, _ := testSetup(t)
+		cfg2.API.Secret = "s3cret"
+		if repo, ok := cfg2.Repositories["owner/repo"]; ok && repoName == "other/repo" {
+			cfg2.Repositories["other/repo"] = repo // github-backed, not local
+		}
+		a := ingest.NewAPIAdapter(cfg2)
+		b := `{"repository":"` + repoName + `"}`
+		if _, _, err := a.Parse(apiReq(b, "s3cret", ""), []byte(b)); err == nil {
+			t.Errorf("%s: missing issue must fail for non-local repo", name)
+		}
+	}
+}

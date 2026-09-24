@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -153,14 +154,30 @@ func (a AgentConfig) TimeoutDuration() time.Duration {
 }
 
 // RepositoryConfig is the per-repo policy: trigger, agent, sandbox,
-// validation, and delivery.
+// validation, and delivery. Local names a filesystem path to clone from
+// and push to instead of GitHub — the whole point of API-queued work is
+// that a repository need not exist on any forge.
 type RepositoryConfig struct {
 	Enabled    bool             `yaml:"enabled"`
+	Local      string           `yaml:"local"`
 	Trigger    TriggerConfig    `yaml:"trigger"`
 	Agent      RepoAgentConfig  `yaml:"agent"`
 	Sandbox    SandboxConfig    `yaml:"sandbox"`
 	Validation ValidationConfig `yaml:"validation"`
 	Delivery   DeliveryConfig   `yaml:"delivery"`
+}
+
+// IsLocal reports whether the repository clones/pushes a filesystem path
+// instead of a GitHub remote: no forge, no PR, no issue labels.
+func (r RepositoryConfig) IsLocal() bool { return strings.TrimSpace(r.Local) != "" }
+
+// Remote returns the git URL provisioning clones and delivery pushes:
+// the local path when configured, else the GitHub https remote for name.
+func (r RepositoryConfig) Remote(name string) string {
+	if r.IsLocal() {
+		return strings.TrimSpace(r.Local)
+	}
+	return fmt.Sprintf("https://github.com/%s.git", name)
 }
 
 // TriggerConfig lists the labels that mark work as agent-ready.
@@ -374,6 +391,9 @@ func validateRepository(name string, repo RepositoryConfig, agents map[string]Ag
 			errs = append(errs, fmt.Errorf("%s.trigger.labels: label %q must match %s",
 				prefix, label, labelPattern.String()))
 		}
+	}
+	if repo.Local != "" && !filepath.IsAbs(repo.Local) {
+		errs = append(errs, fmt.Errorf("%s.local %q must be an absolute path", prefix, repo.Local))
 	}
 	if repo.Agent.Default == "" {
 		errs = append(errs, fmt.Errorf("%s.agent.default must name an entry in agents", prefix))

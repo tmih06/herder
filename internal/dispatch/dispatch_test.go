@@ -446,3 +446,47 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		t.Errorf("unpause (call %d) must precede pane close (call %d)", unpause, paneClose)
 	}
 }
+
+// A local repository's spec carries the filesystem remote so provisioning
+// clones the path, never github.com.
+func TestSpecForTaskLocalRemote(t *testing.T) {
+	cfg := testConfig()
+	repo := cfg.Repositories["acme/web"]
+	repo.Local = "/srv/git/acme-web.git"
+	cfg.Repositories["acme/web"] = repo
+	spec := SpecForTask(cfg, tasks.Task{
+		ID: "task_abc", Repository: "acme/web",
+		AgentProfile: "codex-default", SourceRef: "acme/web#7",
+	})
+	if spec.RemoteURL != "/srv/git/acme-web.git" {
+		t.Errorf("RemoteURL = %q, want the local path", spec.RemoteURL)
+	}
+	// Non-local repos keep the github remote.
+	spec = SpecForTask(testConfig(), tasks.Task{
+		ID: "task_abc", Repository: "acme/web",
+		AgentProfile: "codex-default", SourceRef: "acme/web#7",
+	})
+	if spec.RemoteURL != "https://github.com/acme/web.git" {
+		t.Errorf("RemoteURL = %q, want the github remote", spec.RemoteURL)
+	}
+}
+
+// A local repository has no forge: AdvanceIssueLabels returns without a
+// single engine call even when the source ref parses as an issue number.
+func TestAdvanceIssueLabelsSkipsLocalRepo(t *testing.T) {
+	calls := 0
+	engine := &deliver.Engine{Runner: func(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
+		calls++
+		return sandbox.RunResult{}, nil
+	}}
+	d := &Dispatcher{Store: nil, Engine: engine}
+	repo := testConfig().Repositories["acme/web"]
+	repo.Local = "/srv/git/acme-web.git"
+	task := tasks.Task{ID: "task_x", SourceRef: "acme/web#7", Repository: "acme/web"}
+	if err := d.AdvanceIssueLabels(context.Background(), &task, repo, "agent-review"); err != nil {
+		t.Fatalf("local repo labels must be a no-op, got %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("local repo must never call the delivery engine, ran %d", calls)
+	}
+}

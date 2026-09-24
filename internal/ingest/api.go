@@ -17,12 +17,13 @@ import (
 // value; the route is only registered when a secret is configured, so an
 // empty secret here is a configuration bug, not dev mode.
 type APIAdapter struct {
-	secret string
+	secret       string
+	repositories map[string]config.RepositoryConfig
 }
 
 // NewAPIAdapter builds the adapter from the loaded config.
 func NewAPIAdapter(cfg *config.Config) *APIAdapter {
-	return &APIAdapter{secret: cfg.API.Secret}
+	return &APIAdapter{secret: cfg.API.Secret, repositories: cfg.Repositories}
 }
 
 // Verify requires Authorization: Bearer <api.secret>, compared in
@@ -47,8 +48,21 @@ func (a *APIAdapter) Parse(r *http.Request, body []byte) (TriggerEvent, string, 
 	if err != nil {
 		return TriggerEvent{}, "", err
 	}
-	if strings.TrimSpace(req.Repository) == "" || issue == "" {
-		return TriggerEvent{}, "", errors.New("ingest: task submission needs repository and issue")
+	repoName := strings.TrimSpace(req.Repository)
+	if repoName == "" {
+		return TriggerEvent{}, "", errors.New("ingest: task submission needs repository")
+	}
+	if issue == "" {
+		// Forge-less repositories have no issue tracker: the delivery id
+		// becomes the source coordinate so distinct submissions stay
+		// distinct tasks instead of deduping onto the first.
+		if repo, ok := a.repositories[repoName]; !ok || !repo.IsLocal() {
+			return TriggerEvent{}, "", errors.New("ingest: task submission needs issue (optional only for local repositories)")
+		}
+		issue = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if issue == "" {
+			issue = "api-" + uuid.NewString()
+		}
 	}
 	if req.Priority != nil && *req.Priority < 0 {
 		return TriggerEvent{}, "", fmt.Errorf("ingest: priority must be >= 0, got %d", *req.Priority)
@@ -60,7 +74,7 @@ func (a *APIAdapter) Parse(r *http.Request, body []byte) (TriggerEvent, string, 
 	return TriggerEvent{
 		DeliveryID: delivery,
 		Provider:   ProviderAPI,
-		Repository: strings.TrimSpace(req.Repository),
+		Repository: repoName,
 		IssueRef:   issue,
 		Title:      req.Title,
 		Body:       req.Body,

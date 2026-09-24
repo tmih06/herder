@@ -680,3 +680,76 @@ func TestTaskDeliverResumesDelivering(t *testing.T) {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 }
+
+// --- local (forge-less) repository delivery --------------------------------
+
+// writeLocalConfig renders the example config with the repository pointed
+// at a local filesystem path instead of a GitHub remote.
+func writeLocalConfig(t *testing.T, localPath string) string {
+	t.Helper()
+	dir := t.TempDir()
+	body := strings.ReplaceAll(config.ExampleYAML,
+		"~/.local/state/herder/herder.db", filepath.Join(dir, "herder.db"))
+	body = strings.ReplaceAll(body, "owner/repo", "acme/web")
+	body = strings.Replace(body, "  acme/web:\n", "  acme/web:\n    local: "+localPath+"\n", 1)
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A local repository delivers without any forge: the validated branch is
+// pushed straight to the configured path, no gh call ever runs, and the
+// task still lands PR_OPEN -> DONE.
+func TestTaskDeliverLocalRepo(t *testing.T) {
+	state := writeGateBins(t, "ok")
+	// The "upstream" is a bare repo on disk: the push target and the
+	// workspace's origin are the same local path.
+	upstream := filepath.Join(t.TempDir(), "upstream.git")
+	initBare := exec.Command("git", "init", "-q", "--bare", upstream)
+	if out, err := initBare.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	path := writeLocalConfig(t, upstream)
+	id, ws := runningTask(t, path, state, false)
+	commitWork(t, ws, "internal/app.go", "package app")
+
+	code, out, errOut := runCmd(t, "--config", path, "task", "deliver", id)
+	if code != 0 {
+		t.Fatalf("deliver exit = %d (%s)", code, errOut)
+	}
+	if !strings.Contains(out, "branch herder/7 pushed to "+upstream) {
+		t.Errorf("output should name the pushed branch and path, got %q", out)
+	}
+	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+		t.Errorf("status = %s, want PR_OPEN", got)
+	}
+	// The branch must really exist on the local upstream.
+	lsRemote := exec.Command("git", "ls-remote", upstream, "refs/heads/herder/7")
+	if out, err := lsRemote.CombinedOutput(); err != nil || !strings.Contains(string(out), "herder/7") {
+		t.Errorf("push must land the branch on the local upstream: %v\n%s", err, out)
+	}
+	// No forge means no gh call at all — not even a label read.
+	if calls := ghCalls(t, state, ""); len(calls) != 0 {
+		t.Errorf("local delivery must never invoke gh, ran %v", calls)
+	}
+	events := taskEvents(t, path, id)
+	for _, want := range []string{"delivery.started", "delivery.completed"} {
+		if !hasEvent(events, want) {
+			t.Errorf("missing event %s, got %v", want, events)
+		}
+	}
+	for _, unwanted := range []string{"pull_request.created", "issue.commented", "issue.labels_updated"} {
+		if hasEvent(events, unwanted) {
+			t.Errorf("local delivery must not emit %s, got %v", unwanted, events)
+		}
+	}
+	// task done completes a local delivery like a PR_OPEN one.
+	if code, _, errOut := runCmd(t, "--config", path, "task", "done", id); code != 0 {
+		t.Fatalf("done exit = %d (%s)", code, errOut)
+	}
+	if got := taskStatus(t, path, id); got != "DONE" {
+		t.Errorf("status = %s, want DONE", got)
+	}
+}

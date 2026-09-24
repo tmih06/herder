@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
@@ -67,9 +69,10 @@ func printSandboxUsage(w io.Writer) {
   inspect <id>                show one sandbox
   shell <id>                  open an interactive shell (needs a TTY)
   stop <id>                   halt the container (unknown: logged no-op)
-  destroy <id>                remove the container (unknown: logged no-op)
+  destroy <id|glob>...        remove containers (unknown: logged no-op)
 
-<id> accepts a task id or a container name.
+<id> accepts a task id or a container name; a glob like 'task_*' sweeps
+every matching managed container.
 `)
 }
 
@@ -271,13 +274,99 @@ func sandboxStop(path string, args []string, w, ew io.Writer) int {
 		})
 }
 
-// sandboxDestroy removes the container; unknown ids log a no-op via the
-// provider and still exit 0.
+// sandboxDestroy removes containers; unknown ids log a no-op via the
+// provider and still exit 0. Accepts several targets, and a target
+// containing glob metacharacters (* ? [) matches against the managed
+// container list — `herder sandbox destroy 'task_*'` sweeps a fleet.
+// One failing target does not stop the rest; the exit code reports the
+// first failure after all attempts.
 func sandboxDestroy(path string, args []string, w, ew io.Writer) int {
-	return sandboxOneID(path, args, w, ew, "destroy", "destroyed",
-		func(ctx context.Context, p *sandbox.DockerProvider, id string) error {
-			return p.Destroy(ctx, id)
-		})
+	if len(args) < 1 {
+		fmt.Fprintf(ew, "herder: usage: herder sandbox destroy <task-or-container|glob>...\n")
+		return 2
+	}
+	_, store, provider := sandboxSetup(path, ew)
+	if store == nil {
+		return 1
+	}
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	targets, err := expandSandboxTargets(ctx, provider.List, store, args)
+	if err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	code := 0
+	for _, container := range targets {
+		if err := provider.Destroy(ctx, container); err != nil {
+			fmt.Fprintf(ew, "herder: %v\n", err)
+			code = 1
+			continue
+		}
+		fmt.Fprintf(w, "herder: sandbox %s destroyed\n", container)
+	}
+	return code
+}
+
+// expandSandboxTargets resolves each arg to container names: a glob
+// pattern expands over the managed sandbox list (matched against both
+// the container name and its herder-<task> suffix), anything else maps
+// through resolveTarget. A pattern matching nothing is an error so a
+// typo never silently destroys zero containers while looking like a
+// sweep. Duplicates collapse so `task_x herder-task_x` destroys once.
+// listManaged is the provider's List seam, injectable for tests.
+func expandSandboxTargets(ctx context.Context, listManaged func(context.Context) ([]sandbox.Sandbox, error),
+	store *storage.Store, args []string,
+) ([]string, error) {
+	var managed []sandbox.Sandbox
+	needList := false
+	for _, a := range args {
+		if strings.ContainsAny(a, "*?[") {
+			needList = true
+		}
+	}
+	if needList {
+		var err error
+		managed, err = listManaged(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, a := range args {
+		if strings.ContainsAny(a, "*?[") {
+			matched := 0
+			for _, sb := range managed {
+				short := strings.TrimPrefix(sb.ID, "herder-")
+				ok, _ := gomatch(a, sb.ID)
+				okShort, _ := gomatch(a, short)
+				if ok || okShort {
+					matched++
+					if !seen[sb.ID] {
+						seen[sb.ID] = true
+						out = append(out, sb.ID)
+					}
+				}
+			}
+			if matched == 0 {
+				return nil, fmt.Errorf("sandbox: pattern %q matched no managed containers", a)
+			}
+			continue
+		}
+		container, _ := resolveTarget(store, a)
+		if !seen[container] {
+			seen[container] = true
+			out = append(out, container)
+		}
+	}
+	return out, nil
+}
+
+// gomatch wraps path.Match so the pattern type stays local.
+func gomatch(pattern, name string) (bool, error) {
+	return path.Match(pattern, name)
 }
 
 // sandboxOneID runs one stop/destroy-style action against a task id or

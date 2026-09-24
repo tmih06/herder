@@ -32,8 +32,11 @@ import (
 // toolchain image so the example validation (`go test ./...`) runs.
 const DefaultImage = "golang:1.22-bookworm"
 
-// DefaultPidsLimit caps fork bombs in the worker.
-const DefaultPidsLimit = 256
+// DefaultPidsLimit caps fork bombs in the worker while leaving headroom
+// for the herdr server plus an attached TUI client: each client connect
+// spawns render/input threads, and 256 proved too tight (thread spawn
+// failed with EAGAIN and panicked the server's PID 1).
+const DefaultPidsLimit = 1024
 
 // DefaultCPUs and DefaultMemory apply when the agent profile names no
 // resources.
@@ -64,9 +67,11 @@ type Spec struct {
 	// TaskID is the owning task (e.g. task_abc123); it derives the
 	// container name and workspace directory deterministically.
 	TaskID string
-	// Repository is owner/name; the workspace clones
-	// https://github.com/<repository>.git when reachable.
+	// Repository is owner/name; the workspace clones RemoteURL.
 	Repository string
+	// RemoteURL is the clone/push target: a local filesystem path for
+	// forge-less repositories, else https://github.com/<repository>.git.
+	RemoteURL string
 	// Branch is the deterministic worker branch (herder/<issue>-<slug>).
 	Branch string
 	// Image is the worker image; empty means DefaultImage.

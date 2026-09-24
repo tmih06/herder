@@ -18,7 +18,8 @@ func (d *Dispatcher) AdvanceIssueLabels(ctx context.Context, task *tasks.Task,
 	repo config.RepositoryConfig, next string,
 ) error {
 	issue, ok := deliver.IssueNumber(task.SourceRef)
-	if !ok {
+	if !ok || repo.IsLocal() {
+		// No forge behind a local repository: there is no issue to label.
 		return nil
 	}
 	current, err := d.engine().IssueLabels(ctx, task.Repository, issue)

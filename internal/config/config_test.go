@@ -247,3 +247,41 @@ linear:
 		t.Errorf("error should name linear.teams and the bad value, got: %v", err)
 	}
 }
+
+// A repository may name a local filesystem path instead of a GitHub
+// remote: the path must be absolute, IsLocal flips, and Remote returns
+// the path verbatim while non-local repos keep the https remote.
+func TestRepositoryLocalPath(t *testing.T) {
+	body := strings.Replace(validBody, "    enabled: true\n",
+		"    enabled: true\n    local: /srv/git/acme-web.git\n", 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	repo := cfg.Repositories["acme/web"]
+	if !repo.IsLocal() {
+		t.Error("local path must mark the repository local")
+	}
+	if got := repo.Remote("acme/web"); got != "/srv/git/acme-web.git" {
+		t.Errorf("Remote = %q, want the local path", got)
+	}
+	// A repo without local keeps the GitHub https remote.
+	plain := RepositoryConfig{}
+	if plain.IsLocal() {
+		t.Error("empty local must not mark the repository local")
+	}
+	if got := plain.Remote("acme/web"); got != "https://github.com/acme/web.git" {
+		t.Errorf("Remote = %q, want the github remote", got)
+	}
+}
+
+// A relative local path fails at load: provisioning must never resolve
+// it against whatever directory the daemon happened to start in.
+func TestRepositoryLocalRelativeRejected(t *testing.T) {
+	body := strings.Replace(validBody, "    enabled: true\n",
+		"    enabled: true\n    local: ../repos/acme\n", 1)
+	if _, err := Load(writeConfig(t, body)); err == nil ||
+		!strings.Contains(err.Error(), "local") {
+		t.Errorf("relative local path must fail validation, got %v", err)
+	}
+}
