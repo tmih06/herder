@@ -96,8 +96,10 @@ func TestWriteConfigRemoveConfigRoundTrip(t *testing.T) {
 }
 
 // TestEnsureSSHInclude proves the managed Include line reaches
-// ~/.ssh/config exactly once: the file is created when absent, appended
-// without disturbing user content, and never duplicated.
+// ~/.ssh/config exactly once and in global scope: the file is created
+// when absent, the line is inserted before the first Host block (an
+// Include inside a Host block is conditional and hides every worker
+// block), user content is preserved, and repeats never duplicate.
 func TestEnsureSSHInclude(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -117,7 +119,7 @@ func TestEnsureSSHInclude(t *testing.T) {
 		}
 	})
 
-	t.Run("appends once and keeps user content", func(t *testing.T) {
+	t.Run("inserts before first Host block, keeps user content", func(t *testing.T) {
 		userBlock := "Host personal\n    HostName example.com\n"
 		if err := os.WriteFile(userConfig, []byte(userBlock), 0o600); err != nil {
 			t.Fatalf("seed user config: %v", err)
@@ -131,11 +133,19 @@ func TestEnsureSSHInclude(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read config: %v", err)
 		}
-		if !strings.HasPrefix(string(raw), userBlock) {
+		content := string(raw)
+		if !strings.Contains(content, userBlock) {
 			t.Errorf("user config must be preserved, got:\n%s", raw)
 		}
-		if n := strings.Count(string(raw), a.IncludeLine()); n != 1 {
+		if n := strings.Count(content, a.IncludeLine()); n != 1 {
 			t.Errorf("Include line must appear once after repeated calls, got %d:\n%s", n, raw)
+		}
+		// Global scope: the Include must precede every Host block or
+		// OpenSSH scopes it to the enclosing host.
+		inc := strings.Index(content, a.IncludeLine())
+		host := strings.Index(content, "Host personal")
+		if inc < 0 || host < 0 || inc > host {
+			t.Errorf("Include must precede the first Host block, got:\n%s", raw)
 		}
 	})
 }

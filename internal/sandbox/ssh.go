@@ -146,11 +146,12 @@ func (a SSHAssets) IncludeLine() string {
 }
 
 // EnsureSSHInclude makes the controller's config.d directory visible to
-// OpenSSH by appending one Include line to ~/.ssh/config, creating the
-// file when absent. The user's config is never rewritten beyond that one
-// line; a missing Include is the only change. Appending (not prepending)
-// keeps user Host blocks authoritative for their own hosts — our blocks
-// only add names the user never defined.
+// OpenSSH by inserting one Include line into ~/.ssh/config, creating the
+// file when absent. The line must land in global scope — before the
+// first Host/Match block — because an Include inside a Host block is
+// conditional on that host and would hide every worker block (verified:
+// appending after a trailing Host block left `ssh -G` resolving no Host
+// entry). The user's config is never rewritten beyond that one line.
 func (a SSHAssets) EnsureSSHInclude() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -162,24 +163,42 @@ func (a SSHAssets) EnsureSSHInclude() error {
 		return fmt.Errorf("sandbox: create ~/.ssh: %w", err)
 	}
 	line := a.IncludeLine()
-	if raw, err := os.ReadFile(userConfig); err == nil {
-		for _, existing := range strings.Split(string(raw), "\n") {
+	block := "# Herder worker sandboxes (managed; safe to remove)\n" + line + "\n"
+	raw, err := os.ReadFile(userConfig)
+	switch {
+	case err == nil:
+		lines := strings.Split(string(raw), "\n")
+		for _, existing := range lines {
 			if strings.TrimSpace(existing) == line {
 				return nil
 			}
 		}
-	} else if !os.IsNotExist(err) {
+		// Insert before the first Host/Match block so the Include is
+		// global; with no blocks, append at the end (still global).
+		at := len(lines)
+		for i, l := range lines {
+			t := strings.ToLower(strings.TrimSpace(l))
+			if strings.HasPrefix(t, "host ") || strings.HasPrefix(t, "match ") {
+				at = i
+				break
+			}
+		}
+		out := make([]string, 0, len(lines)+3)
+		out = append(out, lines[:at]...)
+		out = append(out, strings.Split(strings.TrimRight(block, "\n"), "\n")...)
+		out = append(out, lines[at:]...)
+		if err := os.WriteFile(userConfig, []byte(strings.Join(out, "\n")), 0o600); err != nil {
+			return fmt.Errorf("sandbox: update ~/.ssh/config: %w", err)
+		}
+		return nil
+	case os.IsNotExist(err):
+		if err := os.WriteFile(userConfig, []byte(block), 0o600); err != nil {
+			return fmt.Errorf("sandbox: create ~/.ssh/config: %w", err)
+		}
+		return nil
+	default:
 		return fmt.Errorf("sandbox: read ~/.ssh/config: %w", err)
 	}
-	f, err := os.OpenFile(userConfig, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("sandbox: open ~/.ssh/config: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.WriteString("\n# Herder worker sandboxes (managed; safe to remove)\n" + line + "\n"); err != nil {
-		return fmt.Errorf("sandbox: update ~/.ssh/config: %w", err)
-	}
-	return nil
 }
 
 // KeygenArgv builds one ssh-keygen invocation: ed25519, no passphrase,
