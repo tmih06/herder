@@ -1,7 +1,4 @@
-# gomod updates are intentionally absent: Dependabot's `go mod tidy`
-# cannot succeed here because bare tidy also walks the synced skill
-# examples under agent/, which are not part of this module's build.
-# Revisit if those trees ever leave the module scope.
+
 version: 2
 updates:
   - package-ecosystem: github-actions

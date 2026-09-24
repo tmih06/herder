@@ -137,4 +137,4 @@ truth — the event log is the audit trail and the recovery record.
   expiry) before any subprocess; a dead owner's lease expires and the
   task requeues — never strands, never double-dispatches.
 
-SPEC.md is authoritative for rationale.
+

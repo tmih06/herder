@@ -1,6 +1,6 @@
 # Roadmap
 
-One line per item; no dates. SPEC.md sections 67-72 are authoritative.
+One line per item; no dates.
 
 ## v0.1 — current
 

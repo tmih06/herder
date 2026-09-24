@@ -3,8 +3,7 @@
 Herder treats the coding agent as potentially compromised — even when the
 model provider is trusted, because prompt injection can arrive through
 repository content. Authority is therefore enforced structurally, never
-through prompts. SPEC.md sections 28-32 and 65-66 are authoritative for
-rationale; this file records what v0.1 actually enforces.
+through prompts. This file records what v0.1 actually enforces.
 
 ## Trust hierarchy
 

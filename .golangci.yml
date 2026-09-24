@@ -64,18 +64,10 @@ linters:
     presets:
       - std-error-handling
       - common-false-positives
-    paths:
-      # Synced skill examples are not part of this module's build.
-      - agent/
-      - .agents/
-      - .claude/
+
 
 formatters:
   enable:
     - gofmt
     - gofumpt
-  exclusions:
-    paths:
-      - agent/
-      - .agents/
-      - .claude/
+

@@ -31,5 +31,4 @@ compromised, so authority is enforced structurally — credential
 boundaries, least-privilege sandboxes, and a no-raw-Herdr-socket
 invariant — never through prompts. The enforced-vs-aspirational split
 for v0.1 is documented in
-[docs/security-boundary.md](docs/security-boundary.md); the threat model
-and rationale live in SPEC.md sections 28-32 and 65-66.
+[docs/security-boundary.md](docs/security-boundary.md).

@@ -6,11 +6,11 @@
 [![Smoke](https://github.com/tmih06/herder/actions/workflows/smoke.yml/badge.svg)](https://github.com/tmih06/herder/actions/workflows/smoke.yml)
 
 Open-source control plane for autonomous coding-agent fleets, powered by Herdr.
-See [SPEC.md](SPEC.md) for the full architecture.
+
 
 ## Documentation
 
-- [SPEC.md](SPEC.md) — full architecture and rationale (authoritative)
+
 - [ARCHITECTURE.md](ARCHITECTURE.md) — package map, state machine, event log
 - [ROADMAP.md](ROADMAP.md) — v0.1 → v1.0
 - [docs/setup.md](docs/setup.md) — install, config, quickstart
@@ -118,9 +118,7 @@ go vet ./cmd/... ./internal/...
 go test ./cmd/... ./internal/...
 ```
 
-Scope commands to `./cmd/... ./internal/...`: the repo also contains
-synced skill example sources under `agent/` that are not part of this
-module's build.
+Scope commands to `./cmd/... ./internal/...`.
 
 ## License
 

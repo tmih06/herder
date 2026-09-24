@@ -22,10 +22,7 @@ go test ./cmd/... ./internal/...
 golangci-lint run              # config: .golangci.yml (v2 format)
 ```
 
-The repo also carries synced skill example sources under `agent/` (and
-`.agents/`). They are not part of this module's build — bare `go build
-./...`, `go vet ./...`, or `go mod tidy` walks them and fails on code that
-isn't ours. CI mirrors this scoping (`.github/workflows/test.yml`).
+
 
 ## Commits
 
@@ -42,8 +39,8 @@ Conventional Commits: `type(scope): imperative subject`.
    lint, security, and smoke workflows — all must pass.
 3. Describe behavior changes in terms of the task state machine and event
    log, not just the diff.
-4. Update docs when you change a contract: `SPEC.md` is authoritative for
-   rationale, `ARCHITECTURE.md` for structure, `CONTEXT.md` for vocabulary.
+4. Update docs when you change a contract: `ARCHITECTURE.md` for
+   structure, `CONTEXT.md` for vocabulary.
 
 ## Issues and triage
 
