@@ -1,0 +1,13 @@
+# Demo worker image for scripts/demo.sh: a minimal sandbox image whose
+# `codex` binary is the fake agent in demo/codex. The real agent kinds
+# need accounts/API keys; the demo proves the full pipeline without them.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends git ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY codex /usr/local/bin/codex
+RUN chmod +x /usr/local/bin/codex
+
+WORKDIR /workspace

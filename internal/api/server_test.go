@@ -176,7 +176,7 @@ func postWebhook(t *testing.T, srv *api.Server, event, delivery, body string) *h
 func TestGitHubWebhookAcceptsEndToEnd(t *testing.T) {
 	srv, store := testServer(t)
 
-	rec := postWebhook(t, srv, "issues", "del-1", labeledBody("tmih06/meltiply", 182, "bug", "agent-ready"))
+	rec := postWebhook(t, srv, "issues", "del-1", labeledBody("owner/repo", 182, "bug", "agent-ready"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST webhook = %d, want 201: %s", rec.Code, rec.Body.String())
 	}
@@ -195,7 +195,7 @@ func TestGitHubWebhookAcceptsEndToEnd(t *testing.T) {
 	if len(found) != 1 || found[0].Status != "QUEUED" {
 		t.Fatalf("want 1 QUEUED task, got %+v", found)
 	}
-	if found[0].SourceRef != "tmih06/meltiply#182" || found[0].BranchName == "" || found[0].AgentProfile != "codex-default" {
+	if found[0].SourceRef != "owner/repo#182" || found[0].BranchName == "" || found[0].AgentProfile != "codex-default" {
 		t.Errorf("task must record source, branch, and agent: %+v", found[0])
 	}
 
@@ -227,7 +227,7 @@ func TestGitHubWebhookAcceptsEndToEnd(t *testing.T) {
 // must not create a second task.
 func TestGitHubWebhookDuplicates(t *testing.T) {
 	srv, store := testServer(t)
-	body := labeledBody("tmih06/meltiply", 182, "bug", "agent-ready")
+	body := labeledBody("owner/repo", 182, "bug", "agent-ready")
 
 	if rec := postWebhook(t, srv, "issues", "del-1", body); rec.Code != http.StatusCreated {
 		t.Fatalf("first POST = %d, want 201", rec.Code)
@@ -277,7 +277,7 @@ func TestGitHubWebhookDenies(t *testing.T) {
 		t.Fatalf("unknown repo must deny with reason, got %v", outcome)
 	}
 
-	rec = postWebhook(t, srv, "issues", "del-nolabel", labeledBody("tmih06/meltiply", 2, "bug"))
+	rec = postWebhook(t, srv, "issues", "del-nolabel", labeledBody("owner/repo", 2, "bug"))
 	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
 		t.Fatalf("decode outcome: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestGitHubWebhookIgnored(t *testing.T) {
 		t.Errorf("ping event POST = %d, want 202", rec.Code)
 	}
 	opened := `{"action":"opened","issue":{"number":1,"title":"x","labels":[]},
-		"repository":{"full_name":"tmih06/meltiply"}}`
+		"repository":{"full_name":"owner/repo"}}`
 	rec = postWebhook(t, srv, "issues", "del-opened", opened)
 	if rec.Code != http.StatusAccepted {
 		t.Errorf("opened action POST = %d, want 202", rec.Code)
@@ -350,7 +350,7 @@ func TestGitHubWebhookIgnored(t *testing.T) {
 func TestGitHubWebhookBadRequests(t *testing.T) {
 	srv, store := testServer(t)
 
-	rec := postWebhook(t, srv, "issues", "", labeledBody("tmih06/meltiply", 1, "agent-ready"))
+	rec := postWebhook(t, srv, "issues", "", labeledBody("owner/repo", 1, "agent-ready"))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("missing delivery id POST = %d, want 400", rec.Code)
 	}

@@ -106,6 +106,13 @@ func OpenStore(t *testing.T) *storage.Store {
 	return store
 }
 
+// FakeLookPath resolves every binary to a fixed nonexistent path so a
+// Launcher's shim step never needs a real docker install — CI runners
+// without docker (macOS) exercise the same launch path.
+func FakeLookPath(name string) (string, error) {
+	return "/nonexistent/" + name, nil
+}
+
 // EventTypes lists a task's recorded event types in order.
 func EventTypes(t *testing.T, store *storage.Store, taskID string) []string {
 	t.Helper()

@@ -62,7 +62,8 @@ func queueTask(t *testing.T, store *storage.Store, repo, ref string, priority in
 }
 
 // happyRespond scripts a healthy fleet: existing clean repo, running
-// container, live agent session, successful start, and readable labels.
+// container, live agent session, successful launch flow, and readable
+// labels.
 func happyRespond(name string, args []string) (sandbox.RunResult, error) {
 	argv := strings.Join(args, " ")
 	switch {
@@ -70,10 +71,12 @@ func happyRespond(name string, args []string) (sandbox.RunResult, error) {
 		return sandbox.RunResult{Stdout: "running\n"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
 		return sandbox.RunResult{Stdout: inspectJSON("running", false)}, nil
+	case name == "herdr" && strings.HasPrefix(argv, "workspace create"):
+		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "agent get"):
-		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent_status":"working","pane_id":"w5:p7"}}}`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "agent start"):
-		return sandbox.RunResult{Stdout: `{"result":{"agent":{"pane_id":"w5:p7","workspace_id":"w5"}}}`}, nil
+		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w5:p7"}}}`}, nil
+	case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
+		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
 		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
 	}
@@ -95,7 +98,7 @@ func newScheduler(store *storage.Store, cfg *config.Config, rec *testutil.Record
 		Cfg:   cfg,
 		Dispatcher: &dispatch.Dispatcher{
 			Store:    store,
-			Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+			Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
 			Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 			Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		},
@@ -144,8 +147,8 @@ func TestDispatchHonorsCapsAndPriority(t *testing.T) {
 	if got := taskStatus(t, store, newest.ID); got != tasks.Queued {
 		t.Errorf("newest task = %s, want QUEUED (cap reached)", got)
 	}
-	if n := rec.CountCalls("herdr", "agent", "start"); n != 2 {
-		t.Errorf("agent starts = %d, want exactly 2", n)
+	if n := rec.CountCalls("herdr", "pane", "run"); n != 2 {
+		t.Errorf("agent launches = %d, want exactly 2", n)
 	}
 }
 
@@ -320,7 +323,7 @@ func TestInflightProvisionedCountsOnce(t *testing.T) {
 	// count would double-book the slot.
 	release := make(chan struct{})
 	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
-		if name == "herdr" && strings.HasPrefix(strings.Join(args, " "), "agent start") {
+		if name == "herdr" && strings.HasPrefix(strings.Join(args, " "), "workspace create") {
 			<-release
 		}
 		return happyRespond(name, args)
@@ -609,8 +612,8 @@ func TestForeignLeaseBlocksDispatch(t *testing.T) {
 	s.Tick(context.Background())
 	waitDispatch(s)
 
-	if rec.Called("herdr", "agent", "start") {
-		t.Error("foreign-held lease must block the launch: no agent start")
+	if rec.Called("herdr", "pane", "run") {
+		t.Error("foreign-held lease must block the launch: no pane run")
 	}
 	if got := taskStatus(t, store, task.ID); got != tasks.Queued {
 		t.Errorf("task = %s, want QUEUED (still owned elsewhere)", got)
