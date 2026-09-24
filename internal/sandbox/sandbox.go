@@ -104,6 +104,10 @@ type Sandbox struct {
 	// before the agent runs: the validation gate diffs against it because
 	// refs inside the workspace are agent-writable.
 	BaseSHA string
+	// MachineID is the saved herdr SSH machine profile id driving this
+	// worker's container-local herdr server (issue #19); empty when the
+	// provider ran without a state dir.
+	MachineID string
 }
 
 // Result is one finished exec: output plus exit status for later

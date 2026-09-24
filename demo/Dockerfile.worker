@@ -1,11 +1,20 @@
 # Demo worker image for scripts/demo.sh: a minimal sandbox image whose
 # `codex` binary is the fake agent in demo/codex. The real agent kinds
 # need accounts/API keys; the demo proves the full pipeline without them.
+#
+# Issue #19: the worker is a herdr machine — the image ships the herdr
+# binary (PID 1 is `herdr server`, launched by the provider's create
+# entrypoint) and openssh-server (reached in inetd mode through
+# `docker exec -i <ctr> /usr/sbin/sshd -i`; no port is published).
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends git ca-certificates \
+	&& apt-get install -y --no-install-recommends \
+		git ca-certificates curl openssh-server \
 	&& rm -rf /var/lib/apt/lists/*
+
+# herdr: the container-local server the controller drives over SSH.
+RUN curl -fsSL https://herdr.dev/install.sh | HERDR_INSTALL_DIR=/usr/local/bin sh
 
 COPY codex /usr/local/bin/codex
 RUN chmod +x /usr/local/bin/codex

@@ -106,12 +106,18 @@ func (d *Dispatcher) launcher() *agent.Launcher {
 }
 
 // provider resolves the injectable Provider default, wiring its no-op
-// notes through Warnf like the CLI's provider did.
+// notes through Warnf like the CLI's provider did. StateDir roots the
+// SSH assets and machine wiring beside the state database so a
+// defaulted provider provisions the same worker shape as the CLI's.
 func (d *Dispatcher) provider() *sandbox.DockerProvider {
 	if d.Provider != nil {
 		return d.Provider
 	}
-	return &sandbox.DockerProvider{Log: d.warnf}
+	p := &sandbox.DockerProvider{Log: d.warnf}
+	if d.Store != nil {
+		p.StateDir = filepath.Dir(d.Store.Path())
+	}
+	return p
 }
 
 // engine resolves the injectable Engine default.
@@ -359,7 +365,7 @@ func (d *Dispatcher) StopWorker(ctx context.Context, task *tasks.Task) error {
 		}
 	}
 	if task.AgentSessionID != "" {
-		if err := d.launcher().Stop(ctx, task.AgentSessionID, sandbox.ContainerName(task.ID)); err != nil {
+		if err := d.launcher().Stop(ctx, task.ID, task.AgentSessionID); err != nil {
 			return err
 		}
 	}

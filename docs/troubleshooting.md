@@ -6,7 +6,7 @@
 herder doctor   # alias: herder health
 ```
 
-Four sections, each reported distinctly:
+Five sections, each reported distinctly:
 
 | Section      | Meaning                                                        | Failure is |
 | ------------ | -------------------------------------------------------------- | ---------- |
@@ -14,9 +14,11 @@ Four sections, each reported distinctly:
 | `storage`    | SQLite file opens and migrates                                 | fatal      |
 | `herdr`      | `herdr` binary in PATH and its server answering                | warning    |
 | `docker`     | `docker` binary in PATH and the daemon answering `docker info` | warning    |
+| `ssh`        | `ssh` binary, controller keypair, and the managed Include line | warning    |
 
-Herdr/Docker warnings are setup hints, not fatal: task state still works
-without them, but provisioning and agent launch will fail until fixed.
+Herdr/Docker/SSH warnings are setup hints, not fatal: task state still
+works without them, but provisioning and agent launch will fail until
+fixed.
 
 ## Where state lives
 
@@ -24,6 +26,8 @@ without them, but provisioning and agent launch will fail until fixed.
   config). Tasks, events, webhook deliveries, and leases all live here
   and survive a daemon kill.
 - Workspaces: `<statedir>/sandboxes/<task>/` — one checkout per task.
+- SSH assets: `<statedir>/ssh/` — controller keypair, per-task host keys,
+  per-task known_hosts, and `config.d/<container>` Host blocks.
 
 ## Reading a task's history
 
@@ -41,7 +45,9 @@ event, and failure lands as a structured event — the event log answers
 
 | Symptom | Cause | Fix |
 | ------- | ----- | --- |
-| `agent: workspace create …` fails, task FAILED with `agent.start_failed` | Herdr server not running (or `herdr` missing) | Start Herdr (`herdr`), re-check `herder doctor`, then `herder task retry <id>` |
+| `agent: workspace create …` fails, task FAILED with `agent.start_failed` | The worker's container-local herdr server isn't answering (or `herdr` missing in the worker image) | Check `herdr --machine <task-id> status server`; the image must ship `herdr` (see `demo/Dockerfile.worker`); then `herder task retry <id>` |
+| `machine: add …` fails during provision | SSH into the container failed — missing Host block, keypair, or sshd in the image | `ssh <container>` should reach `sshd -i` via the `config.d` block; check `herder doctor` ssh section and that the image ships `openssh-server` |
+| `worker herdr server unreachable` in events, task WAITING_FOR_HUMAN | Container runs but its herdr server died or never started | `docker logs herder-<task>` shows the entrypoint; the entrypoint is `herdr server` — a crash exits the container |
 | `agent prompt` retries then fails (`agent_not_ready`) | Herdr pane exists but the agent inside hasn't come up | Check the pane via `herder task attach <id>` / `task logs`; retry once the agent binary is installed in the sandbox image |
 | `docker found but daemon not answering` / `permission denied … docker.sock` | dockerd down, or your user lacks socket access | Start dockerd; add user to the `docker` group or fix socket permissions |
 | Provision fails with a dirty-workspace error (`DirtyError`) | Re-provisioning would discard uncommitted work | Inspect `<statedir>/sandboxes/<task>/`, commit or clean by hand, then re-provision — Herder refuses rather than destroys |
@@ -50,7 +56,8 @@ event, and failure lands as a structured event — the event log answers
 | `unknown agent kind` / `unknown agent profile` | `agent.default` or `--agent` names nothing in `agents:`, or `kind` isn't codex/claude/opencode/gemini | Fix the profile name or kind in config; `config validate` catches this at load |
 | `dispatch already in progress (lease held by …)` | Another dispatcher holds the task's lease | Wait for `scheduler.lease_ttl` expiry (dead owners requeue automatically) or finish the in-flight dispatch |
 | `sandbox … not ready` on `task start` | Container missing or not running | `herder sandbox provision <task-id>` first; `sandbox inspect <id>` shows status |
-| `task logs`/`attach` fails | Session gone (`ErrSessionGone`) | The pane exited; `task inspect` shows `agent.exited`/`worker.disconnected` — `task retry <id>` starts a fresh attempt |
+| `task logs`/`attach` fails | Session gone (`ErrSessionGone`) or machine unreachable | The pane exited; `task inspect` shows `agent.exited`/`worker.disconnected` — `task retry <id>` starts a fresh attempt |
+| Stale machine profiles in `herdr machine list` | A worker was removed without `sandbox destroy` | `herder sandbox destroy <task-or-container>` removes the profile and SSH files; `herdr machine remove <id>` cleans leftovers by hand |
 
 ## Still stuck
 

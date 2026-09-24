@@ -8,6 +8,11 @@
 # plus restart resilience (kill -9 the daemon mid-run) and
 # duplicate-webhook dedup.
 #
+# Issue #19: the worker is a herdr machine — the container runs its own
+# herdr server (PID 1) reached over SSH through `docker exec` + `sshd -i`,
+# and the demo asserts the machine profile, the forwarded status call,
+# and the agent session on the container-local server.
+#
 # How it works without a real agent account: the worker image
 # (demo/Dockerfile.worker) ships demo/codex, a deterministic fake agent
 # that consumes the seeded contract, waits for a message containing
@@ -59,10 +64,17 @@ cleanup() {
 	[ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
 	if [ -n "$TASK_ID" ]; then
 		# The pane and container outlive `task done` — close them
-		# explicitly (reconcile skips DONE tasks by design).
-		for ws in $(herdr workspace list 2>/dev/null | python3 -c \
+		# explicitly (reconcile skips DONE tasks by design). The remote
+		# workspace lives on the container-local server, so closing it
+		# goes through --machine; the machine profile and container go
+		# last.
+		for ws in $(herdr --machine "$TASK_ID" workspace list 2>/dev/null | python3 -c \
 			'import json,sys; print(" ".join(w["workspace_id"] for w in json.load(sys.stdin)["result"]["workspaces"] if w["label"]=="herder-'"$TASK_ID"'"))' 2>/dev/null); do
-			herdr workspace close "$ws" >/dev/null 2>&1
+			herdr --machine "$TASK_ID" workspace close "$ws" >/dev/null 2>&1
+		done
+		for m in $(herdr machine list --json 2>/dev/null | python3 -c \
+			'import json,sys; print(" ".join(m["id"] for m in json.load(sys.stdin) if m["label"]=="'"$TASK_ID"'"))' 2>/dev/null); do
+			herdr machine remove "$m" >/dev/null 2>&1
 		done
 		docker rm -f "herder-$TASK_ID" >/dev/null 2>&1
 	fi
@@ -78,7 +90,7 @@ trap cleanup EXIT
 
 # ---------- preflight ----------
 say "Preflight"
-for bin in go docker gh herdr python3 curl git; do
+for bin in go docker gh herdr python3 curl git ssh; do
 	command -v "$bin" >/dev/null || die "missing: $bin"
 done
 docker info >/dev/null 2>&1 || die "docker daemon not reachable"
@@ -153,7 +165,20 @@ printf '%s' "$DUP" | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin)
 # ---------- scheduler: provision + launch ----------
 say "Scheduler provisions sandbox and launches agent"
 wait_for "task RUNNING (sandbox + agent up)" 240 task_status RUNNING
-ok "agent visible: herdr agent attach herder-$TASK_ID"
+
+# The worker is a herdr machine: the container-local server answers
+# forwarded calls and the agent session lives on it, not on the host.
+herdr machine list --json | python3 -c \
+	'import json,sys; exit(0 if any(m["label"]=="'"$TASK_ID"'" for m in json.load(sys.stdin)) else 1)' \
+	&& ok "machine profile registered: $TASK_ID" \
+	|| die "no machine profile for $TASK_ID"
+herdr --machine "$TASK_ID" status server >/dev/null 2>&1 \
+	&& ok "container-local herdr server answering over SSH" \
+	|| die "worker herdr server not reachable"
+herdr --machine "$TASK_ID" agent get "herder-$TASK_ID" >/dev/null 2>&1 \
+	&& ok "agent session live on the worker's server" \
+	|| die "agent session not found on worker"
+ok "agent visible: herder task attach $TASK_ID (herdr --remote herder-$TASK_ID)"
 
 # ---------- kill -9 restart resilience ----------
 say "kill -9 the daemon, restart, verify state survives"

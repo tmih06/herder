@@ -9,6 +9,7 @@ import (
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/sandbox"
+	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
 
@@ -85,6 +86,17 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		return fmt.Errorf("sandbox %s not ready: status %s (run `herder sandbox provision %s` first)",
 			container, sb.Status, task.ID)
 	}
+	// Inspect does not carry the machine profile id — resolve it from the
+	// registry so the durable binding records the full link. A missing
+	// profile means provision predates the machine model or ran without
+	// a state dir; the launch still works (the label is the task id) but
+	// the binding stays honest about what exists.
+	machineID := sb.MachineID
+	if machineID == "" {
+		if m, err := d.provider().MachineRegistry().Find(ctx, task.ID, container); err == nil && m != nil {
+			machineID = m.ID
+		}
+	}
 	workspace := sandbox.WorkspacePath(SandboxRoot(cfg.Database.Path), task.ID)
 	session := agent.SessionName(task.ID)
 	// The deterministic worker branch: claimed when set, else herder/<issue>.
@@ -98,23 +110,24 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		SandboxID:        container, Workspace: workspace,
 		PriorAgent: priorAgent,
 	})
-	if task.AgentSessionID != "" && d.launcher().IsLive(ctx, task.AgentSessionID) {
+	if task.AgentSessionID != "" && d.launcher().IsLive(ctx, task.ID, task.AgentSessionID) {
 		return d.reuseSession(ctx, task, repo, prompt, map[string]any{
 			"session": task.AgentSessionID, "kind": prof.Kind, "profile": profileName,
-			"sandbox": container, "reused": true,
+			"sandbox": container, "machine": machineID, "reused": true,
 		})
 	}
 	res, err := d.launcher().Start(ctx, agent.StartInput{
 		Session: session, AgentKind: prof.Kind,
-		Workspace: workspace, Container: container,
-		ShimDir: agent.ShimRoot(cfg.Database.Path),
+		Machine: task.ID,
 		Prompt:  prompt,
 	})
 	if err != nil {
 		// Record the binding optimistically so a session that did start
 		// (send-side failure) stays attachable and retry re-seeds it;
 		// failTaskStart clears it when the session never came up.
-		if bindErr := d.Store.SetBinding(task.ID, container, session); bindErr == nil {
+		if bindErr := d.Store.SetBinding(task.ID, storage.Binding{
+			SandboxID: container, MachineID: machineID, SessionID: session,
+		}); bindErr == nil {
 			task.AgentSessionID = session
 		}
 		return d.failTaskStart(ctx, task, err.Error())
@@ -122,7 +135,10 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 	// Bind only after the pane exists: a failed Start leaves no session
 	// name behind for attach to resolve. A bind failure still fails the
 	// task, and the reason names the orphaned session for manual recovery.
-	if err := d.Store.SetBinding(task.ID, container, session); err != nil {
+	if err := d.Store.SetBinding(task.ID, storage.Binding{
+		SandboxID: container, MachineID: machineID, SessionID: session,
+		RemoteWorkspaceID: res.WorkspaceID, RemotePaneID: res.PaneID,
+	}); err != nil {
 		return d.failTaskStart(ctx, task,
 			fmt.Sprintf("session %s started but binding failed: %v", session, err))
 	}
@@ -148,7 +164,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		if getErr == nil && (stored.Status == tasks.Cancelled || stored.Status == tasks.Failed) {
 			stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer stopCancel()
-			if stopErr := d.launcher().Stop(stopCtx, session, container); stopErr != nil {
+			if stopErr := d.launcher().Stop(stopCtx, task.ID, session); stopErr != nil {
 				d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
 			}
 			if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {
@@ -180,15 +196,17 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 func (d *Dispatcher) reuseSession(ctx context.Context, task *tasks.Task,
 	repo config.RepositoryConfig, prompt string, payload map[string]any,
 ) error {
-	if err := d.Store.SetBinding(task.ID, sandbox.ContainerName(task.ID), ""); err != nil {
+	if err := d.Store.SetBinding(task.ID, storage.Binding{
+		SandboxID: sandbox.ContainerName(task.ID),
+	}); err != nil {
 		return fmt.Errorf("record sandbox binding: %w", err)
 	}
 	if task.Status != tasks.Running {
 		// Re-seed only when the pane doesn't already show the contract:
 		// an ambiguous prompt failure (agent_prompt_stalled) can leave
 		// the text delivered, and a blind resend queues it twice.
-		if !d.launcher().PromptDelivered(ctx, task.AgentSessionID, prompt) {
-			if err := d.launcher().SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
+		if !d.launcher().PromptDelivered(ctx, task.ID, task.AgentSessionID, prompt) {
+			if err := d.launcher().SendPrompt(ctx, task.ID, task.AgentSessionID, prompt); err != nil {
 				return d.failTaskStart(ctx, task, err.Error())
 			}
 		}
@@ -233,7 +251,7 @@ func (d *Dispatcher) failTaskStart(ctx context.Context, task *tasks.Task, reason
 	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if task.AgentSessionID != "" && !d.launcher().IsLive(probeCtx, task.AgentSessionID) {
+	if task.AgentSessionID != "" && !d.launcher().IsLive(probeCtx, task.ID, task.AgentSessionID) {
 		if err := d.Store.ClearSessionBinding(task.ID); err != nil {
 			d.warnf("herder: clear stale session binding: %v", err)
 		}

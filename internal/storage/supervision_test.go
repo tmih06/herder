@@ -21,7 +21,7 @@ func runningTask(t *testing.T, store *Store, ref string) tasks.Task {
 			t.Fatalf("Transition %s = %v", next, err)
 		}
 	}
-	if err := store.SetBinding(task.ID, "herder-"+task.ID, "herder-"+task.ID); err != nil {
+	if err := store.SetBinding(task.ID, Binding{SandboxID: "herder-" + task.ID, SessionID: "herder-" + task.ID}); err != nil {
 		t.Fatalf("SetBinding = %v", err)
 	}
 	task.AgentSessionID = "herder-" + task.ID

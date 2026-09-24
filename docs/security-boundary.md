@@ -52,6 +52,31 @@ and interfere with other sessions — so workers never get it. Herder
 reaches Herdr only through its public CLI/socket API, and the worker
 container is created without the socket mount.
 
+## Worker-local Herdr server (issue #19, enforced)
+
+Each worker container runs its own `herdr server` as PID 1, reached over
+SSH — never over a published port or a mounted socket. The transport is
+`ProxyCommand docker exec -i <container> /usr/sbin/sshd -i`: sshd runs in
+inetd mode inside the container, so the only path in is the Docker exec
+channel the controller already owns.
+
+- **Authentication**: one controller-owned ed25519 keypair under
+  `<statedir>/ssh/`; only the public key enters the sandbox as
+  `authorized_keys` for the `worker` login. Password auth, PAM, and root
+  login are disabled on the injected sshd command line.
+- **Host-key verification**: each task gets a dedicated `known_hosts`
+  plus a per-task sshd host key generated on the controller and injected
+  at provision — `StrictHostKeyChecking accept-new` against a file that
+  dies with the task, never the user's global known_hosts.
+- **Scope**: the container-local server governs only that worker's
+  workspaces/panes/agents. It holds no credentials, no host socket, and
+  no path to other machines — the machine profile is a one-way control
+  channel, not a trust grant.
+- **Config blocks**: per-task `Host <container>` stanzas live in
+  `<statedir>/ssh/config.d/`, included from `~/.ssh/config` by one
+  managed Include line; teardown removes the block, known_hosts, and
+  host key with the machine profile.
+
 ## Worker sandbox enforcement (v0.1, enforced)
 
 `internal/sandbox/docker.go` `create()` builds every worker container
@@ -62,7 +87,8 @@ with:
 - `--user <uid>:<gid>` matching the workspace owner (cap-drop removes even
   root's DAC override, so the worker must own its files)
 - `--cpus`, `--memory`, `--pids-limit` resource caps
-- `--network bridge` — no host network namespace
+- `--network bridge` — no host network namespace; no published ports
+  (SSH reaches the container through `docker exec`, not TCP)
 - Exactly one mount: the task workspace at `/workspace` — no host PID
   namespace, no Docker socket, no Herdr socket, no host home
 - `HERDER_TASK=<task-id>` env + `herder-managed` labels for attribution

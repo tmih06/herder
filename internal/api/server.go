@@ -198,8 +198,8 @@ func (s *Server) handleInspectDelivery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"delivery": delivery})
 }
 
-// handleHealth reports controller/storage/Herdr/Docker distinctly so one
-// glance separates "daemon broken" from "sandbox host down".
+// handleHealth reports controller/storage/Herdr/Docker/SSH distinctly so
+// one glance separates "daemon broken" from "sandbox host down".
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	report := health.Build(s.cfg, s.cfgPath, nil, s.store)
 	writeJSON(w, http.StatusOK, report)

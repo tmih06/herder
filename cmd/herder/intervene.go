@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -67,7 +68,7 @@ func taskTell(store *storage.Store, args []string, w, ew io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
 	launcher := &agent.Launcher{}
-	if err := launcher.SendPrompt(ctx, task.AgentSessionID, message); err != nil {
+	if err := launcher.SendPrompt(ctx, task.ID, task.AgentSessionID, message); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -112,7 +113,7 @@ func taskLogs(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	text, err := (&agent.Launcher{}).Read(ctx, task.AgentSessionID, *lines)
+	text, err := (&agent.Launcher{}).Read(ctx, task.ID, task.AgentSessionID, *lines)
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
@@ -145,7 +146,7 @@ func taskPause(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	provider := newProvider(ew)
+	provider := newProvider(ew, store)
 	container := sandbox.ContainerName(task.ID)
 	if _, err := provider.Inspect(ctx, container); err != nil {
 		fmt.Fprintf(ew, "herder: cannot pause %s: %v\n", task.ID, err)
@@ -186,7 +187,7 @@ func taskResume(store *storage.Store, args []string, w, ew io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), interveneTimeout)
 	defer cancel()
-	provider := newProvider(ew)
+	provider := newProvider(ew, store)
 	if err := provider.EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
@@ -239,7 +240,7 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 		// container; EnsureRunning is a no-op on a running one, and a
 		// missing container already killed the agent inside, so a thaw
 		// failure only warns — the pane close below still converges.
-		if err := newProvider(ew).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
+		if err := newProvider(ew, store).EnsureRunning(ctx, sandbox.ContainerName(task.ID)); err != nil {
 			fmt.Fprintf(ew, "herder: thaw sandbox: %v\n", err)
 		}
 	}
@@ -407,10 +408,16 @@ func oneTask(store *storage.Store, args []string, verb string, ew io.Writer) (ta
 }
 
 // newProvider builds the Docker provider with operator-facing logging,
-// shared by every intervention verb that touches a container.
-func newProvider(ew io.Writer) *sandbox.DockerProvider {
+// shared by every intervention verb that touches a container. StateDir
+// roots the SSH assets and machine wiring Provision/Destroy maintain —
+// it lives beside the state database so every CLI entry resolves the
+// same files the daemon wrote.
+func newProvider(ew io.Writer, store *storage.Store) *sandbox.DockerProvider {
 	provider := sandbox.NewDockerProvider()
 	provider.Log = func(format string, args ...any) { fmt.Fprintf(ew, format+"\n", args...) }
+	if store != nil {
+		provider.StateDir = filepath.Dir(store.Path())
+	}
 	return provider
 }
 

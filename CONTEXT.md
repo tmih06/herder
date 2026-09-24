@@ -41,8 +41,16 @@ _Avoid_: agent config, worker template, persona
 
 **Herdr Session**:
 The live Herdr agent session bound to a running task
-(`agent_session_id`); the durable task ↔ sandbox ↔ session link.
+(`agent_session_id`) on the worker's container-local Herdr server; part
+of the durable task ↔ sandbox ↔ machine ↔ session link.
 _Avoid_: pane (that's Herdr's object), terminal, connection
+
+**Machine**:
+The saved herdr SSH machine profile (`machine_id`) that forwards
+`herdr --machine <task-id>` calls to the worker's container-local
+server. One per task; the SSH target is the container name resolved
+through a per-task `Host` block under `<statedir>/ssh/config.d/`.
+_Avoid_: remote, host, node
 
 **Provider**:
 A pluggable integration behind an interface: source providers (GitHub
@@ -76,11 +84,11 @@ expires_at) that makes "start this task exactly once" survive crashes.
 _Avoid_: lock, claim (except as the CLAIMED state), reservation
 
 **Worker**:
-The running combination of sandbox + Herdr session + coding agent
-executing one task.
+The running combination of sandbox + container-local Herdr server +
+Herdr session + coding agent executing one task.
 _Avoid_: agent (that's the coding tool), executor, runner
 
 **Agent Kind**:
 The coding-agent CLI a profile launches inside the sandbox — `codex`,
-`claude`, `opencode`, `gemini` — attributed to Herdr via `HERDR_AGENT`.
-_Avoid_: model, bot, assistant
+`claude`, `opencode`, `gemini` — detected by the worker's own Herdr
+server from the real in-container process.
