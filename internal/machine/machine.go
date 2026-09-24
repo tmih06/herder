@@ -103,7 +103,7 @@ func (r *Registry) List(ctx context.Context) ([]Machine, error) {
 		Enabled bool   `json:"enabled"`
 	}
 	if err := json.Unmarshal([]byte(out.Stdout), &raw); err != nil {
-		return nil, fmt.Errorf("machine: list: unreadable output")
+		return nil, errors.New("machine: list: unreadable output")
 	}
 	machines := make([]Machine, 0, len(raw))
 	for _, m := range raw {

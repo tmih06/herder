@@ -1,8 +1,9 @@
-// SSH transport for worker sandboxes (issue #19): every worker container
-// runs an in-container herdr server reached over SSH, and SSH reaches the
-// container through `ProxyCommand docker exec -i <container> /usr/sbin/sshd -i`
-// — sshd in inetd mode, so no port is ever published and the same transport
-// maps 1:1 onto `kubectl exec -i <pod> -- sshd -i` for a future provider.
+// Package sandbox — SSH transport for worker sandboxes (issue #19): every
+// worker container runs an in-container herdr server reached over SSH, and
+// SSH reaches the container through `ProxyCommand docker exec -i <ctr>
+// /usr/sbin/sshd -i` — sshd in inetd mode, so no port is ever published and
+// the same transport maps 1:1 onto `kubectl exec -i <pod> -- sshd -i` for a
+// future provider.
 //
 // Why: the host pane ↔ container split was a shim — Herdr detected the
 // symlink's comm, not the agent, and every interaction proxied through

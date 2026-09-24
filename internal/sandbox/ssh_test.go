@@ -22,7 +22,7 @@ func TestConfigBlockRendersHostEntry(t *testing.T) {
 		{"nested state dir", "/var/lib/herder/db", "herder-task_xyz999"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := SSHAssets{StateDir: tc.stateDir,  Container: tc.container}
+			a := SSHAssets{StateDir: tc.stateDir, Container: tc.container}
 			block := a.ConfigBlock()
 			for _, want := range []string{
 				"Host " + tc.container,

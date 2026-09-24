@@ -186,8 +186,10 @@ func CheckSSH(stateDir string) Check {
 		}
 	}
 	if stateDir == "" {
-		return Check{Name: "ssh", State: "reachable",
-			Detail: fmt.Sprintf("ssh at %s (state dir unknown; keypair check skipped)", probe.path)}
+		return Check{
+			Name: "ssh", State: "reachable",
+			Detail: fmt.Sprintf("ssh at %s (state dir unknown; keypair check skipped)", probe.path),
+		}
 	}
 	assets := sandbox.SSHAssets{StateDir: stateDir}
 	if _, err := os.Stat(assets.IdentityFile()); err != nil {
@@ -199,8 +201,10 @@ func CheckSSH(stateDir string) Check {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return Check{Name: "ssh", State: "unreachable",
-			Detail: fmt.Sprintf("cannot resolve home for ~/.ssh/config: %v", err)}
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: fmt.Sprintf("cannot resolve home for ~/.ssh/config: %v", err),
+		}
 	}
 	raw, readErr := os.ReadFile(filepath.Join(home, ".ssh", "config"))
 	if readErr != nil {
