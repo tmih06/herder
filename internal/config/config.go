@@ -47,6 +47,8 @@ type Config struct {
 	Database     DatabaseConfig              `yaml:"database"`
 	Herdr        HerdrConfig                 `yaml:"herdr"`
 	Github       GithubConfig                `yaml:"github"`
+	Linear       LinearConfig                `yaml:"linear"`
+	API          APIConfig                   `yaml:"api"`
 	Scheduler    SchedulerConfig             `yaml:"scheduler"`
 	Repositories map[string]RepositoryConfig `yaml:"repositories"`
 	Agents       map[string]AgentConfig      `yaml:"agents"`
@@ -67,10 +69,29 @@ type HerdrConfig struct {
 	Mode string `yaml:"mode"`
 }
 
-// GithubConfig holds GitHub App credentials (env-expanded).
+// GithubConfig holds GitHub App credentials (env-expanded) plus the
+// webhook signing secret. WebhookSecret empty means deliveries are not
+// signature-verified (documented dev mode); set it in production.
 type GithubConfig struct {
 	AppID          string `yaml:"app_id"`
 	PrivateKeyFile string `yaml:"private_key_file"`
+	WebhookSecret  string `yaml:"webhook_secret"`
+}
+
+// LinearConfig holds the Linear webhook signing secret (env-expanded)
+// and the team-key -> repository routing table. WebhookSecret empty
+// means deliveries are not signature-verified (dev mode); an issue whose
+// team key is absent from Teams records a policy_denied delivery.
+type LinearConfig struct {
+	WebhookSecret string            `yaml:"webhook_secret"`
+	Teams         map[string]string `yaml:"teams"`
+}
+
+// APIConfig holds the bearer secret (env-expanded) that authorizes
+// POST /v1/tasks direct submissions. Secret empty disables the endpoint:
+// the daemon never runs an unauthenticated queue.
+type APIConfig struct {
+	Secret string `yaml:"secret"`
 }
 
 // SchedulerConfig bounds concurrent workers and paces the dispatch loop
@@ -304,6 +325,15 @@ func (c *Config) validate() []error {
 		}
 		if parsed, err := time.ParseDuration(d.raw); err != nil || parsed <= 0 {
 			errs = append(errs, fmt.Errorf("%s %q must be a positive Go duration (example \"2m\")", d.field, d.raw))
+		}
+	}
+	for team, repo := range c.Linear.Teams {
+		if strings.TrimSpace(team) == "" {
+			errs = append(errs, errors.New("linear.teams: team keys must be non-empty"))
+		}
+		if _, ok := c.Repositories[repo]; !ok {
+			errs = append(errs, fmt.Errorf("linear.teams.%q %q is not a configured repository (defined: %s)",
+				team, repo, strings.Join(sortedKeys(c.Repositories), ", ")))
 		}
 	}
 	if len(c.Repositories) == 0 {

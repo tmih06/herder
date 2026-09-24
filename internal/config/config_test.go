@@ -222,3 +222,28 @@ func TestValidateMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file, got nil")
 	}
 }
+
+// TestValidateLinearTeams linear.teams values must name configured
+// repositories; a dangling mapping fails at load naming the team.
+func TestValidateLinearTeams(t *testing.T) {
+	good := validBody + `
+linear:
+  teams:
+    ENG: acme/web
+`
+	if _, err := Load(writeConfig(t, good)); err != nil {
+		t.Fatalf("mapped team must load: %v", err)
+	}
+	bad := validBody + `
+linear:
+  teams:
+    ENG: ghost/repo
+`
+	_, err := Load(writeConfig(t, bad))
+	if err == nil {
+		t.Fatal("expected error for unmapped repository, got nil")
+	}
+	if !strings.Contains(err.Error(), "linear.teams") || !strings.Contains(err.Error(), "ghost/repo") {
+		t.Errorf("error should name linear.teams and the bad value, got: %v", err)
+	}
+}

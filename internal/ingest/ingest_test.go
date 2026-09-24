@@ -2,6 +2,9 @@ package ingest_test
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,14 +31,15 @@ func testSetup(t *testing.T) (*config.Config, *storage.Store, *ingest.Handler) {
 	return cfg, store, ingest.New(cfg, store)
 }
 
-func eligibleEvent(delivery string, issue int) ingest.IssueEvent {
-	return ingest.IssueEvent{
-		DeliveryID:  delivery,
-		Repository:  "owner/repo",
-		IssueNumber: issue,
-		Title:       "Fix OAuth refresh race",
-		Body:        "Refresh tokens race on expiry",
-		Labels:      []string{"bug", "agent-ready"},
+func eligibleEvent(delivery string, issue int) ingest.TriggerEvent {
+	return ingest.TriggerEvent{
+		DeliveryID: delivery,
+		Provider:   ingest.ProviderGitHub,
+		Repository: "owner/repo",
+		IssueRef:   strconv.Itoa(issue),
+		Title:      "Fix OAuth refresh race",
+		Body:       "Refresh tokens race on expiry",
+		Labels:     []string{"bug", "agent-ready"},
 	}
 }
 
@@ -106,7 +110,7 @@ func TestHandleDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Handle = %v", err)
 	}
-	for name, ev := range map[string]ingest.IssueEvent{
+	for name, ev := range map[string]ingest.TriggerEvent{
 		"same delivery": eligibleEvent("del-1", 182),
 		"same issue":    eligibleEvent("del-2", 182),
 	} {
@@ -156,7 +160,7 @@ func TestHandleDenies(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		event  ingest.IssueEvent
+		event  ingest.TriggerEvent
 		reason string
 	}{
 		{"unknown repository", unknown, `"evil/repo" is not configured`},
@@ -325,10 +329,11 @@ func TestHandleConcurrentDuplicates(t *testing.T) {
 func TestHandleValidation(t *testing.T) {
 	_, _, h := testSetup(t)
 
-	for name, ev := range map[string]ingest.IssueEvent{
-		"no delivery id": {Repository: "owner/repo", IssueNumber: 1, Labels: []string{"agent-ready"}},
-		"no repository":  {DeliveryID: "d", IssueNumber: 1, Labels: []string{"agent-ready"}},
-		"no issue":       {DeliveryID: "d", Repository: "owner/repo", Labels: []string{"agent-ready"}},
+	for name, ev := range map[string]ingest.TriggerEvent{
+		"no delivery id": {Repository: "owner/repo", IssueRef: "1", Provider: ingest.ProviderGitHub, Labels: []string{"agent-ready"}},
+		"no repository":  {DeliveryID: "d", IssueRef: "1", Provider: ingest.ProviderGitHub, Labels: []string{"agent-ready"}},
+		"no issue":       {DeliveryID: "d", Repository: "owner/repo", Provider: ingest.ProviderGitHub, Labels: []string{"agent-ready"}},
+		"no provider":    {DeliveryID: "d", Repository: "owner/repo", IssueRef: "1", Labels: []string{"agent-ready"}},
 	} {
 		if _, err := h.Handle(ev); err == nil {
 			t.Errorf("Handle(%s) must fail", name)
@@ -338,18 +343,28 @@ func TestHandleValidation(t *testing.T) {
 
 // Only labeled actions are work; other actions are ignored, and broken
 // bodies are rejected before anything durable happens.
-func TestParseGitHubIssuesEvent(t *testing.T) {
+func TestGitHubAdapterParse(t *testing.T) {
+	cfg, _, _ := testSetup(t)
+	adapter := ingest.NewGitHubAdapter(cfg)
+	parse := func(delivery, body string) (ingest.TriggerEvent, string, error) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/github", strings.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "issues")
+		req.Header.Set("X-GitHub-Delivery", delivery)
+		return adapter.Parse(req, []byte(body))
+	}
+
 	body := `{"action":"labeled",
 		"label":{"name":"agent-ready"},
 		"issue":{"number":182,"title":"Fix OAuth refresh race",
 			"body":"Refresh tokens race on expiry",
 			"labels":[{"name":"bug"},{"name":"agent-ready"}]},
 		"repository":{"full_name":"owner/repo"}}`
-	ev, ignored, err := ingest.ParseGitHubIssuesEvent("del-1", []byte(body))
-	if err != nil || ignored {
-		t.Fatalf("Parse = %+v, %v, %v; want event", ev, ignored, err)
+	ev, ignored, err := parse("del-1", body)
+	if err != nil || ignored != "" {
+		t.Fatalf("Parse = %+v, %q, %v; want event", ev, ignored, err)
 	}
-	if ev.Repository != "owner/repo" || ev.IssueNumber != 182 || ev.DeliveryID != "del-1" {
+	if ev.Repository != "owner/repo" || ev.IssueRef != "182" || ev.DeliveryID != "del-1" ||
+		ev.Provider != ingest.ProviderGitHub {
 		t.Errorf("event mistranslated: %+v", ev)
 	}
 	if ev.Body != "Refresh tokens race on expiry" {
@@ -367,32 +382,34 @@ func TestParseGitHubIssuesEvent(t *testing.T) {
 
 	opened := `{"action":"opened","issue":{"number":1,"title":"x","labels":[]},
 		"repository":{"full_name":"owner/repo"}}`
-	if _, ignored, err := ingest.ParseGitHubIssuesEvent("d", []byte(opened)); err != nil || !ignored {
-		t.Errorf("opened action must be ignored, got %v, %v", ignored, err)
+	if _, ignored, err := parse("d", opened); err != nil || ignored == "" {
+		t.Errorf("opened action must be ignored, got %q, %v", ignored, err)
 	}
-	if _, _, err := ingest.ParseGitHubIssuesEvent("d", []byte(`{oops`)); err == nil {
+	if _, _, err := parse("d", `{oops`); err == nil {
 		t.Errorf("broken JSON must fail")
 	}
 	bare := `{"action":"labeled","issue":{"number":0,"title":"x","labels":[]},
 		"repository":{"full_name":""}}`
-	if _, _, err := ingest.ParseGitHubIssuesEvent("d", []byte(bare)); err == nil {
+	if _, _, err := parse("d", bare); err == nil {
 		t.Errorf("event without repo/issue must fail")
 	}
 }
 
-// Branch names follow herder/<issue>-<slug> with an empty-title fallback.
+// Branch names follow herder/<issue>-<slug> with the ref lowercased and
+// an empty-title fallback.
 func TestBranchName(t *testing.T) {
 	cases := map[string]struct {
-		issue int
+		issue string
 		title string
 		want  string
 	}{
-		"slug":          {182, "Fix OAuth refresh race", "herder/182-fix-oauth-refresh-race"},
-		"punctuation":   {7, "API: export / import (v2)!", "herder/7-api-export-import-v2"},
-		"empty title":   {9, "", "herder/9"},
-		"blank title":   {9, "  !!!  ", "herder/9"},
-		"long title":    {3, "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk", "herder/3-aaaa-bbbb-cccc-dddd-eeee-ffff-gggg-hhhh"},
-		"unicode title": {4, "Überprüfung fehlgeschlagen", "herder/4-berpr-fung-fehlgeschlagen"},
+		"slug":          {"182", "Fix OAuth refresh race", "herder/182-fix-oauth-refresh-race"},
+		"punctuation":   {"7", "API: export / import (v2)!", "herder/7-api-export-import-v2"},
+		"linear ref":    {"ENG-123", "Fix OAuth refresh race", "herder/eng-123-fix-oauth-refresh-race"},
+		"empty title":   {"9", "", "herder/9"},
+		"blank title":   {"9", "  !!!  ", "herder/9"},
+		"long title":    {"3", "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk", "herder/3-aaaa-bbbb-cccc-dddd-eeee-ffff-gggg-hhhh"},
+		"unicode title": {"4", "Überprüfung fehlgeschlagen", "herder/4-berpr-fung-fehlgeschlagen"},
 	}
 	for name, tc := range cases {
 		if got := ingest.BranchName(tc.issue, tc.title); got != tc.want {

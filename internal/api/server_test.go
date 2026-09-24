@@ -1,6 +1,9 @@
 package api_test
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,9 +20,19 @@ import (
 // testServer builds a Server over a temp store with one transition applied.
 func testServer(t *testing.T) (*api.Server, *storage.Store) {
 	t.Helper()
+	return testServerConfig(t, nil)
+}
+
+// testServerConfig builds a Server like testServer with the loaded
+// example config mutated first (webhook secrets, team maps, api secret).
+func testServerConfig(t *testing.T, mutate func(*config.Config)) (*api.Server, *storage.Store) {
+	t.Helper()
 	cfg, err := config.Load("../../examples/herder.yaml")
 	if err != nil {
 		t.Fatalf("Load(example) = %v", err)
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 	store, err := storage.Open(t.TempDir() + "/herder.db")
 	if err != nil {
@@ -364,5 +377,405 @@ func TestGitHubWebhookBadRequests(t *testing.T) {
 	}
 	if len(deliveries) != 0 {
 		t.Errorf("bad requests must not record deliveries, got %v", deliveries)
+	}
+}
+
+// hmacHex computes the hex HMAC-SHA256 a webhook sender attaches.
+func hmacHex(secret, body string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(body))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// postSignedWebhook delivers one issues webhook with a signature header.
+func postSignedWebhook(t *testing.T, srv *api.Server, delivery, body, signature string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/github", strings.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-GitHub-Delivery", delivery)
+	if signature != "" {
+		req.Header.Set("X-Hub-Signature-256", signature)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// With github.webhook_secret configured, valid signatures are accepted,
+// bad or missing signatures answer 401 with nothing recorded, and the
+// same body verifies when the secret is unset (dev mode).
+func TestGitHubWebhookSignature(t *testing.T) {
+	srv, store := testServerConfig(t, func(c *config.Config) {
+		c.Github.WebhookSecret = "gh-secret"
+	})
+	body := labeledBody("owner/repo", 182, "agent-ready")
+
+	rec := postSignedWebhook(t, srv, "del-ok", body, "sha256="+hmacHex("gh-secret", body))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("valid signature POST = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	for name, sig := range map[string]string{
+		"missing":      "",
+		"bad hex":      "sha256=zzzz",
+		"wrong secret": "sha256=" + hmacHex("other", body),
+	} {
+		rec := postSignedWebhook(t, srv, "del-"+name, body, sig)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: POST = %d, want 401", name, rec.Code)
+		}
+	}
+	deliveries, err := store.ListDeliveries()
+	if err != nil {
+		t.Fatalf("ListDeliveries = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Errorf("rejected signatures must not record deliveries, got %v", deliveries)
+	}
+}
+
+// linearBody builds a minimal Linear Issue webhook body.
+func linearBody(action, typ, teamKey string, labels ...string) string {
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, `{"name":`+strconv.Quote(l)+`}`)
+	}
+	team := "null"
+	if teamKey != "" {
+		team = `{"key":` + strconv.Quote(teamKey) + `}`
+	}
+	return `{"action":` + strconv.Quote(action) + `,"type":` + strconv.Quote(typ) + `,"data":{` +
+		`"identifier":"ENG-123","title":"Fix OAuth refresh race",` +
+		`"description":"Refresh tokens race on expiry",` +
+		`"labels":[` + strings.Join(names, ",") + `],"team":` + team + `}}`
+}
+
+// postLinear delivers one Linear webhook to the test server.
+func postLinear(t *testing.T, srv *api.Server, delivery, body, signature string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/linear", strings.NewReader(body))
+	req.Header.Set("Linear-Delivery", delivery)
+	req.Header.Set("Linear-Event", "Issue")
+	if signature != "" {
+		req.Header.Set("Linear-Signature", signature)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// linearServer builds a server with the ENG team mapped to owner/repo.
+func linearServer(t *testing.T) (*api.Server, *storage.Store) {
+	t.Helper()
+	return testServerConfig(t, func(c *config.Config) {
+		c.Linear.Teams = map[string]string{"ENG": "owner/repo"}
+	})
+}
+
+// An eligible Linear Issue delivery must claim a QUEUED task on the
+// mapped repository with the bare identifier as source ref.
+func TestLinearWebhookAcceptsEndToEnd(t *testing.T) {
+	srv, store := linearServer(t)
+
+	rec := postLinear(t, srv, "lin-1", linearBody("create", "Issue", "ENG", "agent-ready", "priority:2"), "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST linear = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	var outcome map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if outcome["decision"] != "accepted" || outcome["task_id"] == "" {
+		t.Fatalf("outcome must accept with a task id, got %v", outcome)
+	}
+	found, err := store.ListTasks()
+	if err != nil {
+		t.Fatalf("ListTasks = %v", err)
+	}
+	if len(found) != 1 || found[0].Status != "QUEUED" {
+		t.Fatalf("want 1 QUEUED task, got %+v", found)
+	}
+	task := found[0]
+	if task.SourceProvider != "linear" || task.SourceRef != "ENG-123" || task.Repository != "owner/repo" {
+		t.Errorf("source identity = %s:%s on %s", task.SourceProvider, task.SourceRef, task.Repository)
+	}
+	if !strings.HasPrefix(task.BranchName, "herder/eng-123-") {
+		t.Errorf("branch = %q, want herder/eng-123-*", task.BranchName)
+	}
+	if task.Priority != 2 {
+		t.Errorf("priority = %d, want 2 from priority:2 label", task.Priority)
+	}
+	if !strings.Contains(task.Goal, "Fix OAuth refresh race") || !strings.Contains(task.Goal, "Refresh tokens race") {
+		t.Errorf("goal = %q, want title and description", task.Goal)
+	}
+
+	// Redelivery and a second delivery for the same issue dedup.
+	for name, delivery := range map[string]string{"same delivery": "lin-1", "same issue": "lin-2"} {
+		rec := postLinear(t, srv, delivery, linearBody("update", "Issue", "ENG", "agent-ready"), "")
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: POST = %d, want 200", name, rec.Code)
+		}
+	}
+	if found, _ := store.ListTasks(); len(found) != 1 {
+		t.Errorf("duplicates created %d tasks, want 1", len(found))
+	}
+}
+
+// Unmapped teams and missing trigger labels deny with a recorded row;
+// non-Issue types and remove actions are ignored without one.
+func TestLinearWebhookDeniesAndIgnores(t *testing.T) {
+	srv, store := linearServer(t)
+
+	rec := postLinear(t, srv, "lin-ops", linearBody("create", "Issue", "OPS", "agent-ready"), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unmapped team POST = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var outcome map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if outcome["decision"] != "policy_denied" || !strings.Contains(outcome["reason"], "OPS") {
+		t.Fatalf("unmapped team must deny naming the team, got %v", outcome)
+	}
+
+	rec = postLinear(t, srv, "lin-nolabel", linearBody("create", "Issue", "ENG", "bug"), "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if outcome["decision"] != "policy_denied" || !strings.Contains(outcome["reason"], "trigger label") {
+		t.Fatalf("missing label must deny, got %v", outcome)
+	}
+
+	for name, body := range map[string]string{
+		"comment type":  linearBody("create", "Comment", "ENG", "agent-ready"),
+		"remove action": linearBody("remove", "Issue", "ENG", "agent-ready"),
+	} {
+		rec := postLinear(t, srv, "lin-"+name, body, "")
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("%s: POST = %d, want 202", name, rec.Code)
+		}
+	}
+
+	deliveries, err := store.ListDeliveries()
+	if err != nil {
+		t.Fatalf("ListDeliveries = %v", err)
+	}
+	if len(deliveries) != 2 {
+		t.Fatalf("want exactly 2 denial rows (ignored record nothing), got %v", deliveries)
+	}
+	for _, d := range deliveries {
+		if d.SourceProvider != "linear" {
+			t.Errorf("delivery provider = %q, want linear", d.SourceProvider)
+		}
+	}
+}
+
+// With linear.webhook_secret configured, bad or missing signatures
+// answer 401 with nothing recorded.
+func TestLinearWebhookSignature(t *testing.T) {
+	srv, store := testServerConfig(t, func(c *config.Config) {
+		c.Linear.Teams = map[string]string{"ENG": "owner/repo"}
+		c.Linear.WebhookSecret = "lin-secret"
+	})
+	body := linearBody("create", "Issue", "ENG", "agent-ready")
+
+	rec := postLinear(t, srv, "lin-ok", body, hmacHex("lin-secret", body))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("valid signature POST = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	for name, sig := range map[string]string{
+		"missing":      "",
+		"bad hex":      "zzzz",
+		"wrong secret": hmacHex("other", body),
+	} {
+		rec := postLinear(t, srv, "lin-"+name, body, sig)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: POST = %d, want 401", name, rec.Code)
+		}
+	}
+	deliveries, err := store.ListDeliveries()
+	if err != nil {
+		t.Fatalf("ListDeliveries = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Errorf("rejected signatures must not record deliveries, got %v", deliveries)
+	}
+}
+
+// Unknown webhook providers answer 404.
+func TestWebhookUnknownProvider(t *testing.T) {
+	srv, _ := testServer(t)
+	for _, provider := range []string{"gitlab", "api"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/"+provider, strings.NewReader(`{}`))
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s webhook POST = %d, want 404", provider, rec.Code)
+		}
+	}
+}
+
+// postTask submits one direct task to POST /v1/tasks.
+func postTask(t *testing.T, srv *api.Server, body, token, idempotencyKey string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// apiServer builds a server with the task API enabled.
+func apiServer(t *testing.T) (*api.Server, *storage.Store) {
+	t.Helper()
+	return testServerConfig(t, func(c *config.Config) {
+		c.API.Secret = "s3cret"
+	})
+}
+
+// An authorized submission must claim a QUEUED task with api source
+// identity, explicit priority, and no trigger label required.
+func TestSubmitTaskAcceptsEndToEnd(t *testing.T) {
+	srv, store := apiServer(t)
+
+	body := `{"repository":"owner/repo","issue":"7","title":"Fix OAuth refresh race","body":"details","labels":["bug"],"priority":4}`
+	rec := postTask(t, srv, body, "s3cret", "ci-run-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST task = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	var outcome map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if outcome["decision"] != "accepted" || outcome["task_id"] == "" {
+		t.Fatalf("outcome must accept with a task id, got %v", outcome)
+	}
+	found, err := store.ListTasks()
+	if err != nil {
+		t.Fatalf("ListTasks = %v", err)
+	}
+	if len(found) != 1 || found[0].Status != "QUEUED" {
+		t.Fatalf("want 1 QUEUED task, got %+v", found)
+	}
+	task := found[0]
+	if task.SourceProvider != "api" || task.SourceRef != "owner/repo#7" {
+		t.Errorf("source identity = %s:%s, want api:owner/repo#7", task.SourceProvider, task.SourceRef)
+	}
+	if task.Priority != 4 {
+		t.Errorf("priority = %d, want explicit 4", task.Priority)
+	}
+	events, err := store.ListEvents(task.ID)
+	if err != nil {
+		t.Fatalf("ListEvents = %v", err)
+	}
+	if len(events) == 0 || events[0].ActorID != "api" {
+		t.Errorf("task events must record actor api, got %+v", events[0])
+	}
+}
+
+// The same idempotency key, and a second submission for the same issue,
+// must dedup instead of double-queueing.
+func TestSubmitTaskDuplicates(t *testing.T) {
+	srv, store := apiServer(t)
+	body := `{"repository":"owner/repo","issue":"7","title":"Fix it"}`
+
+	if rec := postTask(t, srv, body, "s3cret", "ci-1"); rec.Code != http.StatusCreated {
+		t.Fatalf("first POST = %d, want 201", rec.Code)
+	}
+	for name, key := range map[string]string{
+		"same idempotency key": "ci-1",
+		"same issue":           "ci-2",
+	} {
+		rec := postTask(t, srv, body, "s3cret", key)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: POST = %d, want 200: %s", name, rec.Code, rec.Body.String())
+		}
+		var outcome map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+			t.Fatalf("%s: decode outcome: %v", name, err)
+		}
+		if outcome["decision"] != "duplicate" {
+			t.Errorf("%s: decision = %q, want duplicate", name, outcome["decision"])
+		}
+	}
+	found, err := store.ListTasks()
+	if err != nil {
+		t.Fatalf("ListTasks = %v", err)
+	}
+	if len(found) != 1 {
+		t.Fatalf("duplicates created %d tasks, want 1", len(found))
+	}
+}
+
+// Missing or wrong bearer tokens answer 401 with nothing recorded; when
+// api.secret is unset the endpoint answers 404.
+func TestSubmitTaskAuth(t *testing.T) {
+	srv, store := apiServer(t)
+	body := `{"repository":"owner/repo","issue":"7"}`
+
+	for name, token := range map[string]string{
+		"missing": "",
+		"wrong":   "nope",
+	} {
+		rec := postTask(t, srv, body, token, "probe-"+name)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: POST = %d, want 401", name, rec.Code)
+		}
+	}
+	deliveries, err := store.ListDeliveries()
+	if err != nil {
+		t.Fatalf("ListDeliveries = %v", err)
+	}
+	if len(deliveries) != 0 {
+		t.Errorf("rejected tokens must not record deliveries, got %v", deliveries)
+	}
+
+	open, _ := testServer(t)
+	rec := postTask(t, open, body, "anything", "")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unset secret POST = %d, want 404", rec.Code)
+	}
+}
+
+// Unknown or disabled repositories deny with a recorded row; malformed
+// bodies answer 400 with nothing recorded.
+func TestSubmitTaskDeniesAndBadRequests(t *testing.T) {
+	srv, store := apiServer(t)
+
+	rec := postTask(t, srv, `{"repository":"evil/repo","issue":"7"}`, "s3cret", "ci-evil")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unknown repo POST = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var outcome map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if outcome["decision"] != "policy_denied" || !strings.Contains(outcome["reason"], "not configured") {
+		t.Fatalf("unknown repo must deny, got %v", outcome)
+	}
+
+	for name, body := range map[string]string{
+		"broken json":   `{oops`,
+		"missing issue": `{"repository":"owner/repo"}`,
+		"missing repo":  `{"issue":"7"}`,
+	} {
+		rec := postTask(t, srv, body, "s3cret", "")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: POST = %d, want 400", name, rec.Code)
+		}
+	}
+	deliveries, err := store.ListDeliveries()
+	if err != nil {
+		t.Fatalf("ListDeliveries = %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("want exactly 1 denial row (bad requests record nothing), got %v", deliveries)
+	}
+	if deliveries[0].SourceProvider != "api" {
+		t.Errorf("delivery provider = %q, want api", deliveries[0].SourceProvider)
 	}
 }

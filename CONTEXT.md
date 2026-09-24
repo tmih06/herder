@@ -53,13 +53,15 @@ through a per-task `Host` block under `<statedir>/ssh/config.d/`.
 _Avoid_: remote, host, node
 
 **Provider**:
-A pluggable integration behind an interface: source providers (GitHub
-issues) and sandbox providers (`docker` in v0.1).
-_Avoid_: backend, driver (except `herdr` driver mode), adapter
+A pluggable integration behind an interface: source providers (`github`,
+`linear`, `api` — one `SourceAdapter` each in `internal/ingest`) and
+sandbox providers (`docker` in v0.1).
+_Avoid_: backend, driver (except `herdr` driver mode)
 
 **Source Ref**:
-The external coordinate of a task's origin, e.g. `owner/repo#123`;
-`UNIQUE(source_provider, source_ref)` guarantees one task per issue.
+The external coordinate of a task's origin, e.g. `owner/repo#123` for
+GitHub/API or `ENG-123` for Linear; `UNIQUE(source_provider, source_ref)`
+guarantees one task per issue per provider.
 _Avoid_: external id, issue key, reference
 
 **Delivery**:
@@ -68,8 +70,9 @@ the PR, comment the issue, advance stage labels (`internal/deliver`).
 _Avoid_: publish, deploy, merge
 
 **Delivery (webhook)**:
-One inbound webhook receipt, deduplicated by `delivery_id` in
-`webhook_deliveries`; each lands one durable decision: accepted,
+One inbound trigger receipt — a GitHub or Linear webhook delivery, or an
+authenticated `POST /v1/tasks` submission — deduplicated by `delivery_id`
+in `webhook_deliveries`; each lands one durable decision: accepted,
 duplicate, or policy_denied.
 _Avoid_: event (that's Task Event), request, message
 

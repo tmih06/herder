@@ -1,17 +1,22 @@
-// Package ingest turns labeled-issue webhook deliveries into exactly one
-// policy-approved task (issue #2; SPEC sections 11, 12, 36, 49).
+// Package ingest turns source-provider trigger deliveries into exactly
+// one policy-approved task (issues #2, #21; SPEC sections 11, 12, 36, 49).
 //
-// Why: GitHub redelivers webhooks and operators relabel issues, so every
-// delivery must converge on one claimed task or one logged non-event
-// instead of a second worker.
-// Approach: static policy from config (repository known and enabled,
-// trigger label present), then one atomic storage.Claim covering delivery
-// dedup, source dedup, and the insert; concurrency caps belong to the
-// scheduler (issue #7), so bursts queue instead of being denied. A mutex
-// serializes same-process deliveries; UNIQUE rows cover sibling processes.
-// Inputs: IssueEvent deliveries plus the loaded config and open store.
-// Flow: Handle validates -> static gate -> Claim or RecordDenied.
-// Returns: Outcome with the durable decision and the new or surviving task.
+// Why: GitHub and Linear redeliver webhooks and operators relabel issues
+// or retry API submissions, so every delivery must converge on one
+// claimed task or one logged non-event instead of a second worker.
+// Approach: one SourceAdapter per provider authenticates the raw request
+// and translates its payload into a normalized TriggerEvent; this Handler
+// is the single choke point every adapter feeds — static policy from
+// config (repository known and enabled, trigger label present unless the
+// caller is itself the trigger), then one atomic storage.Claim covering
+// delivery dedup, source dedup, and the insert. Concurrency caps belong
+// to the scheduler (issue #7), so bursts queue instead of being denied.
+// A mutex serializes same-process deliveries; UNIQUE rows cover sibling
+// processes.
+// Inputs: TriggerEvent deliveries plus the loaded config and open store.
+// Flow: adapter Verify+Parse -> Handle validates -> static gate -> Claim
+// or RecordDenied. Returns: Outcome with the durable decision and the new
+// or surviving task.
 package ingest
 
 import (
@@ -28,19 +33,46 @@ import (
 	"github.com/tmih06/herder/internal/tasks"
 )
 
-// ProviderGitHub is the source provider recorded on claimed tasks.
-const ProviderGitHub = "github"
+// Source providers recorded on claimed tasks and delivery rows. The
+// provider namespaces source refs: github:owner/repo#7, linear:ENG-123,
+// and api:owner/repo#7 are three distinct tasks.
+const (
+	ProviderGitHub = "github"
+	ProviderLinear = "linear"
+	ProviderAPI    = "api"
+)
 
-// IssueEvent is one labeled-issue trigger delivery: the durable identity
-// (delivery id), the issue coordinate, the labels at delivery time, and
-// the title/body text that seeds the claimed task's agent goal.
-type IssueEvent struct {
-	DeliveryID  string
-	Repository  string
-	IssueNumber int
-	Title       string
-	Body        string
-	Labels      []string
+// TriggerEvent is one normalized trigger delivery from any source
+// provider: the durable identity (delivery id, provider, source
+// coordinate), the labels at delivery time, and the title/body text that
+// seeds the claimed task's agent goal.
+type TriggerEvent struct {
+	// DeliveryID deduplicates the delivery row (webhook delivery id or
+	// API idempotency key).
+	DeliveryID string
+	// Provider is one of the Provider* constants.
+	Provider string
+	// Repository is the resolved config repository (owner/repo). Linear
+	// adapters resolve it from the issue's team; it may be empty when
+	// DenyReason is set.
+	Repository string
+	// IssueRef is the provider's issue coordinate: "182" for GitHub,
+	// "ENG-123" for Linear, the submitted ref for API submissions.
+	IssueRef string
+	Title    string
+	Body     string
+	Labels   []string
+	// Triggered marks the caller as the trigger itself: authorized API
+	// submissions skip the trigger-label gate while repository policy
+	// still applies.
+	Triggered bool
+	// DenyReason pre-denies the delivery before repository validation:
+	// adapters that cannot resolve a repository (e.g. an unmapped Linear
+	// team) record a policy_denied row instead of failing the request.
+	DenyReason string
+	// Priority, when non-nil, is the explicit queue priority and wins
+	// over "priority:N" label parsing.
+	Priority *int
 }
 
 // Outcome is the durable decision for one delivery: accepted tasks carry
@@ -54,8 +86,8 @@ type Outcome struct {
 }
 
 // Handler gates deliveries against config policy and claims tasks.
-// Purpose: one shared choke point for the webhook endpoint and the CLI so
-// both report the same durable decision for the same delivery.
+// Purpose: one shared choke point for every source adapter and the CLI so
+// all report the same durable decision for the same delivery.
 type Handler struct {
 	cfg   *config.Config
 	store *storage.Store
@@ -70,50 +102,60 @@ func New(cfg *config.Config, store *storage.Store) *Handler {
 // Handle deduplicates, policy-gates, and claims one delivery.
 // Why: the single place where "eligible issue becomes a queued task and
 // ineligible or duplicate delivery becomes a logged non-event" holds.
-// Flow: validate identity -> unknown/disabled repository denied ->
-// missing trigger label denied -> atomic Claim (same-delivery and
-// same-issue redeliveries return duplicate; bursts queue for the
-// scheduler's caps rather than being denied here).
+// Flow: validate identity -> adapter-supplied denial (unmapped Linear
+// team) -> unknown/disabled repository denied -> missing trigger label
+// denied unless the event is self-triggered (API) -> atomic Claim
+// (same-delivery and same-issue redeliveries return duplicate; bursts
+// queue for the scheduler's caps rather than being denied here).
 // A "priority:N" label on the issue seeds the task's queue priority
-// (advisory only; malformed values are ignored, never denied).
-// Malformed events (no delivery id, repository, or issue number) are
-// caller errors, not denials: nothing durable can reference them.
-func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
+// unless the event carries an explicit Priority (advisory only; malformed
+// label values are ignored, never denied).
+// Malformed events (no delivery id, provider, issue ref, or repository)
+// are caller errors, not denials: nothing durable can reference them.
+func (h *Handler) Handle(ev TriggerEvent) (Outcome, error) {
 	if strings.TrimSpace(ev.DeliveryID) == "" {
 		return Outcome{}, errors.New("ingest: delivery needs an id")
 	}
-	if strings.TrimSpace(ev.Repository) == "" {
-		return Outcome{}, errors.New("ingest: delivery needs a repository")
+	if strings.TrimSpace(ev.Provider) == "" {
+		return Outcome{}, errors.New("ingest: delivery needs a source provider")
 	}
-	if ev.IssueNumber < 1 {
-		return Outcome{}, fmt.Errorf("ingest: delivery needs an issue number, got %d", ev.IssueNumber)
+	if strings.TrimSpace(ev.IssueRef) == "" {
+		return Outcome{}, errors.New("ingest: delivery needs an issue ref")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	sourceRef := SourceRef(ev.Provider, ev.Repository, ev.IssueRef)
+	if ev.DenyReason != "" {
+		return h.deny(ev, sourceRef, ev.DenyReason)
+	}
+	if strings.TrimSpace(ev.Repository) == "" {
+		return Outcome{}, errors.New("ingest: delivery needs a repository")
+	}
 	repo, ok := h.cfg.Repositories[ev.Repository]
 	if !ok {
-		return h.deny(ev, fmt.Sprintf("repository %q is not configured (defined: %s)",
+		return h.deny(ev, sourceRef, fmt.Sprintf("repository %q is not configured (defined: %s)",
 			ev.Repository, strings.Join(config.RepositoryNames(h.cfg), ", ")))
 	}
 	if !repo.Enabled {
-		return h.deny(ev, fmt.Sprintf("repository %q is disabled", ev.Repository))
+		return h.deny(ev, sourceRef, fmt.Sprintf("repository %q is disabled", ev.Repository))
 	}
 	trigger := matchTrigger(ev.Labels, repo.Trigger.Labels)
-	if trigger == "" {
-		return h.deny(ev, fmt.Sprintf("issue %s labels [%s] include no trigger label (want one of [%s])",
-			SourceRef(ev.Repository, ev.IssueNumber),
+	if trigger == "" && !ev.Triggered {
+		return h.deny(ev, sourceRef, fmt.Sprintf("issue %s labels [%s] include no trigger label (want one of [%s])",
+			sourceRef,
 			strings.Join(sortedLabels(ev.Labels), ", "),
 			strings.Join(repo.Trigger.Labels, ", ")))
 	}
 	// The goal is the issue's title plus body, whichever is present.
 	goal := strings.TrimSpace(ev.Title + "\n\n" + ev.Body)
-	branch := BranchName(ev.IssueNumber, ev.Title)
+	branch := BranchName(ev.IssueRef, ev.Title)
 	payload, err := json.Marshal(map[string]any{
 		"decision":       storage.DecisionAccepted,
 		"delivery_id":    ev.DeliveryID,
+		"provider":       ev.Provider,
 		"repository":     ev.Repository,
-		"issue":          ev.IssueNumber,
+		"issue":          ev.IssueRef,
 		"labels":         sortedLabels(ev.Labels),
 		"trigger_labels": repo.Trigger.Labels,
 		"agent_profile":  repo.Agent.Default,
@@ -122,18 +164,22 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, fmt.Errorf("ingest: encode policy payload: %w", err)
 	}
+	priority := labelPriority(ev.Labels)
+	if ev.Priority != nil {
+		priority = *ev.Priority
+	}
 	claimed, err := h.store.Claim(storage.ClaimRequest{
 		DeliveryID:     ev.DeliveryID,
-		SourceProvider: ProviderGitHub,
-		SourceRef:      SourceRef(ev.Repository, ev.IssueNumber),
+		SourceProvider: ev.Provider,
+		SourceRef:      sourceRef,
 		Repository:     ev.Repository,
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
 		Goal:           goal,
-		Priority:       labelPriority(ev.Labels),
+		Priority:       priority,
 		PolicyPayload:  string(payload),
 		ActorType:      "controller",
-		ActorID:        "webhook",
+		ActorID:        actorID(ev.Provider),
 	})
 	if err != nil {
 		return Outcome{}, err
@@ -148,9 +194,9 @@ func (h *Handler) Handle(ev IssueEvent) (Outcome, error) {
 
 // deny records a static policy refusal and maps a redelivered denial to
 // duplicate so repeats stay stable and never create work.
-func (h *Handler) deny(ev IssueEvent, reason string) (Outcome, error) {
+func (h *Handler) deny(ev TriggerEvent, sourceRef, reason string) (Outcome, error) {
 	denied, created, err := h.store.RecordDenied(
-		ev.DeliveryID, ProviderGitHub, SourceRef(ev.Repository, ev.IssueNumber), ev.Repository, reason)
+		ev.DeliveryID, ev.Provider, sourceRef, ev.Repository, reason)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -164,19 +210,34 @@ func (h *Handler) deny(ev IssueEvent, reason string) (Outcome, error) {
 	return Outcome{Decision: denied.Decision, Reason: denied.Reason}, nil
 }
 
-// SourceRef renders the durable issue coordinate, e.g. "acme/web#7".
-func SourceRef(repository string, issue int) string {
-	return fmt.Sprintf("%s#%d", repository, issue)
+// actorID names the durable actor for one provider's deliveries: webhook
+// receipts are the platform's webhook, API submissions are the api caller.
+func actorID(provider string) string {
+	if provider == ProviderAPI {
+		return "api"
+	}
+	return "webhook"
+}
+
+// SourceRef renders the durable issue coordinate per provider: GitHub and
+// API refs keep "owner/repo#7" while Linear uses the bare identifier
+// "ENG-123" (the repository lives on the task row, not in the ref).
+func SourceRef(provider, repository, issueRef string) string {
+	if provider == ProviderLinear {
+		return issueRef
+	}
+	return fmt.Sprintf("%s#%s", repository, issueRef)
 }
 
 // BranchName renders the worker branch per SPEC section 27:
-// herder/<issue>-<slug>, falling back to herder/<issue> when the title
-// carries no slug material.
-func BranchName(issue int, title string) string {
+// herder/<issue>-<slug> with the ref lowercased (herder/eng-123-fix),
+// falling back to herder/<issue> when the title carries no slug material.
+func BranchName(issueRef, title string) string {
+	ref := strings.ToLower(issueRef)
 	if slug := Slug(title); slug != "" {
-		return fmt.Sprintf("herder/%d-%s", issue, slug)
+		return fmt.Sprintf("herder/%s-%s", ref, slug)
 	}
-	return fmt.Sprintf("herder/%d", issue)
+	return fmt.Sprintf("herder/%s", ref)
 }
 
 // Slug lowercases the issue title into a branch-safe slug of up to 40
@@ -241,62 +302,4 @@ func sortedLabels(labels []string) []string {
 	out := append([]string(nil), labels...)
 	sort.Strings(out)
 	return out
-}
-
-// githubIssuesPayload is the subset of GitHub's issues event v0.1 reads:
-// the action, the triggering label, the issue, and the repository.
-type githubIssuesPayload struct {
-	Action string `json:"action"`
-	Label  struct {
-		Name string `json:"name"`
-	} `json:"label"`
-	Issue struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		Body   string `json:"body"`
-		Labels []struct {
-			Name string `json:"name"`
-		} `json:"labels"`
-	} `json:"issue"`
-	Repository struct {
-		FullName string `json:"full_name"`
-	} `json:"repository"`
-}
-
-// ParseGitHubIssuesEvent converts one GitHub issues webhook body into an
-// IssueEvent. Non-labeled actions (opened, unlabeled, ...) are not work:
-// they return ignored=true with no error and must not be recorded.
-// The delivery id travels in the X-GitHub-Delivery header, so it arrives
-// as a parameter rather than from the body.
-func ParseGitHubIssuesEvent(deliveryID string, body []byte) (ev IssueEvent, ignored bool, err error) {
-	var payload githubIssuesPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return IssueEvent{}, false, fmt.Errorf("ingest: decode issues event: %w", err)
-	}
-	if payload.Action != "labeled" {
-		return IssueEvent{}, true, nil
-	}
-	seen := make(map[string]bool)
-	var labels []string
-	for _, l := range payload.Issue.Labels {
-		if l.Name != "" && !seen[l.Name] {
-			seen[l.Name] = true
-			labels = append(labels, l.Name)
-		}
-	}
-	if payload.Label.Name != "" && !seen[payload.Label.Name] {
-		labels = append(labels, payload.Label.Name)
-	}
-	ev = IssueEvent{
-		DeliveryID:  deliveryID,
-		Repository:  payload.Repository.FullName,
-		IssueNumber: payload.Issue.Number,
-		Title:       payload.Issue.Title,
-		Body:        payload.Issue.Body,
-		Labels:      labels,
-	}
-	if strings.TrimSpace(ev.Repository) == "" || ev.IssueNumber < 1 {
-		return IssueEvent{}, false, errors.New("ingest: issues event needs repository.full_name and issue.number")
-	}
-	return ev, false, nil
 }

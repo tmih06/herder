@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -612,9 +613,9 @@ func ingestDelivery(path string, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: usage: herder ingest --delivery ID --repo R --issue N [--title T] [--body B] [--label L]...\n")
 		return 2
 	}
-	out, err := ingest.New(cfg, store).Handle(ingest.IssueEvent{
-		DeliveryID: *delivery, Repository: *repo,
-		IssueNumber: *issue, Title: *title, Body: *body, Labels: labels,
+	out, err := ingest.New(cfg, store).Handle(ingest.TriggerEvent{
+		DeliveryID: *delivery, Provider: ingest.ProviderGitHub, Repository: *repo,
+		IssueRef: strconv.Itoa(*issue), Title: *title, Body: *body, Labels: labels,
 	})
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
