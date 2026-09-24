@@ -1,0 +1,43 @@
+#!/bin/sh
+# demo/codex — the fake coding agent inside the demo worker image.
+#
+# Why: the end-to-end demo must run on one machine with no agent account
+# or API key. This script plays the agent's part deterministically: it
+# consumes the seeded task contract and any human messages line by line
+# (`herdr agent prompt` delivers multi-line text one read per line),
+# records each input, and on the finish sentinel writes the fix the task
+# asked for, commits it on the task branch, and exits.
+#
+#   any line                       -> appended to .herder-messages
+#   a line containing "finish"     -> write FIX.md, git commit, exit 0
+#   EOF                            -> commit whatever is pending, exit
+
+#
+# Output stays terse and declarative: Herdr classifies agent_status from
+# screen heuristics, so prompt-like text (a trailing "?", "blocked",
+# "done"-style idle banners) would misreport the session as blocked and
+# `agent prompt` would refuse with agent_blocked.
+set -u
+cd /workspace 2>/dev/null || exit 1
+
+echo "codex demo agent ready"
+
+finish() {
+	echo "fix for ${HERDER_TASK:-task}" > FIX.md
+	git add -A >/dev/null 2>&1
+	git -c user.name="herder-demo" -c user.email="demo@herder.local" \
+		commit -qm "herder: demo fix" >/dev/null 2>&1
+	echo "work committed"
+	exit 0
+}
+
+# Read inputs until the finish sentinel or EOF. The seeded contract
+# arrives line by line; only the sentinel acts. (No idle timeout: the
+# worker image's /bin/sh is dash, whose read has no -t.)
+while IFS= read -r line || [ -n "$line" ]; do
+	printf '%s\n' "$line" >> .herder-messages
+	case "$line" in
+	*finish*) finish ;;
+	esac
+done
+finish

@@ -31,7 +31,7 @@ func okGit(name string, args []string) (RunResult, error) {
 	switch {
 	case name == "git" && strings.Contains(argv, "rev-parse"):
 		return RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
-	case name == "git" && strings.HasPrefix(argv, "clone "):
+	case name == "git" && strings.Contains(argv, " clone "):
 		return RunResult{}, nil
 	case name == "git" && strings.Contains(argv, "status"):
 		return RunResult{Stdout: ""}, nil
@@ -46,7 +46,7 @@ func TestProvisionCloneFailureAborts(t *testing.T) {
 		if name == "git" && strings.Contains(argv, "rev-parse") {
 			return RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
 		}
-		if name == "git" && strings.HasPrefix(argv, "clone ") {
+		if name == "git" && strings.Contains(argv, " clone ") {
 			return RunResult{ExitCode: 128, Stderr: "repository not found"}, nil
 		}
 		return RunResult{}, nil

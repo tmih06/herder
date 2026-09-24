@@ -359,7 +359,7 @@ func (d *Dispatcher) StopWorker(ctx context.Context, task *tasks.Task) error {
 		}
 	}
 	if task.AgentSessionID != "" {
-		if err := d.launcher().Stop(ctx, task.AgentSessionID); err != nil {
+		if err := d.launcher().Stop(ctx, task.AgentSessionID, sandbox.ContainerName(task.ID)); err != nil {
 			return err
 		}
 	}

@@ -106,7 +106,9 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 	}
 	res, err := d.launcher().Start(ctx, agent.StartInput{
 		Session: session, AgentKind: prof.Kind,
-		Workspace: workspace, Container: container, Prompt: prompt,
+		Workspace: workspace, Container: container,
+		ShimDir: agent.ShimRoot(cfg.Database.Path),
+		Prompt:  prompt,
 	})
 	if err != nil {
 		// Record the binding optimistically so a session that did start
@@ -146,7 +148,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		if getErr == nil && (stored.Status == tasks.Cancelled || stored.Status == tasks.Failed) {
 			stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer stopCancel()
-			if stopErr := d.launcher().Stop(stopCtx, session); stopErr != nil {
+			if stopErr := d.launcher().Stop(stopCtx, session, container); stopErr != nil {
 				d.warnf("herder: stop orphaned session %s: %v", session, stopErr)
 			}
 			if clearErr := d.Store.ClearSessionBinding(task.ID); clearErr != nil {
@@ -182,8 +184,13 @@ func (d *Dispatcher) reuseSession(ctx context.Context, task *tasks.Task,
 		return fmt.Errorf("record sandbox binding: %w", err)
 	}
 	if task.Status != tasks.Running {
-		if err := d.launcher().SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
-			return d.failTaskStart(ctx, task, err.Error())
+		// Re-seed only when the pane doesn't already show the contract:
+		// an ambiguous prompt failure (agent_prompt_stalled) can leave
+		// the text delivered, and a blind resend queues it twice.
+		if !d.launcher().PromptDelivered(ctx, task.AgentSessionID, prompt) {
+			if err := d.launcher().SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
+				return d.failTaskStart(ctx, task, err.Error())
+			}
 		}
 	}
 	if err := d.advanceToRunning(ctx, task, true); err != nil {

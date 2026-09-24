@@ -1,0 +1,21 @@
+# Keep the build context to what `go build ./cmd/herder` needs:
+# go.mod, go.sum, cmd/, internal/.
+
+.git
+.github
+.claude
+.agents
+docs
+examples
+
+# Local build output — never ship the host binary into the image.
+/herder
+
+# Docs and metadata not needed at build time.
+*.md
+LICENSE
+skills-lock.json
+.golangci.yml
+Dockerfile
+.dockerignore
+docker-compose*.yaml

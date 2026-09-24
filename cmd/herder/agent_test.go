@@ -13,12 +13,16 @@ import (
 )
 
 // writeFakeBins installs fake `herdr` and `docker` CLIs on PATH for agent
-// launch and intervention tests. The herdr fake records calls, tracks
-// started sessions in STATE markers, answers `agent get` with JSON whose
-// status comes from STATE/status-<session> (default "working"), serves
-// `agent read` from STATE/read-<session>, closes panes via `pane close`,
-// and logs `notification show`; it re-reads STATE/herdrmode on every call
-// so setHerdrMode can arm "send-fails" or "start-fails" mid-test.
+// launch and intervention tests. The herdr fake records calls and scripts
+// the 0.9.x launch flow: `workspace create` mints a pane id, `pane run`
+// marks the pane detected with the shim's kind, `agent get` answers for
+// detected panes and named sessions with JSON whose status comes from
+// STATE/status-<session> (default "working"), `agent rename` binds the
+// session name to the pane, `agent prompt` records the seed, `agent read`
+// serves STATE/read-<session> as raw text, `pane close` kills the pane and
+// its named session, and `notification show` logs; it re-reads
+// STATE/herdrmode on every call so setHerdrMode can arm "send-fails" or
+// "start-fails" mid-test.
 // dockerMode selects the inspect outcome ("ready", "stopped", or
 // "missing"); the fake tracks STATE/docker-status so pause/unpause/start
 // move the container between running, paused, and stopped.
@@ -33,28 +37,74 @@ func writeFakeBins(t *testing.T, dockerMode string) string {
 echo "$@" >> "$STATE/calls"
 mode=$(cat "$STATE/herdrmode" 2>/dev/null)
 case "$1 $2" in
-"agent start")
+"workspace create")
   [ "$mode" = "start-fails" ] && { echo "start refused" >&2; exit 1; }
-  echo "{\"result\":{\"agent\":{\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
-  touch "$STATE/started-$3"
+  n=$(cat "$STATE/paneseq" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$STATE/paneseq"
+  pane="w9:p$n"
+  echo "{\"result\":{\"root_pane\":{\"pane_id\":\"$pane\"},\"workspace\":{\"workspace_id\":\"w9\"}}}"
   ;;
-"agent send")
+"pane run")
+  pane=$3; shim=$(basename "$4")
+  touch "$STATE/detected-$pane"; echo "$shim" > "$STATE/kindof-$pane"
+  ;;
+"agent get")
+  target=$3
+  if [ -f "$STATE/detected-$target" ]; then
+    kind=$(cat "$STATE/kindof-$target" 2>/dev/null); st=idle
+    echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$target\",\"workspace_id\":\"w9\"}}}"
+    exit 0
+  fi
+  [ -f "$STATE/started-$target" ] || { echo "agent_not_found" >&2; exit 1; }
+  pane=$(cat "$STATE/paneof-$target" 2>/dev/null || echo "w9:p-$target")
+  kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
+  st=$(cat "$STATE/status-$target" 2>/dev/null || true); [ -z "$st" ] && st=working
+  echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$pane\",\"workspace_id\":\"w9\"}}}"
+  ;;
+"agent rename")
+  pane=$3; name=$4
+  [ -f "$STATE/detected-$pane" ] || { echo "agent_not_found" >&2; exit 1; }
+  touch "$STATE/started-$name"; echo "$pane" > "$STATE/paneof-$name"
+  echo "{\"result\":{\"agent\":{\"name\":\"$name\",\"pane_id\":\"$pane\"}}}"
+  ;;
+"agent prompt")
   [ "$mode" = "send-fails" ] && { echo "send refused" >&2; exit 1; }
   printf '%s' "$4" >> "$STATE/prompt-$3"
   ;;
-"agent get")
-  [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
-  st=$(cat "$STATE/status-$3" 2>/dev/null || true); [ -z "$st" ] && st=working
-  echo "{\"result\":{\"agent\":{\"agent\":\"codex\",\"agent_status\":\"$st\",\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
-  ;;
 "agent read")
-  [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
+  [ -f "$STATE/started-$3" ] || [ -f "$STATE/detected-$3" ] || { echo "agent_not_found" >&2; exit 1; }
   text=$(cat "$STATE/read-$3" 2>/dev/null || true); [ -z "$text" ] && text="agent output tail"
-  printf '%s\n' "{\"result\":{\"read\":{\"text\":\"$text\",\"pane_id\":\"w9:p-$3\"}}}"
+  printf '%s\n' "$text"
+  ;;
+"pane process-info")
+  pane=$4
+  if [ -f "$STATE/detected-$pane" ]; then
+    kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
+    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"$kind\"}]}}}"
+    exit 0
+  fi
+  for f in "$STATE"/paneof-*; do
+    [ -f "$f" ] || continue
+    if [ "$(cat "$f")" = "$pane" ]; then
+      kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
+      echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"$kind\"}]}}}"
+      exit 0
+    fi
+  done
+  sess=${pane#w9:p-}
+  if [ -f "$STATE/started-$sess" ]; then
+    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"codex\"}]}}}"
+  else
+    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"fish\"}]}}}"
+  fi
   ;;
 "pane close")
-  sess=${3#w9:p-}
-  rm -f "$STATE/started-$sess"
+  pane=$3
+  rm -f "$STATE/detected-$pane"
+  for f in "$STATE"/paneof-*; do
+    [ -f "$f" ] || continue
+    [ "$(cat "$f")" = "$pane" ] && rm -f "$STATE/started-${f##*/paneof-}"
+  done
+  sess=${pane#w9:p-}; rm -f "$STATE/started-$sess"
   ;;
 "notification show")
   echo "$3 ${4:-} ${5:-}" >> "$STATE/notifications"
@@ -293,13 +343,13 @@ func TestTaskStartReusesLiveSession(t *testing.T) {
 		t.Fatalf("second start exit = %d (%s)", code, errOut)
 	}
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if n := strings.Count(string(calls), "agent start"); n != 1 {
-		t.Errorf("relaunch should reuse the session (1 start), got %d in %q", n, calls)
+	if n := strings.Count(string(calls), "workspace create"); n != 1 {
+		t.Errorf("relaunch should reuse the session (1 launch), got %d in %q", n, calls)
 	}
 	// The RUNNING task's live session is reused but not re-seeded: the only
 	// send is the seed inside the first start.
-	if n := strings.Count(string(calls), "agent send"); n != 1 {
-		t.Errorf("running task should not be re-seeded (1 send), got %d in %q", n, calls)
+	if n := strings.Count(string(calls), "agent prompt"); n != 1 {
+		t.Errorf("running task should not be re-seeded (1 prompt), got %d in %q", n, calls)
 	}
 	code, inspect, _ := runCmd(t, "--config", path, "task", "inspect", id)
 	if code != 0 {
@@ -326,11 +376,11 @@ func TestTaskStartQueuedReseedsLiveSession(t *testing.T) {
 		t.Fatalf("start exit = %d (%s)", code, errOut)
 	}
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if n := strings.Count(string(calls), "agent start"); n != 0 {
-		t.Errorf("live session should be reused (0 starts), got %d in %q", n, calls)
+	if n := strings.Count(string(calls), "workspace create"); n != 0 {
+		t.Errorf("live session should be reused (0 launches), got %d in %q", n, calls)
 	}
-	if n := strings.Count(string(calls), "agent send"); n != 1 {
-		t.Errorf("queued task should be re-seeded (1 send), got %d in %q", n, calls)
+	if n := strings.Count(string(calls), "agent prompt"); n != 1 {
+		t.Errorf("queued task should be re-seeded (1 prompt), got %d in %q", n, calls)
 	}
 	prompt, err := os.ReadFile(filepath.Join(state, "prompt-herder-"+id))
 	if err != nil {
@@ -377,7 +427,7 @@ func TestTaskStartFailedLaunchLeavesNoBinding(t *testing.T) {
 	}
 	// A refused start should never reach the prompt send.
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if strings.Contains(string(calls), "agent send") {
+	if strings.Contains(string(calls), "agent prompt") {
 		t.Errorf("failed start should not send a prompt, got %q", calls)
 	}
 }
@@ -402,7 +452,7 @@ func TestTaskStartFailedReseedKeepsLiveBinding(t *testing.T) {
 	}
 	// The still-live session was reused, not relaunched: no start at all.
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if strings.Contains(string(calls), "agent start") {
+	if strings.Contains(string(calls), "workspace create") {
 		t.Errorf("failed re-seed should not relaunch the live session, got %q", calls)
 	}
 	code, inspect, _ := runCmd(t, "--config", path, "task", "inspect", id)
@@ -443,8 +493,8 @@ func TestTaskStartSendFailureKeepsLiveBinding(t *testing.T) {
 	}
 	// The pane was created before the send failed: one start, one send.
 	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if n := strings.Count(string(calls), "agent start"); n != 1 {
-		t.Errorf("send failure follows a successful start (1 start), got %d in %q", n, calls)
+	if n := strings.Count(string(calls), "workspace create"); n != 1 {
+		t.Errorf("send failure follows a successful launch (1 create), got %d in %q", n, calls)
 	}
 	code, inspect, _ := runCmd(t, "--config", path, "task", "inspect", id)
 	if code != 0 {

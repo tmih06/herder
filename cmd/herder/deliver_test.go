@@ -63,7 +63,15 @@ case "$1 $2" in
   [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
   echo "{\"result\":{\"agent\":{\"agent\":\"codex\",\"agent_status\":\"working\",\"pane_id\":\"w9:p-$3\",\"workspace_id\":\"w9\"}}}"
   ;;
-"agent send")
+"pane process-info")
+  sess=${4#w9:p-}
+  if [ -f "$STATE/started-$sess" ]; then
+    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"codex\"}]}}}"
+  else
+    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"fish\"}]}}}"
+  fi
+  ;;
+"agent prompt")
   printf '%s' "$4" >> "$STATE/prompt-$3"
   ;;
 *) exit 0 ;;

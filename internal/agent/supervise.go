@@ -20,9 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/tmih06/herder/internal/textutil"
 	"strings"
 	"time"
+
+	"github.com/tmih06/herder/internal/textutil"
 
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -119,6 +120,14 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 			return
 		}
 		s.logf("herder: supervise: %s: %v", task.ID, err)
+		return
+	}
+	// Herdr keeps the named record after the agent process exits, so a
+	// successful Get is not proof of life: the pane's foreground must
+	// still be the shim. A dead shim is the same exit the gone-session
+	// path handles — the pane stays for post-mortem reads.
+	if !info.Running {
+		s.onExited(ctx, task)
 		return
 	}
 	state := NormalizeState(info.Status)

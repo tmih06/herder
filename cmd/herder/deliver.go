@@ -127,7 +127,7 @@ func gateOrRoute(ctx context.Context, cfg *config.Config, store *storage.Store,
 // returns to the live agent or to a human with the failure attached.
 func taskValidate(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, repo, provider, code := prepareTask(cfg, store, args, "validate",
-		[]tasks.State{tasks.Running, tasks.Validating}, ew)
+		[]tasks.State{tasks.Running, tasks.Validating, tasks.WaitingForHuman}, ew)
 	if code >= 0 {
 		return code
 	}
@@ -146,18 +146,22 @@ func taskValidate(cfg *config.Config, store *storage.Store, args []string, w, ew
 // REVIEWING/DELIVERING pick up after it, PR_OPEN is already delivered.
 func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, repo, provider, code := prepareTask(cfg, store, args, "deliver",
-		[]tasks.State{tasks.Running, tasks.Validating, tasks.Reviewing, tasks.Delivering, tasks.PROpen}, ew)
+		[]tasks.State{
+			tasks.Running, tasks.Validating, tasks.WaitingForHuman,
+			tasks.Reviewing, tasks.Delivering, tasks.PROpen,
+		}, ew)
 	if code >= 0 {
 		return code
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gateTimeout)
 	defer cancel()
-
-	// The gate runs for RUNNING/VALIDATING tasks; REVIEWING and beyond
-	// already passed it (resume after a crash mid-delivery). A branch
-	// that moved since the recorded pass re-enters the gate instead of
-	// shipping unverified commits.
-	if task.Status == tasks.Running || task.Status == tasks.Validating {
+	// The gate runs for RUNNING/VALIDATING tasks and for
+	// WAITING_FOR_HUMAN ones whose worker disconnected before the gate
+	// ever ran; REVIEWING and beyond already passed it (resume after a
+	// crash mid-delivery). A branch that moved since the recorded pass
+	// re-enters the gate instead of shipping unverified commits.
+	if task.Status == tasks.Running || task.Status == tasks.Validating ||
+		task.Status == tasks.WaitingForHuman {
 		if code, passed := gateOrRoute(ctx, cfg, store, provider, &task, repo, w, ew); !passed {
 			return code
 		}
@@ -465,11 +469,13 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 			fmt.Fprintf(ew, "herder: bump attempt: %v\n", err)
 			return 1
 		}
-		for _, next := range []tasks.State{tasks.Retrying, tasks.Running} {
-			if err := transition(store, task, next, ew); err != nil {
-				fmt.Fprintf(ew, "herder: %v\n", err)
-				return 1
-			}
+		// One atomic hop back to RUNNING: the agent never stopped, so a
+		// RETRYING waypoint would only open a window where reconcile's
+		// lease check requeues the task mid-transition and a second
+		// dispatch launches a duplicate worker.
+		if err := transition(store, task, tasks.Running, ew); err != nil {
+			fmt.Fprintf(ew, "herder: %v\n", err)
+			return 1
 		}
 		prompt := fmt.Sprintf("Herder validation failed (attempt %d). Fix the issues below, commit your work, and report done again.\n\n%s",
 			bumped.Attempt, summary)

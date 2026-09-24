@@ -733,7 +733,14 @@ func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
 			s.logf("herder: scheduler: thaw sandbox for %s: %v", task.ID, err)
 		}
 	}
-	if err := s.Dispatcher.SessionLauncher().Stop(ctx, agent.SessionName(task.ID)); err != nil {
+	// The bound session id wins; a task abandoned between agent rename
+	// and SetBinding has none, so fall back to the deterministic name —
+	// that orphaned pane is exactly what this cleanup exists to stop.
+	session := task.AgentSessionID
+	if session == "" {
+		session = agent.SessionName(task.ID)
+	}
+	if err := s.Dispatcher.SessionLauncher().Stop(ctx, session, task.SandboxID); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}
 }
