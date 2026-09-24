@@ -84,7 +84,7 @@ func sandboxSetup(path string, ew io.Writer) (*config.Config, *storage.Store, *s
 	if store == nil {
 		return nil, nil, nil
 	}
-	return cfg, store, newProvider(ew)
+	return cfg, store, newProvider(ew, store)
 }
 
 // resolveTarget maps a task id to its container name, passing container

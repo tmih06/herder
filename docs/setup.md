@@ -7,6 +7,8 @@
   launches and supervises agents through it.
 - **Docker** — the `docker` CLI plus a reachable daemon; the default (and
   only v0.1) sandbox provider.
+- **OpenSSH client** — `ssh` in PATH; every worker is a herdr SSH
+  machine, so machine add/forwarded calls go through OpenSSH.
 - **`gh auth login`** — delivery runs as the controller's GitHub identity:
   `gh auth git-credential` authenticates pushes and `gh` opens PRs and
   comments. No token is ever handed to a worker.
@@ -30,7 +32,7 @@ go build -o herder ./cmd/herder
 
 # 4. In another shell: zero-task status view, then full diagnostics.
 ./herder status
-./herder doctor   # controller, storage, Herdr, Docker reported distinctly
+./herder doctor   # controller, storage, Herdr, Docker, SSH reported distinctly
 ```
 
 `demo/demo.sh` runs the full end-to-end demo on one machine (~1 min):
@@ -110,9 +112,21 @@ Notes:
   message, and `config validate` reports every problem at once.
 - `--config PATH` or `$HERDER_CONFIG` overrides the default location.
 
-## Where state lives
-
 - Config: `~/.config/herder/config.yaml`
 - Database: `~/.local/state/herder/herder.db` (tasks, events, deliveries,
   leases — survives daemon restarts)
 - Workspaces: `<statedir>/sandboxes/` (one checkout per task)
+- SSH assets: `<statedir>/ssh/` — the controller keypair, per-task host
+  keys and known_hosts, and `config.d/<container>` Host blocks included
+  from `~/.ssh/config` by one managed Include line (added on first
+  provision; safe to remove when no workers exist)
+
+## Worker machines (issue #19)
+
+Every worker container runs `herdr server` as PID 1 and is registered as
+a saved herdr SSH machine labelled by task id. The controller reaches it
+with `herdr --machine <task-id> …`; a human attaches with
+`herder task attach <id>` (which runs `herdr --remote <container>`).
+Worker images must ship `herdr` and `openssh-server` — see
+`demo/Dockerfile.worker` for the minimal recipe. `herder sandbox
+destroy` removes the machine profile and the task's SSH files.

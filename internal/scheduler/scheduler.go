@@ -352,14 +352,30 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 		})
 		return false
 	}
-	if sb.Status == "running" {
-		return true
+	if sb.Status != "running" {
+		s.stopWorkerBestEffort(ctx, task)
+		s.disconnect(task, "sandbox "+sb.Status, map[string]string{
+			"sandbox": container,
+		})
+		return false
 	}
-	s.stopWorkerBestEffort(ctx, task)
-	s.disconnect(task, "sandbox "+sb.Status, map[string]string{
-		"sandbox": container,
-	})
-	return false
+	// The container's herdr server is the worker's control surface: a
+	// running container whose server never answered (or died after
+	// start) cannot take commands, so it is a dead worker, not a live
+	// one. The probe gets its own bound — ictx was cancelled after
+	// inspect — and a transport failure reads as dead; the next pass
+	// re-checks.
+	pctx, pcancel := context.WithTimeout(ctx, reconcileCallTimeout)
+	live := s.Dispatcher.SessionLauncher().ServerLive(pctx, task.ID)
+	pcancel()
+	if !live {
+		s.stopWorkerBestEffort(ctx, task)
+		s.disconnect(task, "worker herdr server unreachable", map[string]string{
+			"sandbox": container,
+		})
+		return false
+	}
+	return true
 }
 
 // disconnect lands a workerless task WAITING_FOR_HUMAN and records why
@@ -740,7 +756,7 @@ func (s *Scheduler) stopWorkerSession(ctx context.Context, task *tasks.Task) {
 	if session == "" {
 		session = agent.SessionName(task.ID)
 	}
-	if err := s.Dispatcher.SessionLauncher().Stop(ctx, session, task.SandboxID); err != nil {
+	if err := s.Dispatcher.SessionLauncher().Stop(ctx, task.ID, session); err != nil {
 		s.logf("herder: scheduler: stop session for %s: %v", task.ID, err)
 	}
 }

@@ -113,7 +113,7 @@ func (s *Supervisor) PollOnce(ctx context.Context) {
 // re-blocks after a human answer instead of silently staying RUNNING.
 func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 	session := task.AgentSessionID
-	info, err := s.Launcher.Get(ctx, session)
+	info, err := s.Launcher.Get(ctx, task.ID, session)
 	if err != nil {
 		if errors.Is(err, ErrSessionGone) {
 			s.onExited(ctx, task)
@@ -124,7 +124,7 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 	}
 	// Herdr keeps the named record after the agent process exits, so a
 	// successful Get is not proof of life: the pane's foreground must
-	// still be the shim. A dead shim is the same exit the gone-session
+	// still be the agent. A dead agent is the same exit the gone-session
 	// path handles — the pane stays for post-mortem reads.
 	if !info.Running {
 		s.onExited(ctx, task)
@@ -157,7 +157,7 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 // non-empty recent output, or a plain marker when the pane won't read.
 func (s *Supervisor) onBlocked(ctx context.Context, task *tasks.Task, session string) {
 	reason := "agent reports blocked"
-	if tail, err := s.Launcher.Read(ctx, session, blockedTailLines); err == nil {
+	if tail, err := s.Launcher.Read(ctx, task.ID, session, blockedTailLines); err == nil {
 		if line := lastLine(tail); line != "" {
 			reason = textutil.Truncate(line, blockedReasonCap)
 		}

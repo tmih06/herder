@@ -14,11 +14,14 @@ package health
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 )
 
@@ -32,12 +35,13 @@ type Check struct {
 	Detail string `json:"detail"`
 }
 
-// Report holds the four diagnostic sections.
+// Report holds the five diagnostic sections.
 type Report struct {
 	Controller Check `json:"controller"`
 	Storage    Check `json:"storage"`
 	Herdr      Check `json:"herdr"`
 	Docker     Check `json:"docker"`
+	SSH        Check `json:"ssh"`
 }
 
 // OK reports whether the must-work layers pass.
@@ -50,11 +54,16 @@ func (r Report) OK() bool {
 // Build assembles the full report. A nil cfg means the config failed to
 // load; reason carries the load error for the controller section.
 func Build(cfg *config.Config, cfgPath string, reason error, store *storage.Store) Report {
+	stateDir := ""
+	if store != nil {
+		stateDir = filepath.Dir(store.Path())
+	}
 	return Report{
 		Controller: CheckController(cfg, cfgPath, reason),
 		Storage:    CheckStorage(store),
 		Herdr:      CheckHerdr(),
 		Docker:     CheckDocker(),
+		SSH:        CheckSSH(stateDir),
 	}
 }
 
@@ -159,6 +168,69 @@ func CheckDocker() Check {
 	return Check{
 		Name: "docker", State: "reachable",
 		Detail: fmt.Sprintf("docker at %s: server %s", probe.path, orMsg(probe.output, "daemon answering")),
+	}
+}
+
+// CheckSSH verifies the controller's SSH transport for worker machines
+// (issue #19): the ssh binary must exist, the controller keypair must be
+// generated, and ~/.ssh/config must carry the managed Include line so
+// herdr's machine commands resolve worker Host blocks. Unreachable only
+// warns — provisioning wires the assets itself, so a missing piece is a
+// hint, not a failure.
+func CheckSSH(stateDir string) Check {
+	probe := probeBinary("ssh", "-V")
+	if probe.err != nil && probe.path == "" {
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: "ssh binary not in PATH (install OpenSSH to reach worker machines)",
+		}
+	}
+	if stateDir == "" {
+		return Check{
+			Name: "ssh", State: "reachable",
+			Detail: fmt.Sprintf("ssh at %s (state dir unknown; keypair check skipped)", probe.path),
+		}
+	}
+	assets := sandbox.SSHAssets{StateDir: stateDir}
+	if _, err := os.Stat(assets.IdentityFile()); err != nil {
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: fmt.Sprintf("controller keypair missing at %s (provision a task to generate it)",
+				assets.IdentityFile()),
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: fmt.Sprintf("cannot resolve home for ~/.ssh/config: %v", err),
+		}
+	}
+	raw, readErr := os.ReadFile(filepath.Join(home, ".ssh", "config"))
+	if readErr != nil {
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: "~/.ssh/config missing or unreadable — the Herder Include line is absent (provision a task to add it)",
+		}
+	}
+	// Same predicate EnsureSSHInclude uses: an exact trimmed-line match,
+	// so a commented-out Include never reads as present.
+	included := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == assets.IncludeLine() {
+			included = true
+			break
+		}
+	}
+	if !included {
+		return Check{
+			Name: "ssh", State: "unreachable",
+			Detail: "~/.ssh/config lacks the Herder Include line (provision a task to add it)",
+		}
+	}
+	return Check{
+		Name: "ssh", State: "reachable",
+		Detail: fmt.Sprintf("ssh at %s; keypair and Include line present", probe.path),
 	}
 }
 

@@ -127,8 +127,10 @@ func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
 	for _, want := range []string{
 		"--cap-drop ALL", "no-new-privileges", "--pids-limit 256",
 		"--cpus 2", "--memory 4g", "--network bridge", "--user",
+		"--workdir /workspace", "--env HOME=/tmp/herder-home",
 		"/tmp/herder-test-sb/task_abc123:/workspace:rw",
-		"herder-managed=true", "sleep infinity",
+		"herder-managed=true",
+		`sh -c mkdir -p "$HOME/.ssh" && exec herdr server`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("create argv %q should contain %q", joined, want)
@@ -138,9 +140,11 @@ func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
 	if !strings.Contains(joined, wantUser) {
 		t.Errorf("create argv %q should run the worker as %q", joined, wantUser)
 	}
+	// The entrypoint runs `herdr server` inside the container, so the
+	// forbidden surface is the host's sockets and mounts, not the word.
 	for _, forbidden := range []string{
 		"--privileged", "--network host", "--pid host", "--ipc host",
-		"--uts host", "docker.sock", "herdr", ":/root", ":/home/",
+		"--uts host", "docker.sock", "herdr.sock", ":/root", ":/home/",
 	} {
 		if strings.Contains(joined, forbidden) {
 			t.Errorf("create argv %q must never contain %q", joined, forbidden)
@@ -281,6 +285,11 @@ func TestDestroyUnknownIsLoggedNoOp(t *testing.T) {
 		if name == "docker" && args[0] == "inspect" {
 			return RunResult{ExitCode: 1, Stderr: "Error: No such container"}, nil
 		}
+		// Destroy always sweeps the machine catalog; an empty list means
+		// no profile to remove.
+		if name == "herdr" && strings.Join(args, " ") == "machine list --json" {
+			return RunResult{Stdout: "[]"}, nil
+		}
 		return RunResult{}, nil
 	}
 	p := &DockerProvider{Runner: f.run, Log: func(f string, a ...any) { logged = append(logged, f) }}
@@ -292,6 +301,60 @@ func TestDestroyUnknownIsLoggedNoOp(t *testing.T) {
 	}
 	if argvOf(f.calls, "docker", "rm") != nil {
 		t.Errorf("destroy no-op must not remove anything, ran %v", f.calls)
+	}
+	if argvOf(f.calls, "herdr", "machine") != nil &&
+		strings.Join(argvOf(f.calls, "herdr", "machine"), " ") != "herdr machine list --json" {
+		t.Errorf("destroy no-op must not remove a machine profile, ran %v", f.calls)
+	}
+}
+
+// TestDestroyRemovesMachineProfileAndSSHFiles proves teardown cleans the
+// control plane too: every saved machine profile matching the container
+// name is removed by id, and the per-task SSH config/known_hosts/host
+// key under StateDir are deleted.
+func TestDestroyRemovesMachineProfileAndSSHFiles(t *testing.T) {
+	stateDir := t.TempDir()
+	a := SSHAssets{StateDir: stateDir, Container: "herder-task_abc123"}
+	if err := a.WriteConfig(); err != nil {
+		t.Fatalf("seed ssh config: %v", err)
+	}
+	for _, path := range []string{a.KnownHostsFile(), a.HostKeyFile()} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", path, err)
+		}
+	}
+	f := &fakeRunner{}
+	f.respond = func(name string, args []string) (RunResult, error) {
+		if name == "docker" && args[0] == "inspect" {
+			return RunResult{Stdout: "running\n"}, nil
+		}
+		if name == "herdr" && strings.Join(args, " ") == "machine list --json" {
+			return RunResult{Stdout: `[{"id":"m1","label":"task_abc123","target":"herder-task_abc123","enabled":true},` +
+				`{"id":"m2","label":"other","target":"herder-task_abc123","enabled":true},` +
+				`{"id":"m3","label":"task_other","target":"herder-task_other","enabled":true}]`}, nil
+		}
+		return RunResult{}, nil
+	}
+	p := &DockerProvider{Runner: f.run, StateDir: stateDir, Log: func(string, ...any) {}}
+	if err := p.Destroy(context.Background(), "herder-task_abc123"); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if argvOf(f.calls, "docker", "rm") == nil {
+		t.Errorf("destroy must docker rm the live container, ran %v", f.calls)
+	}
+	var removed []string
+	for _, c := range f.calls {
+		if len(c) == 4 && c[0] == "herdr" && c[1] == "machine" && c[2] == "remove" {
+			removed = append(removed, c[3])
+		}
+	}
+	if strings.Join(removed, ",") != "m1,m2" {
+		t.Errorf("machine remove ids = %v, want [m1 m2] (label or target match only)", removed)
+	}
+	for _, path := range []string{a.ConfigFile(), a.KnownHostsFile(), a.HostKeyFile()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("destroy must remove %s, stat err = %v", path, err)
+		}
 	}
 }
 

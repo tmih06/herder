@@ -68,7 +68,7 @@ func TestResolveProfile(t *testing.T) {
 }
 
 // TestBuildPrompt proves the seeded prompt carries every acceptance item:
-// goal, issue metadata, repo instructions, allowed ops, completion reqs.
+// goal, issue metadata, repo instructions, and the working rules.
 func TestBuildPrompt(t *testing.T) {
 	prompt := BuildPrompt(PromptInput{
 		Task: testTask(), AgentKind: "codex", ProfileName: "codex-default",
@@ -80,14 +80,14 @@ func TestBuildPrompt(t *testing.T) {
 	for _, want := range []string{
 		"acme/web#7", "herder/7", "task_abc123", "codex",
 		"Fix OAuth refresh race", "Refresh tokens rotate mid-request.",
-		"Always run gofmt.", "go test ./...",
+		"Always run gofmt.", "herder-task_abc123",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt should contain %q, got:\n%s", want, prompt)
 		}
 	}
 	lower := strings.ToLower(prompt)
-	for _, want := range []string{"goal", "allowed", "complet"} {
+	for _, want := range []string{"goal", "allowed operations", "completion requirements", "go test ./..."} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("prompt should section %q, got:\n%s", want, prompt)
 		}
@@ -95,14 +95,16 @@ func TestBuildPrompt(t *testing.T) {
 }
 
 // TestBuildPromptWithoutInstructions still seeds a usable prompt: the agent
-// must get completion requirements even when the repo has no AGENTS.md.
+// must get the completion contract even when the repo has no AGENTS.md.
 func TestBuildPromptWithoutInstructions(t *testing.T) {
 	prompt := BuildPrompt(PromptInput{
 		Task: testTask(), AgentKind: "codex", ProfileName: "codex-default",
 		Repo: testConfig().Repositories["acme/web"],
 	})
-	if !strings.Contains(prompt, "go test ./...") {
-		t.Errorf("prompt should carry validation commands, got:\n%s", prompt)
+	for _, want := range []string{"clean working tree", "Report done only when"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt should carry the completion contract %q, got:\n%s", want, prompt)
+		}
 	}
 }
 
@@ -117,48 +119,59 @@ func TestSessionNameIsStable(t *testing.T) {
 	}
 }
 
-// fakeLookPath resolves every binary to a path inside dir so Start's
-// shim step never needs a real docker install.
-func fakeLookPath(dir string) func(string) (string, error) {
-	return func(name string) (string, error) { return filepath.Join(dir, name), nil }
+// stripMachine drops the `--machine <label>` forwarding prefix so scripted
+// runners can match the herdr subcommand; host-side calls (notification
+// show) carry no prefix and pass through.
+func stripMachine(args []string) []string {
+	if len(args) >= 2 && args[0] == "--machine" {
+		return args[2:]
+	}
+	return args
 }
 
-// startRespond scripts the full herdr 0.9.x launch flow: workspace create
-// answers with pane ids, pane run records the shim argv, agent get reports
-// the detected kind, rename binds the session, and prompt records the seed.
+// startRespond scripts the full herdr 0.9.x launch flow on the worker's
+// machine: workspace create answers with pane ids, pane run records the
+// agent argv, agent get reports the detected kind, pane process-info
+// proves the agent is foreground, rename binds the session, and prompt
+// records the seed.
 func startRespond(calls *[][]string) Runner {
 	return func(_ context.Context, name string, args ...string) (RunResult, error) {
 		*calls = append(*calls, append([]string{name}, args...))
-		argv := strings.Join(args, " ")
+		argv := strings.Join(stripMachine(args), " ")
 		switch {
 		case strings.HasPrefix(argv, "workspace create"):
 			return RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 		case strings.HasPrefix(argv, "agent get"):
 			return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
 		case strings.HasPrefix(argv, "pane process-info"):
-			return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+			// Foreground group differs from the shell pid: the agent runs.
+			return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
 		}
 		return RunResult{Stdout: `{}`}, nil
 	}
 }
 
-// TestStartArgv proves the launch flow stays attributable: the workspace
-// carries the session label and HERDR_AGENT env, the pane runs the kind
-// shim into docker exec on the task container, and the prompt seeds the
-// renamed session (SPEC sections 24, 26).
+// TestStartArgv proves the launch flow stays attributable: every call is
+// forwarded to the worker's machine, the workspace carries the session
+// label and HERDR_AGENT env at the container's /workspace, the pane runs
+// the real agent binary, and the prompt seeds the renamed session (SPEC
+// sections 24, 26).
 func TestStartArgv(t *testing.T) {
-	dir := t.TempDir()
-	lookPath := fakeLookPath(dir)
 	var calls [][]string
-	l := &Launcher{Runner: startRespond(&calls), LookPath: lookPath}
+	l := &Launcher{Runner: startRespond(&calls)}
 	res, err := l.Start(context.Background(), StartInput{
 		Session: "herder-task_abc123", AgentKind: "codex",
-		Workspace: "/state/sandboxes/task_abc123",
-		Container: "herder-task_abc123", ShimDir: filepath.Join(dir, "shims"),
-		Prompt: "Do the thing.\n",
+		Machine: "task_abc123",
+		Prompt:  "Do the thing.\n",
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call[0] != "herdr" || len(call) < 3 ||
+			call[1] != "--machine" || call[2] != "task_abc123" {
+			t.Errorf("every call must forward to the task machine, got %v", call)
+		}
 	}
 	var create, run, rename, prompt string
 	for _, call := range calls {
@@ -176,15 +189,14 @@ func TestStartArgv(t *testing.T) {
 	}
 	for _, want := range []string{
 		"workspace create", "--label herder-task_abc123",
-		"--cwd /state/sandboxes/task_abc123", "HERDR_AGENT=codex",
+		"--cwd /workspace", "HERDR_AGENT=codex",
 	} {
 		if !strings.Contains(create, want) {
 			t.Errorf("workspace create should contain %q, got %q", want, create)
 		}
 	}
-	shim := filepath.Join(dir, "shims", "codex")
 	for _, want := range []string{
-		"pane run w5:p7", shim + " exec -it herder-task_abc123 codex",
+		"pane run w5:p7 codex",
 	} {
 		if !strings.Contains(run, want) {
 			t.Errorf("pane run should contain %q, got %q", want, run)
@@ -202,19 +214,14 @@ func TestStartArgv(t *testing.T) {
 	}
 }
 
-// TestStartClosesPaneOnFailure proves a launch that dies after the pane
-// exists cleans it up: a detection timeout must not leak the workspace.
 func TestStartClosesPaneOnFailure(t *testing.T) {
-	dir := t.TempDir()
-	lookPath := fakeLookPath(dir)
 	var calls [][]string
 	l := &Launcher{
-		LookPath:      lookPath,
 		DetectTimeout: 50 * time.Millisecond,
 		PollInterval:  5 * time.Millisecond,
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
 			calls = append(calls, append([]string{name}, args...))
-			argv := strings.Join(args, " ")
+			argv := strings.Join(stripMachine(args), " ")
 			switch {
 			case strings.HasPrefix(argv, "workspace create"):
 				return RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
@@ -227,7 +234,7 @@ func TestStartClosesPaneOnFailure(t *testing.T) {
 	}
 	_, err := l.Start(context.Background(), StartInput{
 		Session: "herder-task_x", AgentKind: "codex",
-		Workspace: "/w", Container: "c", ShimDir: filepath.Join(dir, "shims"), Prompt: "p",
+		Machine: "task_x", Prompt: "p",
 	})
 	if err == nil || !strings.Contains(err.Error(), "not detected") {
 		t.Fatalf("detection timeout should fail the launch, got %v", err)
@@ -249,12 +256,12 @@ func TestSendPromptRetriesNotReady(t *testing.T) {
 	n := 0
 	l := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
-			argv := strings.Join(args, " ")
+			argv := strings.Join(stripMachine(args), " ")
 			switch {
 			case strings.HasPrefix(argv, "agent get"):
 				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
 			case strings.HasPrefix(argv, "pane process-info"):
-				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
 			}
 			n++
 			if n < 3 {
@@ -263,7 +270,7 @@ func TestSendPromptRetriesNotReady(t *testing.T) {
 			return RunResult{}, nil
 		},
 	}
-	if err := l.SendPrompt(context.Background(), "herder-task_x", "go"); err != nil {
+	if err := l.SendPrompt(context.Background(), "task_x", "herder-task_x", "go"); err != nil {
 		t.Fatalf("transient agent_not_ready should retry, got %v", err)
 	}
 	if n != 3 {
@@ -277,19 +284,20 @@ func TestSendPromptRetriesNotReady(t *testing.T) {
 func TestSendPromptRefusesDeadAgent(t *testing.T) {
 	l := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
-			argv := strings.Join(args, " ")
+			argv := strings.Join(stripMachine(args), " ")
 			switch {
 			case strings.HasPrefix(argv, "agent get"):
 				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
 			case strings.HasPrefix(argv, "pane process-info"):
-				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"fish"}]}}}`}, nil
+				// Foreground group IS the shell: the agent exited.
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":100,"shell_pid":100}}}`}, nil
 			case strings.HasPrefix(argv, "agent prompt"):
 				t.Error("prompt must never reach a dead agent's pane")
 			}
 			return RunResult{}, nil
 		},
 	}
-	err := l.SendPrompt(context.Background(), "herder-task_x", "rm -rf /")
+	err := l.SendPrompt(context.Background(), "task_x", "herder-task_x", "rm -rf /")
 	if !errors.Is(err, ErrSessionGone) {
 		t.Fatalf("dead agent prompt = %v, want ErrSessionGone", err)
 	}
@@ -303,7 +311,7 @@ func TestReadReturnsRawText(t *testing.T) {
 			return RunResult{Stdout: "line one\nline two\n"}, nil
 		},
 	}
-	text, err := l.Read(context.Background(), "herder-task_x", 10)
+	text, err := l.Read(context.Background(), "task_x", "herder-task_x", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +331,7 @@ func TestStartRefusesUnknownKind(t *testing.T) {
 	}
 	_, err := l.Start(context.Background(), StartInput{
 		Session: "herder-task_x", AgentKind: "mystery",
-		Workspace: "/w", Container: "c", ShimDir: "/s", Prompt: "p",
+		Machine: "task_x", Prompt: "p",
 	})
 	if err == nil || !strings.Contains(err.Error(), "mystery") {
 		t.Errorf("should name the unknown kind, got %v", err)
@@ -333,17 +341,14 @@ func TestStartRefusesUnknownKind(t *testing.T) {
 // TestStartSurfacesHerdrFailure proves a failed workspace create is an
 // error, so the caller fails the task instead of pretending it runs.
 func TestStartSurfacesHerdrFailure(t *testing.T) {
-	dir := t.TempDir()
-	lookPath := fakeLookPath(dir)
 	l := &Launcher{
-		LookPath: lookPath,
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
 			return RunResult{ExitCode: 1, Stderr: "no such server"}, nil
 		},
 	}
 	_, err := l.Start(context.Background(), StartInput{
 		Session: "herder-task_x", AgentKind: "codex",
-		Workspace: "/w", Container: "c", ShimDir: filepath.Join(dir, "shims"), Prompt: "p",
+		Machine: "task_x", Prompt: "p",
 	})
 	if err == nil || !strings.Contains(err.Error(), "no such server") {
 		t.Errorf("should surface herdr stderr, got %v", err)
@@ -362,87 +367,58 @@ func TestParseWorkspaceCreate(t *testing.T) {
 	}
 }
 
-// TestEnsureShim proves the shim is a symlink to docker named after the
-// kind, recreated when the link target drifts.
-func TestEnsureShim(t *testing.T) {
-	dir := t.TempDir()
-	lookPath := fakeLookPath(dir)
-	shim, err := EnsureShim(filepath.Join(dir, "shims"), "codex", lookPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	target, err := os.Readlink(shim)
-	if err != nil {
-		t.Fatalf("shim should be a symlink: %v", err)
-	}
-	if target != filepath.Join(dir, "docker") {
-		t.Errorf("shim target = %q, want the fake docker", target)
-	}
-	// A wrong link is replaced.
-	if err := os.Remove(shim); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/nonexistent", shim); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EnsureShim(filepath.Join(dir, "shims"), "codex", lookPath); err != nil {
-		t.Fatal(err)
-	}
-	if target, _ := os.Readlink(shim); target != filepath.Join(dir, "docker") {
-		t.Errorf("stale shim not repaired, target = %q", target)
-	}
-}
-
-// TestAttachArgv proves attach targets the live session through the real
-// agent (glass-box), not a log replay.
+// TestAttachArgv proves attach lands in the worker's real Herdr session
+// through `herdr --remote <container>` (glass-box), not a log replay.
 func TestAttachArgv(t *testing.T) {
 	argv := AttachArgv("herder-task_abc123")
 	joined := strings.Join(argv, " ")
-	if !strings.Contains(joined, "agent attach herder-task_abc123") {
-		t.Errorf("attach should target the session, got %q", joined)
+	if !strings.Contains(joined, "--remote herder-task_abc123") {
+		t.Errorf("attach should target the worker's remote session, got %q", joined)
 	}
 }
 
 // TestIsLive maps `agent get` plus `pane process-info` to real liveness:
-// a named record alone is not proof — the shim must still be foreground.
+// a named record alone is not proof — the pane's foreground group must
+// still differ from its shell pid.
 func TestIsLive(t *testing.T) {
 	live := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
-			argv := strings.Join(args, " ")
+			argv := strings.Join(stripMachine(args), " ")
 			switch {
 			case strings.HasPrefix(argv, "agent get"):
 				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w9:p1"}}}`}, nil
 			case strings.HasPrefix(argv, "pane process-info"):
-				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
 			}
 			return RunResult{}, nil
 		},
 	}
-	if !live.IsLive(context.Background(), "herder-task_x") {
-		t.Error("running shim should mean live")
+	if !live.IsLive(context.Background(), "task_x", "herder-task_x") {
+		t.Error("foreground agent should mean live")
 	}
 	exited := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
-			argv := strings.Join(args, " ")
+			argv := strings.Join(stripMachine(args), " ")
 			switch {
 			case strings.HasPrefix(argv, "agent get"):
 				// The stale record still answers after the agent exits.
 				return RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w9:p1"}}}`}, nil
 			case strings.HasPrefix(argv, "pane process-info"):
-				return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"fish"}]}}}`}, nil
+				// The pane fell back to its shell: foreground == shell pid.
+				return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":100,"shell_pid":100}}}`}, nil
 			}
 			return RunResult{}, nil
 		},
 	}
-	if exited.IsLive(context.Background(), "herder-task_x") {
-		t.Error("stale record with no shim should mean not live")
+	if exited.IsLive(context.Background(), "task_x", "herder-task_x") {
+		t.Error("stale record with shell foreground should mean not live")
 	}
 	dead := &Launcher{
 		Runner: func(_ context.Context, name string, args ...string) (RunResult, error) {
 			return RunResult{ExitCode: 1, Stderr: "agent_not_found"}, nil
 		},
 	}
-	if dead.IsLive(context.Background(), "herder-task_x") {
+	if dead.IsLive(context.Background(), "task_x", "herder-task_x") {
 		t.Error("missing agent should mean not live")
 	}
 }

@@ -204,7 +204,7 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	owner := fmt.Sprintf("daemon-%d", os.Getpid())
 	d := &dispatch.Dispatcher{
 		Store: store, Owner: owner,
-		Provider: newProvider(ew), Launcher: &agent.Launcher{},
+		Provider: newProvider(ew, store), Launcher: &agent.Launcher{},
 		Engine:  &deliver.Engine{},
 		ActorID: owner,
 		Logf:    logf, Warnf: logf,
@@ -321,8 +321,8 @@ func cmdStatus(path string, w, ew io.Writer) int {
 	return 0
 }
 
-// cmdDoctor prints the four diagnostic sections distinctly and fails only
-// when the must-work layers (controller, storage) fail; Herdr/Docker
+// cmdDoctor prints the five diagnostic sections distinctly and fails only
+// when the must-work layers (controller, storage) fail; Herdr/Docker/SSH
 // unreachable are setup hints, not fatal.
 func cmdDoctor(path string, w, ew io.Writer) int {
 	cfg, cfgErr := config.Load(path)
@@ -339,7 +339,7 @@ func cmdDoctor(path string, w, ew io.Writer) int {
 		}
 	}
 	report := health.Build(cfg, path, cfgErr, store)
-	for _, section := range []health.Check{report.Controller, report.Storage, report.Herdr, report.Docker} {
+	for _, section := range []health.Check{report.Controller, report.Storage, report.Herdr, report.Docker, report.SSH} {
 		fmt.Fprintf(w, "%-10s %s — %s\n", section.Name+":", section.State, section.Detail)
 	}
 	if !report.OK() {
@@ -671,7 +671,7 @@ usage: herder [--config PATH] <command> [args]
   daemon                  start the controller and serve the status view
   config validate         fail fast on a bad config with a field-level message
   status                  show the daemon's task list
-  doctor | health         report controller, storage, Herdr, Docker distinctly
+  doctor | health         report controller, storage, Herdr, Docker, SSH distinctly
   task list               show tasks oldest-first
   task inspect <id>       show one task plus its event history
   task create --repo R --source-ref REF

@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 	branch_name TEXT NOT NULL DEFAULT '',
 	agent_session_id TEXT NOT NULL DEFAULT '',
 	sandbox_id TEXT NOT NULL DEFAULT '',
-	agent_state TEXT NOT NULL DEFAULT '',
+	machine_id TEXT NOT NULL DEFAULT '',
+	remote_workspace_id TEXT NOT NULL DEFAULT '',
+	remote_pane_id TEXT NOT NULL DEFAULT '',
 	attempt INTEGER NOT NULL DEFAULT 1,
 	created_at TEXT NOT NULL,
 	priority INTEGER NOT NULL DEFAULT 0,
@@ -154,11 +156,13 @@ func Open(path string) (*Store, error) {
 // migrateColumns adds columns introduced after the first databases were
 // written: the task-sandbox-session link columns plus goal, which carries
 // the issue goal text seeded into the agent prompt (issue #4), agent_state,
-// the normalized Herdr-reported worker condition (issue #5), and the
-// scheduler columns priority and started_at (issue #7). Fresh databases
-// already carry the columns via schema; legacy files get one ALTER each,
-// and the duplicate-column error on a partially migrated file is the
-// success signal, not a failure.
+// the normalized Herdr-reported worker condition (issue #5), the
+// scheduler columns priority and started_at (issue #7), and the machine
+// binding columns that record the worker's saved SSH profile and remote
+// workspace/pane ids (issue #19). Fresh databases already carry the
+// columns via schema; legacy files get one ALTER each, and the
+// duplicate-column error on a partially migrated file is the success
+// signal, not a failure.
 func migrateColumns(db *sql.DB) error {
 	for _, column := range []string{
 		"agent_session_id TEXT NOT NULL DEFAULT ''",
@@ -167,6 +171,9 @@ func migrateColumns(db *sql.DB) error {
 		"agent_state TEXT NOT NULL DEFAULT ''",
 		"priority INTEGER NOT NULL DEFAULT 0",
 		"started_at TEXT NOT NULL DEFAULT ''",
+		"machine_id TEXT NOT NULL DEFAULT ''",
+		"remote_workspace_id TEXT NOT NULL DEFAULT ''",
+		"remote_pane_id TEXT NOT NULL DEFAULT ''",
 	} {
 		_, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column)
 		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -333,27 +340,52 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	return event, nil
 }
 
-// SetBinding records the durable task <-> sandbox <-> session link (SPEC
-// section 18) without touching task status: sandbox provision stores the
-// container id, agent start stores the Herdr session name. Empty values
-// leave the stored column unchanged so callers update only what they know.
-// Unknown ids fail with ErrNotFound; updated_at moves so crash recovery
-// can tell a fresh link from a stale one.
-func (s *Store) SetBinding(id, sandboxID, sessionID string) error {
+// Binding is the durable task ↔ sandbox ↔ machine ↔ session link (SPEC
+// section 18, issue #19): the container, the saved herdr SSH machine
+// profile driving it, the agent session name on the container-local
+// herdr server, and the remote workspace/pane ids the agent occupies.
+// Empty fields leave the stored column unchanged so callers update only
+// what they know.
+type Binding struct {
+	SandboxID         string
+	MachineID         string
+	SessionID         string
+	RemoteWorkspaceID string
+	RemotePaneID      string
+}
+
+// SetBinding records the durable link without touching task status:
+// sandbox provision stores the container and machine profile, agent
+// start stores the session name and remote pane/workspace ids. Unknown
+// ids fail with ErrNotFound; updated_at moves so crash recovery can
+// tell a fresh link from a stale one.
+func (s *Store) SetBinding(id string, b Binding) error {
 	task, err := s.GetTask(id)
 	if err != nil {
 		return err
 	}
-	if sandboxID != "" {
-		task.SandboxID = sandboxID
+	if b.SandboxID != "" {
+		task.SandboxID = b.SandboxID
 	}
-	if sessionID != "" {
-		task.AgentSessionID = sessionID
+	if b.MachineID != "" {
+		task.MachineID = b.MachineID
+	}
+	if b.SessionID != "" {
+		task.AgentSessionID = b.SessionID
+	}
+	if b.RemoteWorkspaceID != "" {
+		task.RemoteWorkspaceID = b.RemoteWorkspaceID
+	}
+	if b.RemotePaneID != "" {
+		task.RemotePaneID = b.RemotePaneID
 	}
 	task.UpdatedAt = time.Now().UTC()
-	res, err := s.db.Exec(`UPDATE tasks SET sandbox_id = ?, agent_session_id = ?,
+	res, err := s.db.Exec(`UPDATE tasks SET sandbox_id = ?, machine_id = ?,
+		agent_session_id = ?, remote_workspace_id = ?, remote_pane_id = ?,
 		updated_at = ? WHERE id = ?`,
-		task.SandboxID, task.AgentSessionID, formatTime(task.UpdatedAt), id)
+		task.SandboxID, task.MachineID, task.AgentSessionID,
+		task.RemoteWorkspaceID, task.RemotePaneID,
+		formatTime(task.UpdatedAt), id)
 	if err != nil {
 		return fmt.Errorf("storage: set binding: %w", err)
 	}
@@ -1206,7 +1238,8 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 
 // taskColumns lists the tasks columns in scanTask order.
 const taskColumns = `SELECT id, source_provider, source_ref, goal, status, repository,
-	agent_profile, branch_name, agent_session_id, sandbox_id, agent_state, priority, started_at, attempt, created_at, updated_at FROM tasks`
+	agent_profile, branch_name, agent_session_id, sandbox_id, machine_id,
+	remote_workspace_id, remote_pane_id, agent_state, priority, started_at, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -1220,7 +1253,8 @@ func scanTask(row rowScanner) (tasks.Task, error) {
 	var status, startedAt, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
 		&task.Goal, &status, &task.Repository, &task.AgentProfile, &task.BranchName,
-		&task.AgentSessionID, &task.SandboxID, &task.AgentState,
+		&task.AgentSessionID, &task.SandboxID, &task.MachineID,
+		&task.RemoteWorkspaceID, &task.RemotePaneID, &task.AgentState,
 		&task.Priority, &startedAt, &task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
 	}

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/tmih06/herder/internal/agent"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 )
@@ -46,6 +47,12 @@ func (r *Recorder) DockerRun(ctx context.Context, name string, args ...string) (
 func (r *Recorder) HerdrRun(ctx context.Context, name string, args ...string) (agent.RunResult, error) {
 	out, err := r.Run(ctx, name, args...)
 	return agent.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
+}
+
+// MachineRun adapts the script to the machine.Runner seam.
+func (r *Recorder) MachineRun(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
+	out, err := r.Run(ctx, name, args...)
+	return machine.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
 }
 
 // Calls returns a copy of the recorded argv log so tests can assert
@@ -104,13 +111,6 @@ func OpenStore(t *testing.T) *storage.Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
-}
-
-// FakeLookPath resolves every binary to a fixed nonexistent path so a
-// Launcher's shim step never needs a real docker install — CI runners
-// without docker (macOS) exercise the same launch path.
-func FakeLookPath(name string) (string, error) {
-	return "/nonexistent/" + name, nil
 }
 
 // EventTypes lists a task's recorded event types in order.

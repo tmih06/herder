@@ -58,6 +58,8 @@ esac
 `
 	herdr := `#!/bin/sh
 echo "herdr $@" >> "$STATE/calls"
+# Worker calls arrive forwarded as herdr --machine <task-id> <verb>.
+if [ "$1" = "--machine" ]; then shift 2; fi
 case "$1 $2" in
 "agent get")
   [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
@@ -66,13 +68,18 @@ case "$1 $2" in
 "pane process-info")
   sess=${4#w9:p-}
   if [ -f "$STATE/started-$sess" ]; then
-    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"codex\"}]}}}"
+    echo '{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":4000}}}'
   else
-    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"fish\"}]}}}"
+    echo '{"result":{"process_info":{"foreground_process_group_id":4000,"shell_pid":4000}}}'
   fi
   ;;
 "agent prompt")
   printf '%s' "$4" >> "$STATE/prompt-$3"
+  ;;
+"agent read")
+  [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
+  text=$(cat "$STATE/read-$3" 2>/dev/null || true); [ -z "$text" ] && text="agent output tail"
+  printf '%s\n' "$text"
   ;;
 *) exit 0 ;;
 esac
