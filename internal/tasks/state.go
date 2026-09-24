@@ -136,23 +136,29 @@ var allowed = map[State][]State{
 
 // Task is the in-memory form of one row in tasks. Goal carries the issue
 // goal text seeded into the agent prompt. AgentSessionID names the
-// live Herdr agent session (empty until the agent launches) and SandboxID
-// names the worker container; together they are the durable
-// task <-> sandbox <-> session link from SPEC section 18. AgentState is
-// the normalized Herdr-reported worker condition (empty until the
+// live Herdr agent session on the worker's machine (empty until the
+// agent launches) and SandboxID names the worker container; MachineID
+// is the saved herdr SSH profile driving that container, and
+// RemoteWorkspaceID/RemotePaneID name the workspace and pane the agent
+// occupies on the container-local herdr server — together they are the
+// durable task ↔ sandbox ↔ machine ↔ session link (issue #19). AgentState
+// is the normalized Herdr-reported worker condition (empty until the
 // supervision loop observes the session).
 type Task struct {
-	ID             string
-	SourceProvider string
-	SourceRef      string
-	Goal           string
-	Status         State
-	Repository     string
-	AgentProfile   string
-	BranchName     string
-	AgentSessionID string
-	SandboxID      string
-	AgentState     string
+	ID                string
+	SourceProvider    string
+	SourceRef         string
+	Goal              string
+	Status            State
+	Repository        string
+	AgentProfile      string
+	BranchName        string
+	AgentSessionID    string
+	SandboxID         string
+	MachineID         string
+	RemoteWorkspaceID string
+	RemotePaneID      string
+	AgentState        string
 	// Priority orders the dispatch queue: higher runs first, ties break on
 	// CreatedAt (FIFO-plus-priority, SPEC section 15).
 	Priority int

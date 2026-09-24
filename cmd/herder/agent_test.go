@@ -14,15 +14,21 @@ import (
 
 // writeFakeBins installs fake `herdr` and `docker` CLIs on PATH for agent
 // launch and intervention tests. The herdr fake records calls and scripts
-// the 0.9.x launch flow: `workspace create` mints a pane id, `pane run`
-// marks the pane detected with the shim's kind, `agent get` answers for
-// detected panes and named sessions with JSON whose status comes from
+// the forwarded launch flow (issue #19): every worker call arrives as
+// `herdr --machine <task-id> <verb>`, which the script strips before
+// dispatch. `workspace create` mints a pane/workspace pair, `workspace
+// list`/`workspace close` track the live set, `pane run` marks the pane
+// detected with the agent kind, `agent get` answers for detected panes
+// and named sessions with JSON whose status comes from
 // STATE/status-<session> (default "working"), `agent rename` binds the
-// session name to the pane, `agent prompt` records the seed, `agent read`
-// serves STATE/read-<session> as raw text, `pane close` kills the pane and
-// its named session, and `notification show` logs; it re-reads
-// STATE/herdrmode on every call so setHerdrMode can arm "send-fails" or
-// "start-fails" mid-test.
+// session name to the pane (and honors --clear), `agent prompt` records
+// the seed, `agent read` serves STATE/read-<session> as raw text, `pane
+// process-info` reports a foreground pgid distinct from the shell pid
+// only while the pane's agent is live, `pane close` kills the pane, its
+// named session, and its workspace, `status server` answers running, the
+// `machine` verbs track saved profiles, and `notification show` logs; it
+// re-reads STATE/herdrmode on every call so setHerdrMode can arm
+// "send-fails" or "start-fails" mid-test.
 // dockerMode selects the inspect outcome ("ready", "stopped", or
 // "missing"); the fake tracks STATE/docker-status so pause/unpause/start
 // move the container between running, paused, and stopped.
@@ -36,31 +42,55 @@ func writeFakeBins(t *testing.T, dockerMode string) string {
 	herdr := `#!/bin/sh
 echo "$@" >> "$STATE/calls"
 mode=$(cat "$STATE/herdrmode" 2>/dev/null)
+# Worker calls arrive forwarded as herdr --machine <task-id> <verb>;
+# host-side calls (notification show, machine *) carry no prefix.
+if [ "$1" = "--machine" ]; then shift 2; fi
 case "$1 $2" in
 "workspace create")
   [ "$mode" = "start-fails" ] && { echo "start refused" >&2; exit 1; }
   n=$(cat "$STATE/paneseq" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$STATE/paneseq"
-  pane="w9:p$n"
-  echo "{\"result\":{\"root_pane\":{\"pane_id\":\"$pane\"},\"workspace\":{\"workspace_id\":\"w9\"}}}"
+  pane="w$n:p$n"; ws="w$n"; label=""
+  while [ $# -gt 0 ]; do [ "$1" = "--label" ] && label=$2; shift; done
+  [ -n "$label" ] && echo "$ws $label" >> "$STATE/wslist"
+  echo "$ws" > "$STATE/wsof-$pane"
+  echo "{\"result\":{\"root_pane\":{\"pane_id\":\"$pane\"},\"workspace\":{\"workspace_id\":\"$ws\"}}}"
+  ;;
+"workspace list")
+  printf '['; first=1
+  if [ -f "$STATE/wslist" ]; then
+    while read -r wid lab; do
+      [ $first -eq 0 ] && printf ','; first=0
+      printf '{"workspace_id":"%s","label":"%s"}' "$wid" "$lab"
+    done < "$STATE/wslist"
+  fi
+  printf ']\n'
+  ;;
+"workspace close")
+  [ -f "$STATE/wslist" ] && grep -v "^$3 " "$STATE/wslist" > "$STATE/wslist.tmp"; [ -f "$STATE/wslist.tmp" ] && mv "$STATE/wslist.tmp" "$STATE/wslist"
   ;;
 "pane run")
-  pane=$3; shim=$(basename "$4")
-  touch "$STATE/detected-$pane"; echo "$shim" > "$STATE/kindof-$pane"
+  pane=$3; cmd=$4
+  touch "$STATE/detected-$pane"; echo "$cmd" > "$STATE/kindof-$pane"
   ;;
 "agent get")
   target=$3
   if [ -f "$STATE/detected-$target" ]; then
     kind=$(cat "$STATE/kindof-$target" 2>/dev/null); st=idle
-    echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$target\",\"workspace_id\":\"w9\"}}}"
+    ws=$(cat "$STATE/wsof-$target" 2>/dev/null || echo w1)
+    echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$target\",\"workspace_id\":\"$ws\"}}}"
     exit 0
   fi
   [ -f "$STATE/started-$target" ] || { echo "agent_not_found" >&2; exit 1; }
-  pane=$(cat "$STATE/paneof-$target" 2>/dev/null || echo "w9:p-$target")
+  pane=$(cat "$STATE/paneof-$target" 2>/dev/null || echo "w1:p-$target")
   kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
+  ws=$(cat "$STATE/wsof-$pane" 2>/dev/null || echo w1)
   st=$(cat "$STATE/status-$target" 2>/dev/null || true); [ -z "$st" ] && st=working
-  echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$pane\",\"workspace_id\":\"w9\"}}}"
+  echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$pane\",\"workspace_id\":\"$ws\"}}}"
   ;;
 "agent rename")
+  if [ "$4" = "--clear" ]; then
+    rm -f "$STATE/started-$3" "$STATE/paneof-$3"; exit 0
+  fi
   pane=$3; name=$4
   [ -f "$STATE/detected-$pane" ] || { echo "agent_not_found" >&2; exit 1; }
   touch "$STATE/started-$name"; echo "$pane" > "$STATE/paneof-$name"
@@ -77,24 +107,21 @@ case "$1 $2" in
   ;;
 "pane process-info")
   pane=$4
+  live=0
   if [ -f "$STATE/detected-$pane" ]; then
-    kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
-    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"$kind\"}]}}}"
-    exit 0
-  fi
-  for f in "$STATE"/paneof-*; do
-    [ -f "$f" ] || continue
-    if [ "$(cat "$f")" = "$pane" ]; then
-      kind=$(cat "$STATE/kindof-$pane" 2>/dev/null || echo codex)
-      echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"$kind\"}]}}}"
-      exit 0
-    fi
-  done
-  sess=${pane#w9:p-}
-  if [ -f "$STATE/started-$sess" ]; then
-    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"codex\"}]}}}"
+    live=1
   else
-    echo "{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"fish\"}]}}}"
+    for f in "$STATE"/paneof-*; do
+      [ -f "$f" ] || continue
+      if [ "$(cat "$f")" = "$pane" ] && [ -f "$STATE/started-${f##*/paneof-}" ]; then live=1; fi
+    done
+    sess=${pane#w*:p-}
+    [ -f "$STATE/started-$sess" ] && live=1
+  fi
+  if [ "$live" = "1" ]; then
+    echo '{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":4000}}}'
+  else
+    echo '{"result":{"process_info":{"foreground_process_group_id":4000,"shell_pid":4000}}}'
   fi
   ;;
 "pane close")
@@ -104,7 +131,34 @@ case "$1 $2" in
     [ -f "$f" ] || continue
     [ "$(cat "$f")" = "$pane" ] && rm -f "$STATE/started-${f##*/paneof-}"
   done
-  sess=${pane#w9:p-}; rm -f "$STATE/started-$sess"
+  sess=${pane#w*:p-}; rm -f "$STATE/started-$sess"
+  ws=$(cat "$STATE/wsof-$pane" 2>/dev/null)
+  if [ -n "$ws" ] && [ -f "$STATE/wslist" ]; then
+    grep -v "^$ws " "$STATE/wslist" > "$STATE/wslist.tmp"; mv "$STATE/wslist.tmp" "$STATE/wslist"
+  fi
+  rm -f "$STATE/wsof-$pane"
+  ;;
+"status server")
+  echo "running"
+  ;;
+"machine list")
+  printf '['; first=1
+  if [ -f "$STATE/machines" ]; then
+    while read -r mid mlab mtgt; do
+      [ $first -eq 0 ] && printf ','; first=0
+      printf '{"id":"%s","label":"%s","target":"%s","enabled":true}' "$mid" "$mlab" "$mtgt"
+    done < "$STATE/machines"
+  fi
+  printf ']\n'
+  ;;
+"machine add")
+  target=$3; label=""
+  while [ $# -gt 0 ]; do [ "$1" = "--label" ] && label=$2; shift; done
+  mid=$(printf '%s' "$label" | tr -cd 'a-zA-Z0-9_-')
+  echo "m-$mid $label $target" >> "$STATE/machines"
+  ;;
+"machine remove")
+  [ -f "$STATE/machines" ] && grep -v "^$3 " "$STATE/machines" > "$STATE/machines.tmp"; [ -f "$STATE/machines.tmp" ] && mv "$STATE/machines.tmp" "$STATE/machines"
   ;;
 "notification show")
   echo "$3 ${4:-} ${5:-}" >> "$STATE/notifications"
@@ -203,7 +257,9 @@ func bindSession(t *testing.T, cfgPath, state, id string, live bool) {
 	}
 	defer store.Close()
 	session := agent.SessionName(id)
-	if err := store.SetBinding(id, sandbox.ContainerName(id), session); err != nil {
+	if err := store.SetBinding(id, storage.Binding{
+		SandboxID: sandbox.ContainerName(id), SessionID: session,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if live {
@@ -611,9 +667,10 @@ func TestTaskAttachNeedsSession(t *testing.T) {
 	}
 }
 
-// TestTaskAttachTargetsSession proves attach resolves the task to its live
-// Herdr session instead of replaying logs.
-func TestTaskAttachTargetsSession(t *testing.T) {
+// TestTaskAttachTargetsRemote proves attach opens the worker's remote
+// Herdr UI over the task's SSH target — the container name — instead of
+// replaying logs.
+func TestTaskAttachTargetsRemote(t *testing.T) {
 	writeFakeBins(t, "ready")
 	path := writeTestConfig(t)
 	id := queueTask(t, path)
@@ -627,8 +684,8 @@ func TestTaskAttachTargetsSession(t *testing.T) {
 	if code, _, errOut := runCmd(t, "--config", path, "task", "attach", id); code != 0 {
 		t.Fatalf("attach exit = %d (%s)", code, errOut)
 	}
-	joined := strings.Join(got, " ")
-	if !strings.Contains(joined, "agent attach herder-"+id) {
-		t.Errorf("attach should target the live session, got %q", joined)
+	want := agent.AttachArgv(sandbox.ContainerName(id))
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("attach argv = %v, want %v", got, want)
 	}
 }

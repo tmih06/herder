@@ -31,7 +31,13 @@ func TestSetBindingRoundTrip(t *testing.T) {
 		t.Fatalf("new task should carry the issue goal, got %+v", task)
 	}
 
-	if err := store.SetBinding(task.ID, "herder-task_abc", "herder-task_abc"); err != nil {
+	if err := store.SetBinding(task.ID, Binding{
+		SandboxID:         "herder-task_abc",
+		MachineID:         "task_abc",
+		SessionID:         "herder-task_abc",
+		RemoteWorkspaceID: "ws-abc",
+		RemotePaneID:      "pane-abc",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetTask(task.ID)
@@ -42,11 +48,15 @@ func TestSetBindingRoundTrip(t *testing.T) {
 		t.Errorf("binding = sandbox %q session %q, want both herder-task_abc",
 			got.SandboxID, got.AgentSessionID)
 	}
+	if got.MachineID != "task_abc" || got.RemoteWorkspaceID != "ws-abc" || got.RemotePaneID != "pane-abc" {
+		t.Errorf("remote binding = machine %q workspace %q pane %q, want task_abc/ws-abc/pane-abc",
+			got.MachineID, got.RemoteWorkspaceID, got.RemotePaneID)
+	}
 	if got.Goal != "Fix the flaky login retry" {
 		t.Errorf("goal = %q, want the issue goal to round-trip", got.Goal)
 	}
 
-	if err := store.SetBinding(task.ID, "", "herder-task_xyz"); err != nil {
+	if err := store.SetBinding(task.ID, Binding{SessionID: "herder-task_xyz"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err = store.GetTask(task.ID)
@@ -56,11 +66,14 @@ func TestSetBindingRoundTrip(t *testing.T) {
 	if got.SandboxID != "herder-task_abc" {
 		t.Errorf("empty sandbox must leave the stored value, got %q", got.SandboxID)
 	}
+	if got.MachineID != "task_abc" || got.RemoteWorkspaceID != "ws-abc" || got.RemotePaneID != "pane-abc" {
+		t.Errorf("empty remote fields must leave the stored values, got %+v", got)
+	}
 	if got.AgentSessionID != "herder-task_xyz" {
 		t.Errorf("session = %q, want herder-task_xyz", got.AgentSessionID)
 	}
 
-	if err := store.SetBinding("task_missing", "sbx", "sess"); err == nil {
+	if err := store.SetBinding("task_missing", Binding{SandboxID: "sbx", SessionID: "sess"}); err == nil {
 		t.Error("binding an unknown task should fail")
 	}
 }
@@ -82,7 +95,7 @@ func TestClearSessionBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBinding(task.ID, "sbx-1", "sess-1"); err != nil {
+	if err := store.SetBinding(task.ID, Binding{SandboxID: "sbx-1", SessionID: "sess-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ClearSessionBinding(task.ID); err != nil {
@@ -122,7 +135,7 @@ func TestBindingSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBinding(task.ID, "sbx-1", "sess-1"); err != nil {
+	if err := store.SetBinding(task.ID, Binding{SandboxID: "sbx-1", SessionID: "sess-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -192,7 +205,7 @@ func TestLegacyDBMigration(t *testing.T) {
 	if got.Priority != 0 || !got.StartedAt.IsZero() {
 		t.Errorf("legacy task scheduler fields should read zero, got %+v", got)
 	}
-	if err := store.SetBinding("task_legacy", "sbx-9", "sess-9"); err != nil {
+	if err := store.SetBinding("task_legacy", Binding{SandboxID: "sbx-9", SessionID: "sess-9"}); err != nil {
 		t.Fatalf("migrated db should accept bindings: %v", err)
 	}
 	created, err := store.CreateTask(CreateInput{

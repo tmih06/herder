@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/textutil"
 )
 
@@ -59,13 +60,22 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 }
 
 // DockerProvider provisions least-privilege worker containers through the
-// Docker CLI (SPEC section 24).
+// Docker CLI (SPEC section 24). StateDir roots the controller's SSH
+// assets (<statedir>/ssh); when set, Provision also wires the container
+// as a saved herdr SSH machine (issue #19). Machines is the injectable
+// herdr-machine registry; nil defaults to the real CLI through Runner.
 type DockerProvider struct {
 	// Runner executes subprocesses; DefaultRunner in production.
 	Runner Runner
 	// Log receives no-op notes (stop/destroy of unknown sandboxes).
 	// Defaults to discard.
 	Log func(format string, args ...any)
+	// StateDir roots the controller's SSH assets (<statedir>/ssh); empty
+	// disables SSH/machine wiring for bare-provider use.
+	StateDir string
+	// Machines registers workers as saved herdr SSH machines; nil
+	// defaults to a registry on Runner.
+	Machines *machine.Registry
 }
 
 // NewDockerProvider builds a DockerProvider on the real CLIs.
@@ -152,11 +162,207 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 			return nil, fmt.Errorf("sandbox: start %s: %s", name, textutil.FirstLine(out.Stderr))
 		}
 	}
-	return &Sandbox{
+	// The entrypoint is `herdr server`: an image without herdr exits
+	// immediately, and every later step (ssh injection, machine add)
+	// would fail against a dead container with a misleading error.
+	// Surface the real cause now — the logs name the missing binary.
+	if p.StateDir != "" {
+		if now, err := p.containerState(ctx, name); err != nil {
+			return nil, err
+		} else if now != "running" {
+			logs := ""
+			if out, err := p.run(ctx, "docker", "logs", "--tail", "5", name); err == nil {
+				logs = textutil.FirstLine(out.Stdout + out.Stderr)
+			}
+			return nil, fmt.Errorf("sandbox: %s exited at start (%s); the worker image must ship herdr and openssh-server (see docs/setup.md)",
+				name, orDefault(logs, "no logs"))
+		}
+	}
+	sb := &Sandbox{
 		ID: name, TaskID: spec.TaskID, Image: imageOf(spec),
 		Status: "running", Branch: spec.Branch, Workspace: workspace,
 		BaseSHA: baseSHA,
-	}, nil
+	}
+	// The container-local herdr server is the worker's control surface:
+	// wire SSH access and register the machine so `herdr --machine
+	// <task>` drives it. Skipped only when no state dir is configured —
+	// a bare provider used outside the controller.
+	if p.StateDir != "" {
+		if err := p.ensureSSH(ctx, spec.TaskID, name); err != nil {
+			return nil, err
+		}
+		m, err := p.MachineRegistry().Ensure(ctx, spec.TaskID, name)
+		if err != nil {
+			return nil, err
+		}
+		sb.MachineID = m.ID
+	}
+	return sb, nil
+}
+
+// remoteReadyTimeout bounds the wait for the container-local herdr
+// server to open its socket after the container starts.
+const remoteReadyTimeout = 30 * time.Second
+
+// MachineRegistry resolves the injectable registry default, adapting the
+// provider's Runner seam to the machine package's result type.
+func (p *DockerProvider) MachineRegistry() *machine.Registry {
+	if p.Machines != nil {
+		return p.Machines
+	}
+	return &machine.Registry{Runner: func(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
+		out, err := p.run(ctx, name, args...)
+		return machine.RunResult{Stdout: out.Stdout, Stderr: out.Stderr, ExitCode: out.ExitCode}, err
+	}}
+}
+
+// ensureSSH converges the worker's SSH access (issue #19): the
+// controller keypair and per-task host key exist under <statedir>/ssh,
+// the Host block is written and included from ~/.ssh/config, the
+// container has a passwd entry for the worker uid (sshd needs a named
+// login), and authorized_keys plus the host key are injected. Every step
+// is idempotent so a re-provision converges instead of duplicating.
+// The in-container herdr server is polled ready before returning so the
+// caller's `machine add` never races a half-started server.
+func (p *DockerProvider) ensureSSH(ctx context.Context, taskID, container string) error {
+	a := SSHAssets{StateDir: p.StateDir, Container: container}
+	if err := os.MkdirAll(a.SSHDir(), 0o700); err != nil {
+		return fmt.Errorf("sandbox: create ssh dir: %w", err)
+	}
+	for _, key := range []string{a.IdentityFile(), a.HostKeyFile()} {
+		if _, err := os.Stat(key); err == nil {
+			continue
+		}
+		out, err := p.run(ctx, "ssh-keygen", KeygenArgv(key)...)
+		if err != nil {
+			return err
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("sandbox: ssh-keygen %s: %s", key, textutil.FirstLine(out.Stderr))
+		}
+	}
+	if err := a.WriteConfig(); err != nil {
+		return err
+	}
+	if err := a.EnsureSSHInclude(); err != nil {
+		return err
+	}
+	// sshd authenticates a named login, so the container uid needs a
+	// passwd entry. uid 0 appends it (root can write root-owned files
+	// even with every capability dropped); a pre-existing entry with a
+	// different uid would break the same-uid sshd -i path, so it is a
+	// hard error, not a silent skip.
+	uid, gid := os.Getuid(), os.Getgid()
+	passwdScript := fmt.Sprintf(
+		`grep -q '^%s:' /etc/passwd || echo '%s:*:%d:%d::%s:/bin/sh' >> /etc/passwd; grep '^%s:' /etc/passwd`,
+		SSHUser, SSHUser, uid, gid, ContainerHome, SSHUser)
+	out, err := p.run(ctx, "docker", "exec", "-u", "0", container, "sh", "-c", passwdScript)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("sandbox: provision ssh user in %s: %s", container, textutil.FirstLine(out.Stderr))
+	}
+	entry := strings.TrimSpace(out.Stdout)
+	parts := strings.Split(entry, ":")
+	if len(parts) < 4 || parts[2] != strconv.Itoa(uid) {
+		return fmt.Errorf("sandbox: container %s already has a %s user with a different uid (%s); cannot run sshd as the worker uid",
+			container, SSHUser, entry)
+	}
+	// Key injection: docker cp preserves the source file's owner and
+	// mode, so the worker uid owns both files and the host key stays
+	// 0600 — no chown needed (CAP_CHOWN is dropped).
+	if out, err := p.run(ctx, "docker", "exec", container, "mkdir", "-p", ContainerSSHDir); err != nil {
+		return err
+	} else if out.ExitCode != 0 {
+		return fmt.Errorf("sandbox: create %s in %s: %s", ContainerSSHDir, container, textutil.FirstLine(out.Stderr))
+	}
+	for _, copy := range [][2]string{
+		{a.PublicKeyFile(), container + ":" + ContainerAuthorizedKeys},
+		{a.HostKeyFile(), container + ":" + ContainerHostKeyPath},
+	} {
+		out, err := p.run(ctx, "docker", "cp", copy[0], copy[1])
+		if err != nil {
+			return err
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("sandbox: inject %s into %s: %s", copy[0], container, textutil.FirstLine(out.Stderr))
+		}
+	}
+	return p.waitRemoteReady(ctx, container)
+}
+
+// create builds the least-privilege container (SPEC section 24): an
+// unprivileged uid matching the workspace owner (cap-drop removes even
+// root's DAC override, so the worker must own its files), dropped
+// capabilities, no-new-privileges, CPU/memory/process caps, bridge
+// networking, and exactly one host mount (the task workspace). Host
+// namespaces, the Docker and host Herdr sockets, and host home
+// directories are never mounted or shared: every mount below names only
+// the workspace. No port is published — SSH reaches the container
+// through `docker exec` (issue #19).
+// The entrypoint is the container-local herdr server itself: PID 1 is a
+// session leader, which is exactly what herdr's saved-machine check
+// requires (detached_server_daemon), and a dead server exits the
+// container so reconcile sees a dead worker instead of a live shell.
+// HOME points at the container-local home the provisioner creates.
+func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace string) error {
+	args := []string{
+		"create",
+		"--name", name,
+		"--hostname", name,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"--cpus", cpusOf(spec),
+		"--memory", memoryOf(spec),
+		"--pids-limit", strconv.Itoa(pidsOf(spec)),
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges:true",
+		"--network", "bridge",
+		"--workdir", ContainerWorkspace,
+		"--volume", workspace + ":" + ContainerWorkspace + ":rw",
+		"--env", "HERDER_TASK=" + spec.TaskID,
+		"--env", "HOME=" + ContainerHome,
+		"--label", "herder-task=" + spec.TaskID,
+		"--label", "herder-managed=true",
+		imageOf(spec),
+		"sh", "-c", "mkdir -p \"$HOME/.ssh\" && exec herdr server",
+	}
+	out, err := p.run(ctx, "docker", args...)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("sandbox: create %s: %s", name, textutil.FirstLine(out.Stderr))
+	}
+	return nil
+}
+
+// waitRemoteReady polls the container-local herdr server until its
+// socket answers: the entrypoint starts it at container start, and
+// `machine add` must not race a server that has not opened its socket
+// yet (the add would spawn a duplicate daemon). Bounded by
+// remoteReadyTimeout; the last probe error is returned on expiry.
+func (p *DockerProvider) waitRemoteReady(ctx context.Context, container string) error {
+	ctx, cancel := context.WithTimeout(ctx, remoteReadyTimeout)
+	defer cancel()
+	probe := []string{"exec", "-e", "HOME=" + ContainerHome, container, "herdr", "status", "server"}
+	var last string
+	for {
+		out, err := p.run(ctx, "docker", probe...)
+		if err == nil && out.ExitCode == 0 && strings.Contains(out.Stdout, "status: running") {
+			return nil
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = textutil.FirstLine(out.Stderr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("sandbox: herdr server in %s not ready: %s (the worker image must ship herdr and openssh-server — see docs/setup.md)", container, last)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // ensureRepo leaves an independent checkout in workspace: existing repos
@@ -221,43 +427,6 @@ func (p *DockerProvider) containerState(ctx context.Context, name string) (strin
 		return "", fmt.Errorf("sandbox: inspect %s: %s", name, textutil.FirstLine(out.Stderr))
 	}
 	return strings.TrimSpace(out.Stdout), nil
-}
-
-// create builds the least-privilege container (SPEC section 24): an
-// unprivileged uid matching the workspace owner (cap-drop removes even
-// root's DAC override, so the worker must own its files), dropped
-// capabilities, no-new-privileges, CPU/memory/process caps, bridge
-// networking, and exactly one host mount (the task workspace). Host
-// namespaces, the Docker and Herdr sockets, and host home directories are
-// never mounted or shared: every mount below names only the workspace.
-func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace string) error {
-	args := []string{
-		"create",
-		"--name", name,
-		"--hostname", name,
-		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		"--cpus", cpusOf(spec),
-		"--memory", memoryOf(spec),
-		"--pids-limit", strconv.Itoa(pidsOf(spec)),
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges:true",
-		"--network", "bridge",
-		"--workdir", "/workspace",
-		"--volume", workspace + ":/workspace:rw",
-		"--env", "HERDER_TASK=" + spec.TaskID,
-		"--label", "herder-task=" + spec.TaskID,
-		"--label", "herder-managed=true",
-		imageOf(spec),
-		"sleep", "infinity",
-	}
-	out, err := p.run(ctx, "docker", args...)
-	if err != nil {
-		return err
-	}
-	if out.ExitCode != 0 {
-		return fmt.Errorf("sandbox: create %s: %s", name, textutil.FirstLine(out.Stderr))
-	}
-	return nil
 }
 
 // Exec runs cmd inside the sandbox and returns output plus exit status.
@@ -455,8 +624,12 @@ func (p *DockerProvider) EnsureRunning(ctx context.Context, id string) error {
 	return nil
 }
 
-// Destroy removes the container; an unknown or already-removed sandbox
-// is a logged no-op rather than an error cascade.
+// Destroy removes the container and its control-plane residue: the saved
+// herdr machine profile (a destroyed worker must not accumulate dead
+// sidebar machines) and the per-task SSH config/known_hosts/host key.
+// An unknown or already-removed sandbox is a logged no-op rather than
+// an error cascade; machine and file cleanup are best-effort so a dead
+// herdr never blocks container removal.
 func (p *DockerProvider) Destroy(ctx context.Context, id string) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("sandbox: destroy needs a sandbox id")
@@ -470,18 +643,32 @@ func (p *DockerProvider) Destroy(ctx context.Context, id string) error {
 	}
 	if state == "" {
 		p.logf("herder: sandbox %s already removed (destroy no-op)", id)
-		return nil
-	}
-	out, err := p.run(ctx, "docker", "rm", "-f", id)
-	if err != nil {
-		return err
-	}
-	if out.ExitCode != 0 {
-		if isNoSuch(out.Stderr) {
-			p.logf("herder: sandbox %s already removed (destroy no-op)", id)
-			return nil
+	} else {
+		out, err := p.run(ctx, "docker", "rm", "-f", id)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("sandbox: destroy %s: %s", id, textutil.FirstLine(out.Stderr))
+		if out.ExitCode != 0 {
+			if isNoSuch(out.Stderr) {
+				p.logf("herder: sandbox %s already removed (destroy no-op)", id)
+			} else {
+				return fmt.Errorf("sandbox: destroy %s: %s", id, textutil.FirstLine(out.Stderr))
+			}
+		}
+	}
+	// The machine profile keys on the SSH target, which is the container
+	// name — removal works even when the task id is unknown here. Gated
+	// on StateDir like Provision: a bare provider never registered a
+	// machine, and an ungated sweep could match profiles it did not
+	// create.
+	if p.StateDir != "" {
+		if err := p.MachineRegistry().Remove(ctx, "", id); err != nil {
+			p.logf("herder: remove machine profile for %s: %v", id, err)
+		}
+		a := SSHAssets{StateDir: p.StateDir, Container: id}
+		if err := a.RemoveConfig(); err != nil {
+			p.logf("herder: remove ssh config for %s: %v", id, err)
+		}
 	}
 	return nil
 }

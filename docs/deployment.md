@@ -15,8 +15,8 @@ go build -o herder ./cmd/herder
 ```
 
 Requirements on the host: `herdr` (with its server running), `docker`
-(with the daemon up), the coding agents you configured, and `gh auth
-login` for delivery.
+(with the daemon up), `ssh` (workers are herdr SSH machines), the
+coding agents you configured, and `gh auth login` for delivery.
 
 ### systemd unit
 
@@ -39,8 +39,9 @@ WantedBy=multi-user.target
 ```
 
 Run the service as the same user that owns the Herdr session and the
-state directory — the daemon shells out to `herdr` and `docker` as that
-user.
+state directory — the daemon shells out to `herdr`, `docker`, and `ssh`
+as that user, and `~/.ssh/config` must be writable for the managed
+Include line.
 
 ## Container (controller)
 
@@ -56,21 +57,33 @@ docker compose -f examples/docker-compose.yaml up
 
 The controller container is the ONLY component granted the Docker socket
 and the Herdr socket: it needs Docker to provision sandboxes and Herdr
-to place agents in host-visible panes. Worker containers are created by
-the controller with `--cap-drop ALL`, `no-new-privileges`, resource caps,
-and exactly one mount — the task workspace. Workers NEVER receive the
-Docker socket, the Herdr socket, `GH_TOKEN`, the GitHub App key, or the
-Herder database; mounting the controller's sockets or credentials into a
-worker collapses the sandbox boundary and gives agent-controlled code
-host-level control. The controller's socket access is itself the
-privilege boundary: treat the controller container as host-equivalent.
+to drive worker machines. Worker containers are created by the
+controller with `--cap-drop ALL`, `no-new-privileges`, resource caps,
+and exactly one mount — the task workspace. Each worker runs its own
+container-local `herdr server` reached over SSH through `docker exec` +
+`sshd -i` (issue #19): no published port, no socket mount, and the only
+credential is the controller's SSH keypair under `<statedir>/ssh/`.
+Workers NEVER receive the Docker socket, the host Herdr socket,
+`GH_TOKEN`, the GitHub App key, or the Herder database; mounting the
+controller's sockets or credentials into a worker collapses the sandbox
+boundary and gives agent-controlled code host-level control. The
+controller's socket access is itself the privilege boundary: treat the
+controller container as host-equivalent.
 
 ### Host Herdr server required
 
-The container does not run Herdr. It is a socket client of the host's
-Herdr server, reached through a bind-mounted `HERDR_SOCKET_PATH`. Start
-`herdr` on the host first; the compose file mounts the socket into the
-controller.
+The container does not run the host Herdr. It is a CLI client of the
+host's Herdr server (notifications, machine registry) and reaches each
+worker's own server over SSH. Start `herdr` on the host first; the
+compose file mounts the socket into the controller.
+
+### SSH inside the controller container
+
+Worker machines are SSH targets: the controller image needs an `ssh`
+client, and `HOME` must be writable so the managed `Include` line lands
+in `~/.ssh/config`. The per-task Host blocks live under
+`<statedir>/ssh/config.d/` — bind-mounting the state dir at the
+identical path (below) keeps them valid.
 
 ### PATH PARITY
 

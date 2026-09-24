@@ -87,7 +87,7 @@ func prepareTask(cfg *config.Config, store *storage.Store, args []string,
 	if !ok {
 		return fail(1, "herder: task repository %q not in config\n", task.Repository)
 	}
-	return task, repo, newProvider(ew), -1
+	return task, repo, newProvider(ew, store), -1
 }
 
 // stateNames renders a state list for refusal messages.
@@ -463,7 +463,7 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 ) int {
 	summary := rep.Summary()
 	launcher := &agent.Launcher{}
-	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.AgentSessionID) {
+	if task.AgentSessionID != "" && launcher.IsLive(ctx, task.ID, task.AgentSessionID) {
 		bumped, err := store.IncrementAttempt(task.ID)
 		if err != nil {
 			fmt.Fprintf(ew, "herder: bump attempt: %v\n", err)
@@ -479,7 +479,7 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 		}
 		prompt := fmt.Sprintf("Herder validation failed (attempt %d). Fix the issues below, commit your work, and report done again.\n\n%s",
 			bumped.Attempt, summary)
-		if err := launcher.SendPrompt(ctx, task.AgentSessionID, prompt); err != nil {
+		if err := launcher.SendPrompt(ctx, task.ID, task.AgentSessionID, prompt); err != nil {
 			// The agent is live but unreachable: a human must look.
 			if err := transition(store, task, tasks.WaitingForHuman, ew); err != nil {
 				fmt.Fprintf(ew, "herder: %v\n", err)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
@@ -93,8 +94,9 @@ func emitEvent(store *storage.Store, taskID, eventType string, payload any, ew i
 }
 
 // taskAttach drops the human into the real running agent behind the task.
-// Purpose: glass-box attach (SPEC section 21) — resolve the durable session
-// link and hand stdio to Herdr; detaching leaves the agent running.
+// Purpose: glass-box attach (SPEC section 21) — `herdr --remote` opens the
+// full remote UI of the worker's container-local server over the task's
+// SSH target (the container name); detaching leaves the agent running.
 func taskAttach(store *storage.Store, args []string, w, ew io.Writer) int {
 	if len(args) != 1 {
 		fmt.Fprintf(ew, "herder: usage: herder task attach <id>\n")
@@ -110,5 +112,5 @@ func taskAttach(store *storage.Store, args []string, w, ew io.Writer) int {
 			task.ID, task.ID)
 		return 1
 	}
-	return execAttach(agent.AttachArgv(task.AgentSessionID))
+	return execAttach(agent.AttachArgv(sandbox.ContainerName(task.ID)))
 }

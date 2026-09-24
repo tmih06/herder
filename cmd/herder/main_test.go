@@ -197,14 +197,14 @@ func TestTaskCreateUnknownRepo(t *testing.T) {
 	}
 }
 
-// TestDoctorReportsFourSections doctor prints all four sections distinctly on a good setup.
-func TestDoctorReportsFourSections(t *testing.T) {
+// TestDoctorReportsFiveSections doctor prints all five sections distinctly on a good setup.
+func TestDoctorReportsFiveSections(t *testing.T) {
 	path := writeTestConfig(t)
 	code, out, _ := runCmd(t, "--config", path, "doctor")
 	if code != 0 {
 		t.Errorf("doctor exit = %d, want 0 on a good setup", code)
 	}
-	for _, section := range []string{"controller:", "storage:", "herdr:", "docker:"} {
+	for _, section := range []string{"controller:", "storage:", "herdr:", "docker:", "ssh:"} {
 		if !strings.Contains(out, section) {
 			t.Errorf("doctor output should report %q distinctly, got:\n%s", section, out)
 		}

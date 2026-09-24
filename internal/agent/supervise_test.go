@@ -23,9 +23,10 @@ type scriptedHerdr struct {
 
 func (s *scriptedHerdr) run(ctx context.Context, name string, args ...string) (RunResult, error) {
 	s.calls = append(s.calls, strings.Join(args, " "))
-	switch strings.Join(args[:2], " ") {
+	argv := stripMachine(args)
+	switch strings.Join(argv[:2], " ") {
 	case "agent get":
-		session := args[2]
+		session := argv[2]
 		if s.gone[session] {
 			return RunResult{ExitCode: 1, Stderr: "agent_not_found"}, nil
 		}
@@ -40,14 +41,14 @@ func (s *scriptedHerdr) run(ctx context.Context, name string, args ...string) (R
 		// herdr 0.9.x prints the pane tail directly, no JSON envelope.
 		return RunResult{Stdout: s.readText + "\n"}, nil
 	case "pane process-info":
-		// The shim stays foreground while the session lives; a gone
-		// session's pane fell back to its shell.
-		pane := args[3]
+		// The agent stays foreground while the session lives; a dead
+		// agent's pane fell back to its shell (foreground == shell pid).
+		pane := argv[3]
 		sess := strings.TrimPrefix(pane, "w9:p-")
 		if s.gone[sess] {
-			return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"fish"}]}}}`}, nil
+			return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":100,"shell_pid":100}}}`}, nil
 		}
-		return RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+		return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
 	}
 	return RunResult{}, nil
 }
@@ -82,10 +83,15 @@ func runningTask(t *testing.T, store *storage.Store, ref string) tasks.Task {
 		}
 	}
 	session := SessionName(task.ID)
-	if err := store.SetBinding(task.ID, "herder-"+task.ID, session); err != nil {
+	if err := store.SetBinding(task.ID, storage.Binding{
+		SandboxID: "herder-" + task.ID,
+		MachineID: task.ID,
+		SessionID: session,
+	}); err != nil {
 		t.Fatalf("SetBinding = %v", err)
 	}
 	task.AgentSessionID = session
+	task.MachineID = task.ID
 	return task
 }
 
@@ -318,7 +324,7 @@ func TestGetHerdrOutageIsNotGone(t *testing.T) {
 	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (RunResult, error) {
 		return RunResult{ExitCode: 1, Stderr: "dial unix /run/herdr.sock: connect: no such file"}, nil
 	}}
-	_, err := l.Get(context.Background(), "herder-task_x")
+	_, err := l.Get(context.Background(), "task_x", "herder-task_x")
 	if err == nil || errors.Is(err, ErrSessionGone) {
 		t.Fatalf("Herdr outage = %v, want a plain error not ErrSessionGone", err)
 	}
@@ -366,7 +372,7 @@ func TestPollSkipsPausedAndUnbound(t *testing.T) {
 	sup.PollOnce(context.Background())
 
 	for _, call := range fake.calls {
-		if strings.HasPrefix(call, "agent get") {
+		if strings.Contains(call, "agent get") {
 			t.Errorf("paused/unbound tasks must not be polled, ran %q", call)
 		}
 	}
@@ -377,7 +383,7 @@ func TestPollSkipsPausedAndUnbound(t *testing.T) {
 func TestGetParsesAgentInfo(t *testing.T) {
 	fake := &scriptedHerdr{statuses: map[string]string{"herder-task_x": "blocked"}, gone: map[string]bool{}}
 	l := &Launcher{Runner: fake.run}
-	info, err := l.Get(context.Background(), "herder-task_x")
+	info, err := l.Get(context.Background(), "task_x", "herder-task_x")
 	if err != nil {
 		t.Fatalf("Get = %v", err)
 	}
@@ -391,7 +397,7 @@ func TestGetParsesAgentInfo(t *testing.T) {
 func TestGetGoneSession(t *testing.T) {
 	fake := &scriptedHerdr{gone: map[string]bool{"herder-task_x": true}}
 	l := &Launcher{Runner: fake.run}
-	_, err := l.Get(context.Background(), "herder-task_x")
+	_, err := l.Get(context.Background(), "task_x", "herder-task_x")
 	if err == nil || !errors.Is(err, ErrSessionGone) {
 		t.Fatalf("Get on dead session = %v, want ErrSessionGone", err)
 	}
@@ -401,7 +407,7 @@ func TestGetGoneSession(t *testing.T) {
 func TestReadReturnsTail(t *testing.T) {
 	fake := &scriptedHerdr{readText: "line one\nline two"}
 	l := &Launcher{Runner: fake.run}
-	text, err := l.Read(context.Background(), "herder-task_x", 50)
+	text, err := l.Read(context.Background(), "task_x", "herder-task_x", 50)
 	if err != nil {
 		t.Fatalf("Read = %v", err)
 	}
@@ -411,16 +417,17 @@ func TestReadReturnsTail(t *testing.T) {
 }
 
 // TestStopClosesPane proves stop resolves the session's pane and closes
-// it — the agent dies with the pane while the sandbox survives.
+// it on the worker's machine — the remote pane close kills the
+// in-container agent with the pane while the sandbox survives.
 func TestStopClosesPane(t *testing.T) {
 	fake := &scriptedHerdr{gone: map[string]bool{}}
 	l := &Launcher{Runner: fake.run}
-	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
+	if err := l.Stop(context.Background(), "task_x", "herder-task_x"); err != nil {
 		t.Fatalf("Stop = %v", err)
 	}
 	var closed bool
 	for _, call := range fake.calls {
-		if call == "pane close w9:p-herder-task_x" {
+		if strings.Contains(call, "pane close w9:p-herder-task_x") {
 			closed = true
 		}
 	}
@@ -429,44 +436,16 @@ func TestStopClosesPane(t *testing.T) {
 	}
 }
 
-// TestStopKillsContainerAgent proves stop kills the docker exec'd agent
-// inside the container: `pane close` only drops the host exec client and
-// the agent would keep running deaf inside (verified against herdr
-// 0.9.1). The kill is host-side via docker top + kill.
-func TestStopKillsContainerAgent(t *testing.T) {
-	fake := &scriptedHerdr{gone: map[string]bool{}}
-	var calls []string
-	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (RunResult, error) {
-		calls = append(calls, name+" "+strings.Join(args, " "))
-		if name == "docker" && len(args) > 0 && args[0] == "top" {
-			return RunResult{Stdout: "PID   COMMAND   ARGS\n1     sleep     sleep infinity\n4242  sh        /bin/sh /usr/local/bin/codex\n"}, nil
-		}
-		return fake.run(ctx, name, args...)
-	}}
-	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
-		t.Fatalf("Stop = %v", err)
-	}
-	var killed bool
-	for _, call := range calls {
-		if call == "kill -9 4242" {
-			killed = true
-		}
-	}
-	if !killed {
-		t.Errorf("stop must kill the in-container agent pid, calls: %v", calls)
-	}
-}
-
 // TestStopGoneSessionIsNoop proves stopping a dead session is a no-op:
 // the desired end state already holds.
 func TestStopGoneSessionIsNoop(t *testing.T) {
 	fake := &scriptedHerdr{gone: map[string]bool{"herder-task_x": true}}
 	l := &Launcher{Runner: fake.run}
-	if err := l.Stop(context.Background(), "herder-task_x", "herder-task_x"); err != nil {
+	if err := l.Stop(context.Background(), "task_x", "herder-task_x"); err != nil {
 		t.Fatalf("Stop on dead session = %v, want nil", err)
 	}
 	for _, call := range fake.calls {
-		if strings.HasPrefix(call, "pane close") {
+		if strings.Contains(call, "pane close") {
 			t.Errorf("dead session must not reach pane close, ran %q", call)
 		}
 	}

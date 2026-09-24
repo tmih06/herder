@@ -67,12 +67,12 @@ func launchRespond(name string, args []string) (sandbox.RunResult, error) {
 	switch {
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
 		return sandbox.RunResult{Stdout: `[{"Id":"cid","Name":"/herder-x","Config":{"Image":"img"},"State":{"Status":"running"}}]`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "workspace create"):
+	case name == "herdr" && strings.Contains(argv, "workspace create"):
 		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "agent get"):
+	case name == "herdr" && strings.Contains(argv, "agent get"):
 		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+	case name == "herdr" && strings.Contains(argv, "pane process-info"):
+		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
 		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
 	}
@@ -105,12 +105,12 @@ func provisionThenLaunchRespond(name string, args []string) (sandbox.RunResult, 
 		return sandbox.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
 		return sandbox.RunResult{Stdout: `[{"Id":"cid","Name":"/herder-x","Config":{"Image":"img"},"State":{"Status":"running"}}]`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "workspace create"):
+	case name == "herdr" && strings.Contains(argv, "workspace create"):
 		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "agent get"):
+	case name == "herdr" && strings.Contains(argv, "agent get"):
 		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
-	case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+	case name == "herdr" && strings.Contains(argv, "pane process-info"):
+		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
 		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
 	}
@@ -164,7 +164,7 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
@@ -219,7 +219,7 @@ func TestLaunchQueuedLeaseHeld(t *testing.T) {
 	rec := &testutil.Recorder{Respond: launchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	err := d.Launch(context.Background(), testConfig(), &task, "", "")
@@ -297,7 +297,7 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 	rec := &testutil.Recorder{Respond: provisionThenLaunchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 		Engine:   &deliver.Engine{Runner: rec.DockerRun},
 	}
@@ -414,15 +414,15 @@ func TestStopWorkerThawsBeforeStopping(t *testing.T) {
 		switch {
 		case name == "docker" && strings.HasPrefix(argv, "inspect "):
 			return sandbox.RunResult{Stdout: "paused"}, nil
-		case name == "herdr" && strings.HasPrefix(argv, "agent get"):
+		case name == "herdr" && strings.Contains(argv, "agent get"):
 			return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w1:p1"}}}`}, nil
-		case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
-			return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+		case name == "herdr" && strings.Contains(argv, "pane process-info"):
+			return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 		}
 		return sandbox.RunResult{}, nil
 	}}
 	d := &Dispatcher{
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
 		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 	}
 	task := &tasks.Task{ID: "task_abc", Status: tasks.Paused, AgentSessionID: "herder-task_abc"}

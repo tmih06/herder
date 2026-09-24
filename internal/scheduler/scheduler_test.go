@@ -61,22 +61,37 @@ func queueTask(t *testing.T, store *storage.Store, repo, ref string, priority in
 	return task
 }
 
+// herdrArgv drops the leading `--machine <task-id>` selector the launcher
+// prefixes onto every forwarded call so scripts can match the remote
+// subcommand directly.
+func herdrArgv(args []string) []string {
+	if len(args) >= 2 && args[0] == "--machine" {
+		return args[2:]
+	}
+	return args
+}
+
 // happyRespond scripts a healthy fleet: existing clean repo, running
 // container, live agent session, successful launch flow, and readable
 // labels.
 func happyRespond(name string, args []string) (sandbox.RunResult, error) {
+	if name == "herdr" {
+		args = herdrArgv(args)
+	}
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "docker" && strings.HasPrefix(argv, "inspect --format"):
 		return sandbox.RunResult{Stdout: "running\n"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
 		return sandbox.RunResult{Stdout: inspectJSON("running", false)}, nil
+	case name == "herdr" && strings.HasPrefix(argv, "status server"):
+		return sandbox.RunResult{Stdout: "status: running\n"}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "workspace create"):
 		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "agent get"):
 		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w5:p7"}}}`}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_processes":[{"name":"codex"}]}}}`}, nil
+		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
 		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
 	}
@@ -98,7 +113,7 @@ func newScheduler(store *storage.Store, cfg *config.Config, rec *testutil.Record
 		Cfg:   cfg,
 		Dispatcher: &dispatch.Dispatcher{
 			Store:    store,
-			Launcher: &agent.Launcher{Runner: rec.HerdrRun, LookPath: testutil.FakeLookPath},
+			Launcher: &agent.Launcher{Runner: rec.HerdrRun},
 			Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
 			Engine:   &deliver.Engine{Runner: rec.DockerRun},
 		},
@@ -224,7 +239,9 @@ func TestExpiredLeaseRequeues(t *testing.T) {
 	if _, err := store.Transition(occupant.ID, tasks.Running, "controller", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBinding(occupant.ID, sandbox.ContainerName(occupant.ID), "herder-"+occupant.ID); err != nil {
+	if err := store.SetBinding(occupant.ID, storage.Binding{
+		SandboxID: sandbox.ContainerName(occupant.ID), SessionID: agent.SessionName(occupant.ID),
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -323,7 +340,7 @@ func TestInflightProvisionedCountsOnce(t *testing.T) {
 	// count would double-book the slot.
 	release := make(chan struct{})
 	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
-		if name == "herdr" && strings.HasPrefix(strings.Join(args, " "), "workspace create") {
+		if name == "herdr" && strings.HasPrefix(strings.Join(herdrArgv(args), " "), "workspace create") {
 			<-release
 		}
 		return happyRespond(name, args)
@@ -407,7 +424,9 @@ func TestAgentTimeoutStopsWorker(t *testing.T) {
 	if _, err := store.Transition(task.ID, tasks.Running, "controller", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBinding(task.ID, sandbox.ContainerName(task.ID), "herder-"+task.ID); err != nil {
+	if err := store.SetBinding(task.ID, storage.Binding{
+		SandboxID: sandbox.ContainerName(task.ID), SessionID: agent.SessionName(task.ID),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// The RUNNING transition stamped started_at; the 1ms budget is
@@ -451,7 +470,9 @@ func TestOOMKilledSandboxFails(t *testing.T) {
 	if _, err := store.Transition(task.ID, tasks.Running, "controller", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBinding(task.ID, sandbox.ContainerName(task.ID), "herder-"+task.ID); err != nil {
+	if err := store.SetBinding(task.ID, storage.Binding{
+		SandboxID: sandbox.ContainerName(task.ID), SessionID: agent.SessionName(task.ID),
+	}); err != nil {
 		t.Fatal(err)
 	}
 

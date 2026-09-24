@@ -55,9 +55,11 @@ RUN apt-get update \
 # --- final --------------------------------------------------------------------
 FROM debian:bookworm-slim
 # ca-certificates: TLS to GitHub/herdr.dev. git: provider clones and
-# delivery staging run controller-side.
+# delivery staging run controller-side. openssh-client: every worker is
+# a herdr SSH machine — machine add and forwarded calls go through ssh,
+# and ssh-keygen mints the controller keypair (issue #19).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --create-home --shell /usr/sbin/nologin herder
 COPY --from=build /out/herder /usr/local/bin/herder
