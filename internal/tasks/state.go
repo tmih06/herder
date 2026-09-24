@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -145,14 +146,17 @@ var allowed = map[State][]State{
 // is the normalized Herdr-reported worker condition (empty until the
 // supervision loop observes the session).
 type Task struct {
-	ID                string
-	SourceProvider    string
-	SourceRef         string
-	Goal              string
-	Status            State
-	Repository        string
-	AgentProfile      string
-	BranchName        string
+	ID             string
+	SourceProvider string
+	SourceRef      string
+	Goal           string
+	Status         State
+	Repository     string
+	AgentProfile   string
+	BranchName     string
+	// DisplayName is the operator-facing panel name: the herdr workspace
+	// label the TUI shows for this task's agent (empty until claimed).
+	DisplayName       string
 	AgentSessionID    string
 	SandboxID         string
 	MachineID         string
@@ -190,7 +194,9 @@ type NewInput struct {
 	Repository     string
 	AgentProfile   string
 	Goal           string
-	Priority       int
+	// DisplayName is the operator-facing panel name (herdr workspace label).
+	DisplayName string
+	Priority    int
 }
 
 // New builds a DISCOVERED task with fresh identity and timestamps.
@@ -207,6 +213,7 @@ func New(in NewInput) Task {
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
 		Priority:       in.Priority,
+		DisplayName:    in.DisplayName,
 		Attempt:        1,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -301,4 +308,28 @@ func hexID(n int) string {
 		return strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	}
 	return hex.EncodeToString(buf[:n])
+}
+
+// displayNameSafe mirrors Herdr's name class so a panel name never fails
+// `workspace create` at launch: lowercase alphanumerics, dash, underscore.
+var displayNameSafe = regexp.MustCompile(`[^a-z0-9_-]+`)
+
+// SanitizeDisplayName normalizes an operator-supplied panel name into
+// Herdr's name class: lowercased, unsafe runs become dashes, edges
+// trimmed, capped at 31 chars, and a leading digit gains a t- prefix so
+// the result always matches ^[a-z][a-z0-9_-]{0,31}$. Empty input returns
+// "" so callers fall back to their derived default.
+func SanitizeDisplayName(raw string) string {
+	s := displayNameSafe.ReplaceAllString(strings.ToLower(strings.TrimSpace(raw)), "-")
+	s = strings.Trim(s, "-_")
+	if len(s) > 31 {
+		s = strings.Trim(s[:31], "-_")
+	}
+	if s != "" && s[0] >= '0' && s[0] <= '9' {
+		s = "t-" + s
+		if len(s) > 31 {
+			s = s[:31]
+		}
+	}
+	return s
 }

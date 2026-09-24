@@ -81,12 +81,14 @@ func (a *APIAdapter) Parse(r *http.Request, body []byte) (TriggerEvent, string, 
 		Labels:     req.Labels,
 		Triggered:  true,
 		Priority:   req.Priority,
+		Name:       req.Name,
 	}, "", nil
 }
 
 // apiTaskRequest is the POST /v1/tasks body: repository, issue ref, the
-// title/body that seed the agent goal, labels, and an optional explicit
-// queue priority that wins over "priority:N" label parsing.
+// title/body that seed the agent goal, labels, an optional explicit
+// queue priority that wins over "priority:N" label parsing, and an
+// optional panel name for the task's herdr workspace.
 type apiTaskRequest struct {
 	Repository string          `json:"repository"`
 	Issue      json.RawMessage `json:"issue"`
@@ -94,6 +96,7 @@ type apiTaskRequest struct {
 	Body       string          `json:"body"`
 	Labels     []string        `json:"labels"`
 	Priority   *int            `json:"priority"`
+	Name       string          `json:"name"`
 }
 
 // issueRef normalizes the issue field: a JSON string is used verbatim, a

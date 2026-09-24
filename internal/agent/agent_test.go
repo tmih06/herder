@@ -446,3 +446,37 @@ func TestLoadRepoInstructions(t *testing.T) {
 		t.Errorf("CLAUDE.md should back up AGENTS.md, got %q", got)
 	}
 }
+
+// A WorkspaceLabel overrides the session name on `workspace create` and
+// the stale-workspace sweep, while the agent name stays the session.
+func TestStartWorkspaceLabel(t *testing.T) {
+	var calls [][]string
+	l := &Launcher{Runner: startRespond(&calls)}
+	_, err := l.Start(context.Background(), StartInput{
+		Session: "herder-task_abc123", AgentKind: "codex",
+		Machine: "task_abc123", Prompt: "Do the thing.\n",
+		WorkspaceLabel: "web-issue-7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var create, rename string
+	for _, call := range calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "workspace create") {
+			create = joined
+		}
+		if strings.Contains(joined, "agent rename") {
+			rename = joined
+		}
+	}
+	if !strings.Contains(create, "--label web-issue-7") {
+		t.Errorf("workspace label should be the display name, got %q", create)
+	}
+	if strings.Contains(create, "herder-task_abc123") {
+		t.Errorf("workspace label must not fall back to the session, got %q", create)
+	}
+	if !strings.Contains(rename, "agent rename w5:p7 herder-task_abc123") {
+		t.Errorf("agent name stays the session handle, got %q", rename)
+	}
+}

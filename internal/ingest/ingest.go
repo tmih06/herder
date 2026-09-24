@@ -73,6 +73,9 @@ type TriggerEvent struct {
 	// Priority, when non-nil, is the explicit queue priority and wins
 	// over "priority:N" label parsing.
 	Priority *int
+	// Name is the operator-facing panel name for the task's herdr
+	// workspace; empty derives <repo>-issue-<ref> at claim time.
+	Name string
 }
 
 // Outcome is the durable decision for one delivery: accepted tasks carry
@@ -175,6 +178,7 @@ func (h *Handler) Handle(ev TriggerEvent) (Outcome, error) {
 		Repository:     ev.Repository,
 		AgentProfile:   repo.Agent.Default,
 		BranchName:     branch,
+		DisplayName:    DisplayName(ev),
 		Goal:           goal,
 		Priority:       priority,
 		PolicyPayload:  string(payload),
@@ -302,4 +306,29 @@ func sortedLabels(labels []string) []string {
 	out := append([]string(nil), labels...)
 	sort.Strings(out)
 	return out
+}
+
+// DisplayName resolves the task's operator-facing panel name: the
+// caller's name when given, else <repo>-issue-<ref> derived from the
+// source coordinates — both sanitized into Herdr's name class so the
+// workspace label never fails at launch. Linear refs already read like
+// ENG-123, so they skip the issue- prefix.
+func DisplayName(ev TriggerEvent) string {
+	if name := tasks.SanitizeDisplayName(ev.Name); name != "" {
+		return name
+	}
+	repo := ev.Repository
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		repo = repo[i+1:]
+	}
+	suffix := "-issue-" + ev.IssueRef
+	if ev.Provider == ProviderLinear {
+		suffix = "-" + ev.IssueRef
+	}
+	// The issue coordinate is the identifying half: truncate the repo
+	// side first so a long name never eats the ref off the panel.
+	if over := len(repo) + len(suffix) - 31; over > 0 {
+		repo = strings.Trim(repo[:max(0, len(repo)-over)], "-_")
+	}
+	return tasks.SanitizeDisplayName(repo + suffix)
 }

@@ -408,3 +408,65 @@ func TestAPIAdapterParseLocalIssueOptional(t *testing.T) {
 		}
 	}
 }
+
+// The panel name flows from the submission through the claim: an explicit
+// name wins (sanitized), and an absent name derives <repo>-issue-<ref>.
+func TestAPIAdapterNameAndDerivation(t *testing.T) {
+	cfg, store, h := testSetup(t)
+	cfg.API.Secret = "s3cret"
+	adapter := ingest.NewAPIAdapter(cfg)
+
+	// Explicit name, sanitized into Herdr's class.
+	body := `{"repository":"owner/repo","issue":"7","name":"My Panel: OAuth Fix"}`
+	ev, _, err := adapter.Parse(apiReq(body, "s3cret", "n1"), []byte(body))
+	if err != nil {
+		t.Fatalf("Parse = %v", err)
+	}
+	out, err := h.Handle(ev)
+	if err != nil {
+		t.Fatalf("Handle = %v", err)
+	}
+	task, err := store.GetTask(out.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask = %v", err)
+	}
+	if task.DisplayName != "my-panel-oauth-fix" {
+		t.Errorf("DisplayName = %q, want sanitized explicit name", task.DisplayName)
+	}
+
+	// Derived default: <repo-name>-issue-<ref>.
+	body = `{"repository":"owner/repo","issue":"42"}`
+	ev, _, err = adapter.Parse(apiReq(body, "s3cret", "n2"), []byte(body))
+	if err != nil {
+		t.Fatalf("Parse = %v", err)
+	}
+	out, err = h.Handle(ev)
+	if err != nil {
+		t.Fatalf("Handle = %v", err)
+	}
+	task, err = store.GetTask(out.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask = %v", err)
+	}
+	if task.DisplayName != "repo-issue-42" {
+		t.Errorf("DisplayName = %q, want derived repo-issue-42", task.DisplayName)
+	}
+}
+
+// DisplayName derivation covers every provider shape.
+func TestDisplayNameDerivation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ev   ingest.TriggerEvent
+		want string
+	}{
+		"github":    {ingest.TriggerEvent{Provider: ingest.ProviderGitHub, Repository: "acme/web", IssueRef: "7"}, "web-issue-7"},
+		"api":       {ingest.TriggerEvent{Provider: ingest.ProviderAPI, Repository: "acme/web", IssueRef: "ci-9"}, "web-issue-ci-9"},
+		"linear":    {ingest.TriggerEvent{Provider: ingest.ProviderLinear, Repository: "acme/web", IssueRef: "ENG-123"}, "web-eng-123"},
+		"explicit":  {ingest.TriggerEvent{Provider: ingest.ProviderAPI, Repository: "acme/web", IssueRef: "7", Name: "Custom Name!"}, "custom-name"},
+		"long repo": {ingest.TriggerEvent{Provider: ingest.ProviderGitHub, Repository: "org/a-very-long-repository-name-here", IssueRef: "12345"}, "a-very-long-reposit-issue-12345"},
+	} {
+		if got := ingest.DisplayName(tc.ev); got != tc.want {
+			t.Errorf("%s: DisplayName = %q, want %q", name, got, tc.want)
+		}
+	}
+}

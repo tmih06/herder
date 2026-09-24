@@ -490,3 +490,32 @@ func TestAdvanceIssueLabelsSkipsLocalRepo(t *testing.T) {
 		t.Errorf("local repo must never call the delivery engine, ran %d", calls)
 	}
 }
+
+// The task's display name becomes the herdr workspace label — the panel
+// name the TUI shows — while the agent session keeps the deterministic
+// herder-<task> handle.
+func TestLaunchUsesDisplayNameForWorkspace(t *testing.T) {
+	store := testutil.OpenStore(t)
+	task := queueTask(t, store)
+	task.DisplayName = "web-issue-7"
+	rec := &testutil.Recorder{Respond: launchRespond}
+	d := &Dispatcher{
+		Store:    store,
+		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Engine:   &deliver.Engine{Runner: rec.DockerRun},
+		Logf:     func(string, ...any) {},
+	}
+	if err := d.Launch(context.Background(), testConfig(), &task, "", ""); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+	var create string
+	for _, c := range rec.Calls() {
+		if j := strings.Join(c, " "); strings.Contains(j, "workspace create") {
+			create = j
+		}
+	}
+	if !strings.Contains(create, "--label web-issue-7") {
+		t.Errorf("workspace label should be the display name, got %q", create)
+	}
+}

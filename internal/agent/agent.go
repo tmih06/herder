@@ -281,6 +281,9 @@ type StartInput struct {
 	// command is forwarded to.
 	Machine string
 	Prompt  string
+	// WorkspaceLabel names the herdr workspace the TUI shows for this
+	// agent; empty falls back to Session.
+	WorkspaceLabel string
 }
 
 // StartResult carries the remote Herdr pane identity for the durable
@@ -338,14 +341,17 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		return StartResult{}, fmt.Errorf("agent: pane run command %q is not shell-safe", cmd)
 	}
 	run := l.runner()
-	// A previous launch under this session name can leave a dead
-	// workspace behind (a remote server restart restores panes as
-	// shells; the name record is gone but the workspace lingers). Close
-	// same-label workspaces so relaunches converge on one workspace per
-	// session.
-	l.closeStaleWorkspaces(ctx, in.Machine, in.Session)
+	// A previous launch under this label can leave a dead workspace
+	// behind (a remote server restart restores panes as shells; the name
+	// record is gone but the workspace lingers). Close same-label
+	// workspaces so relaunches converge on one workspace per session.
+	label := in.WorkspaceLabel
+	if label == "" {
+		label = in.Session
+	}
+	l.closeStaleWorkspaces(ctx, in.Machine, label)
 	out, err := run(ctx, "herdr", machineArgv(in.Machine, "workspace", "create",
-		"--label", in.Session, "--cwd", sandbox.ContainerWorkspace,
+		"--label", label, "--cwd", sandbox.ContainerWorkspace,
 		"--env", "HERDR_AGENT="+in.AgentKind, "--no-focus")...)
 	if err != nil {
 		return StartResult{}, fmt.Errorf("agent: workspace create %s: %w", in.Session, err)

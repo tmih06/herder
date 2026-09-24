@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	repository TEXT NOT NULL,
 	agent_profile TEXT NOT NULL,
 	branch_name TEXT NOT NULL DEFAULT '',
+	display_name TEXT NOT NULL DEFAULT '',
 	agent_session_id TEXT NOT NULL DEFAULT '',
 	sandbox_id TEXT NOT NULL DEFAULT '',
 	machine_id TEXT NOT NULL DEFAULT '',
@@ -92,7 +93,9 @@ type CreateInput struct {
 	Repository     string
 	AgentProfile   string
 	BranchName     string
-	Goal           string
+	// DisplayName is the operator-facing panel name (herdr workspace label).
+	DisplayName string
+	Goal        string
 	// Priority orders the dispatch queue (zero is normal).
 	Priority  int
 	ActorType string
@@ -166,6 +169,7 @@ func Open(path string) (*Store, error) {
 func migrateColumns(db *sql.DB) error {
 	for _, column := range []string{
 		"agent_session_id TEXT NOT NULL DEFAULT ''",
+		"display_name TEXT NOT NULL DEFAULT ''",
 		"sandbox_id TEXT NOT NULL DEFAULT ''",
 		"goal TEXT NOT NULL DEFAULT ''",
 		"agent_state TEXT NOT NULL DEFAULT ''",
@@ -247,6 +251,7 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
 		Goal:           in.Goal,
+		DisplayName:    in.DisplayName,
 		Priority:       in.Priority,
 	})
 	task.BranchName = in.BranchName
@@ -609,6 +614,8 @@ type ClaimRequest struct {
 	Repository     string
 	AgentProfile   string
 	BranchName     string
+	// DisplayName is the operator-facing panel name (herdr workspace label).
+	DisplayName string
 	// Goal carries the issue goal text seeded into the agent prompt.
 	Goal string
 	// Priority orders the dispatch queue (zero is normal).
@@ -708,6 +715,7 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 		Repository:     req.Repository,
 		AgentProfile:   req.AgentProfile,
 		Goal:           req.Goal,
+		DisplayName:    req.DisplayName,
 		Priority:       req.Priority,
 	})
 	task.BranchName = req.BranchName
@@ -1147,11 +1155,11 @@ func getTaskBySourceTx(tx *sql.Tx, provider, ref string) (tasks.Task, error) {
 // inspect RowsAffected, plus wrapped errors only.
 func insertTaskTx(tx *sql.Tx, task tasks.Task, conflictSuffix string) (sql.Result, error) {
 	const insert = `INSERT INTO tasks
-		(id, source_provider, source_ref, goal, status, repository, agent_profile, branch_name, agent_session_id, sandbox_id, priority, started_at, attempt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?)`
+		(id, source_provider, source_ref, goal, status, repository, agent_profile, branch_name, display_name, agent_session_id, sandbox_id, priority, started_at, attempt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?)`
 	res, err := tx.Exec(insert+conflictSuffix, task.ID, task.SourceProvider, task.SourceRef,
 		task.Goal, string(task.Status), task.Repository, task.AgentProfile, task.BranchName,
-		task.Priority, formatStartedAt(task.StartedAt), task.Attempt,
+		task.DisplayName, task.Priority, formatStartedAt(task.StartedAt), task.Attempt,
 		formatTime(task.CreatedAt), formatTime(task.UpdatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("storage: insert task: %w", err)
@@ -1238,7 +1246,7 @@ func getTaskTx(tx *sql.Tx, id string) (tasks.Task, error) {
 
 // taskColumns lists the tasks columns in scanTask order.
 const taskColumns = `SELECT id, source_provider, source_ref, goal, status, repository,
-	agent_profile, branch_name, agent_session_id, sandbox_id, machine_id,
+	agent_profile, branch_name, display_name, agent_session_id, sandbox_id, machine_id,
 	remote_workspace_id, remote_pane_id, agent_state, priority, started_at, attempt, created_at, updated_at FROM tasks`
 
 // rowScanner abstracts *sql.Row, *sql.Rows, and *sql.Tx row results.
@@ -1253,7 +1261,7 @@ func scanTask(row rowScanner) (tasks.Task, error) {
 	var status, startedAt, createdAt, updatedAt string
 	if err := row.Scan(&task.ID, &task.SourceProvider, &task.SourceRef,
 		&task.Goal, &status, &task.Repository, &task.AgentProfile, &task.BranchName,
-		&task.AgentSessionID, &task.SandboxID, &task.MachineID,
+		&task.DisplayName, &task.AgentSessionID, &task.SandboxID, &task.MachineID,
 		&task.RemoteWorkspaceID, &task.RemotePaneID, &task.AgentState,
 		&task.Priority, &startedAt, &task.Attempt, &createdAt, &updatedAt); err != nil {
 		return tasks.Task{}, err
