@@ -222,3 +222,66 @@ func TestValidateMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file, got nil")
 	}
 }
+
+// TestValidateLinearTeams linear.teams values must name configured
+// repositories; a dangling mapping fails at load naming the team.
+func TestValidateLinearTeams(t *testing.T) {
+	good := validBody + `
+linear:
+  teams:
+    ENG: acme/web
+`
+	if _, err := Load(writeConfig(t, good)); err != nil {
+		t.Fatalf("mapped team must load: %v", err)
+	}
+	bad := validBody + `
+linear:
+  teams:
+    ENG: ghost/repo
+`
+	_, err := Load(writeConfig(t, bad))
+	if err == nil {
+		t.Fatal("expected error for unmapped repository, got nil")
+	}
+	if !strings.Contains(err.Error(), "linear.teams") || !strings.Contains(err.Error(), "ghost/repo") {
+		t.Errorf("error should name linear.teams and the bad value, got: %v", err)
+	}
+}
+
+// A repository may name a local filesystem path instead of a GitHub
+// remote: the path must be absolute, IsLocal flips, and Remote returns
+// the path verbatim while non-local repos keep the https remote.
+func TestRepositoryLocalPath(t *testing.T) {
+	body := strings.Replace(validBody, "    enabled: true\n",
+		"    enabled: true\n    local: /srv/git/acme-web.git\n", 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	repo := cfg.Repositories["acme/web"]
+	if !repo.IsLocal() {
+		t.Error("local path must mark the repository local")
+	}
+	if got := repo.Remote("acme/web"); got != "/srv/git/acme-web.git" {
+		t.Errorf("Remote = %q, want the local path", got)
+	}
+	// A repo without local keeps the GitHub https remote.
+	plain := RepositoryConfig{}
+	if plain.IsLocal() {
+		t.Error("empty local must not mark the repository local")
+	}
+	if got := plain.Remote("acme/web"); got != "https://github.com/acme/web.git" {
+		t.Errorf("Remote = %q, want the github remote", got)
+	}
+}
+
+// A relative local path fails at load: provisioning must never resolve
+// it against whatever directory the daemon happened to start in.
+func TestRepositoryLocalRelativeRejected(t *testing.T) {
+	body := strings.Replace(validBody, "    enabled: true\n",
+		"    enabled: true\n    local: ../repos/acme\n", 1)
+	if _, err := Load(writeConfig(t, body)); err == nil ||
+		!strings.Contains(err.Error(), "local") {
+		t.Errorf("relative local path must fail validation, got %v", err)
+	}
+}

@@ -106,9 +106,15 @@ points break provisioning.
 
 ### Webhook ingress
 
-GitHub must reach `POST /v1/webhooks/github` on `server.listen`
-(default `:8787`). On a developer machine that means a tunnel
-(`gh webhook forward`, ngrok, cloudflared, …) pointed at the controller;
-in a private network, publish the port to wherever GitHub can route.
-Deliveries are deduplicated by `delivery_id`, so retries and redeliveries
-are safe.
+GitHub must reach `POST /v1/webhooks/github` and Linear
+`POST /v1/webhooks/linear` on `server.listen` (default `:8787`). On a
+developer machine that means a tunnel (`gh webhook forward`, ngrok,
+cloudflared, …) pointed at the controller; in a private network, publish
+the port to wherever the provider can route. Set `github.webhook_secret`
+/ `linear.webhook_secret` so deliveries are HMAC-verified — with no
+secret configured, verification is skipped (local dev only). Deliveries
+are deduplicated by `delivery_id`, so retries and redeliveries are safe.
+
+CI and scripts can also queue work directly through `POST /v1/tasks`
+with `Authorization: Bearer <api.secret>`; the endpoint answers 404
+unless `api.secret` is configured.

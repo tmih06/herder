@@ -120,6 +120,9 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		Session: session, AgentKind: prof.Kind,
 		Machine: task.ID,
 		Prompt:  prompt,
+		// The TUI panel name: the operator-supplied or derived display
+		// name, falling back to the session when the task predates it.
+		WorkspaceLabel: task.DisplayName,
 	})
 	if err != nil {
 		// Record the binding optimistically so a session that did start

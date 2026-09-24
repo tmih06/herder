@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -47,6 +48,8 @@ type Config struct {
 	Database     DatabaseConfig              `yaml:"database"`
 	Herdr        HerdrConfig                 `yaml:"herdr"`
 	Github       GithubConfig                `yaml:"github"`
+	Linear       LinearConfig                `yaml:"linear"`
+	API          APIConfig                   `yaml:"api"`
 	Scheduler    SchedulerConfig             `yaml:"scheduler"`
 	Repositories map[string]RepositoryConfig `yaml:"repositories"`
 	Agents       map[string]AgentConfig      `yaml:"agents"`
@@ -67,10 +70,29 @@ type HerdrConfig struct {
 	Mode string `yaml:"mode"`
 }
 
-// GithubConfig holds GitHub App credentials (env-expanded).
+// GithubConfig holds GitHub App credentials (env-expanded) plus the
+// webhook signing secret. WebhookSecret empty means deliveries are not
+// signature-verified (documented dev mode); set it in production.
 type GithubConfig struct {
 	AppID          string `yaml:"app_id"`
 	PrivateKeyFile string `yaml:"private_key_file"`
+	WebhookSecret  string `yaml:"webhook_secret"`
+}
+
+// LinearConfig holds the Linear webhook signing secret (env-expanded)
+// and the team-key -> repository routing table. WebhookSecret empty
+// means deliveries are not signature-verified (dev mode); an issue whose
+// team key is absent from Teams records a policy_denied delivery.
+type LinearConfig struct {
+	WebhookSecret string            `yaml:"webhook_secret"`
+	Teams         map[string]string `yaml:"teams"`
+}
+
+// APIConfig holds the bearer secret (env-expanded) that authorizes
+// POST /v1/tasks direct submissions. Secret empty disables the endpoint:
+// the daemon never runs an unauthenticated queue.
+type APIConfig struct {
+	Secret string `yaml:"secret"`
 }
 
 // SchedulerConfig bounds concurrent workers and paces the dispatch loop
@@ -132,14 +154,30 @@ func (a AgentConfig) TimeoutDuration() time.Duration {
 }
 
 // RepositoryConfig is the per-repo policy: trigger, agent, sandbox,
-// validation, and delivery.
+// validation, and delivery. Local names a filesystem path to clone from
+// and push to instead of GitHub — the whole point of API-queued work is
+// that a repository need not exist on any forge.
 type RepositoryConfig struct {
 	Enabled    bool             `yaml:"enabled"`
+	Local      string           `yaml:"local"`
 	Trigger    TriggerConfig    `yaml:"trigger"`
 	Agent      RepoAgentConfig  `yaml:"agent"`
 	Sandbox    SandboxConfig    `yaml:"sandbox"`
 	Validation ValidationConfig `yaml:"validation"`
 	Delivery   DeliveryConfig   `yaml:"delivery"`
+}
+
+// IsLocal reports whether the repository clones/pushes a filesystem path
+// instead of a GitHub remote: no forge, no PR, no issue labels.
+func (r RepositoryConfig) IsLocal() bool { return strings.TrimSpace(r.Local) != "" }
+
+// Remote returns the git URL provisioning clones and delivery pushes:
+// the local path when configured, else the GitHub https remote for name.
+func (r RepositoryConfig) Remote(name string) string {
+	if r.IsLocal() {
+		return strings.TrimSpace(r.Local)
+	}
+	return fmt.Sprintf("https://github.com/%s.git", name)
 }
 
 // TriggerConfig lists the labels that mark work as agent-ready.
@@ -306,6 +344,15 @@ func (c *Config) validate() []error {
 			errs = append(errs, fmt.Errorf("%s %q must be a positive Go duration (example \"2m\")", d.field, d.raw))
 		}
 	}
+	for team, repo := range c.Linear.Teams {
+		if strings.TrimSpace(team) == "" {
+			errs = append(errs, errors.New("linear.teams: team keys must be non-empty"))
+		}
+		if _, ok := c.Repositories[repo]; !ok {
+			errs = append(errs, fmt.Errorf("linear.teams.%q %q is not a configured repository (defined: %s)",
+				team, repo, strings.Join(sortedKeys(c.Repositories), ", ")))
+		}
+	}
 	if len(c.Repositories) == 0 {
 		errs = append(errs, errors.New("repositories must define at least one repository (example \"owner/repo\")"))
 	}
@@ -344,6 +391,9 @@ func validateRepository(name string, repo RepositoryConfig, agents map[string]Ag
 			errs = append(errs, fmt.Errorf("%s.trigger.labels: label %q must match %s",
 				prefix, label, labelPattern.String()))
 		}
+	}
+	if repo.Local != "" && !filepath.IsAbs(repo.Local) {
+		errs = append(errs, fmt.Errorf("%s.local %q must be an absolute path", prefix, repo.Local))
 	}
 	if repo.Agent.Default == "" {
 		errs = append(errs, fmt.Errorf("%s.agent.default must name an entry in agents", prefix))

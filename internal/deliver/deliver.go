@@ -20,6 +20,7 @@ package deliver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -53,7 +54,7 @@ type Engine struct {
 // pushed to the explicit repository URL. A moved branch fails instead of
 // shipping unverified commits; empty wantSHA skips the pin for tasks
 // that reached REVIEWING without a recorded validation.
-func (e *Engine) PushBranch(ctx context.Context, workspace, repo, branch, wantSHA string) error {
+func (e *Engine) PushBranch(ctx context.Context, workspace, remote, branch, wantSHA string) error {
 	staging, err := os.MkdirTemp("", "herder-deliver-*")
 	if err != nil {
 		return fmt.Errorf("deliver: staging repo: %w", err)
@@ -91,7 +92,9 @@ func (e *Engine) PushBranch(ctx context.Context, workspace, repo, branch, wantSH
 	if wantSHA != "" && sha != wantSHA {
 		return fmt.Errorf("deliver: branch %s moved since validation (%s, want %s)", branch, sha, wantSHA)
 	}
-	remote := fmt.Sprintf("https://github.com/%s.git", repo)
+	if remote == "" {
+		return errors.New("deliver: push needs a remote")
+	}
 	if out, err := e.run(ctx, "git", cleanGit(
 		"-c", "credential.helper=",
 		"-c", "credential.helper=!gh auth git-credential",

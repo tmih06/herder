@@ -125,7 +125,7 @@ func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
 	}
 	joined := strings.Join(create, " ")
 	for _, want := range []string{
-		"--cap-drop ALL", "no-new-privileges", "--pids-limit 256",
+		"--cap-drop ALL", "no-new-privileges", "--pids-limit 1024",
 		"--cpus 2", "--memory 4g", "--network bridge", "--user",
 		"--workdir /workspace", "--env HOME=/tmp/herder-home",
 		"/tmp/herder-test-sb/task_abc123:/workspace:rw",
@@ -516,5 +516,33 @@ func TestEnsureRunningConverges(t *testing.T) {
 	}
 	if err := p.EnsureRunning(context.Background(), "herder-task_x"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing container = %v, want ErrNotFound", err)
+	}
+}
+
+// A local-path remote clones the filesystem path verbatim: the gh
+// credential helper stays URL-scoped and never applies to it.
+func TestProvisionClonesLocalRemote(t *testing.T) {
+	f := &fakeRunner{respond: okGit}
+	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	spec := testSpec()
+	spec.RemoteURL = "/srv/git/acme-web.git"
+	if _, err := p.Provision(context.Background(), spec); err != nil {
+		t.Fatalf("Provision = %v", err)
+	}
+	var clone []string
+	for _, c := range f.calls {
+		if c[0] == "git" && strings.Contains(strings.Join(c, " "), " clone ") {
+			clone = c
+		}
+	}
+	if clone == nil {
+		t.Fatal("provision must clone the workspace")
+	}
+	joined := strings.Join(clone, " ")
+	if !strings.Contains(joined, "clone /srv/git/acme-web.git") {
+		t.Errorf("clone must use the local path, ran %q", joined)
+	}
+	if strings.Contains(joined, "github.com") {
+		t.Errorf("local clone must never name github.com, ran %q", joined)
 	}
 }

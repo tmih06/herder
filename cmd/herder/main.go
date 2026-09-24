@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -447,9 +448,10 @@ func taskInspect(store *storage.Store, args []string, w, ew io.Writer) int {
 	if !task.StartedAt.IsZero() {
 		started = task.StartedAt.Format(time.RFC3339)
 	}
-	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nagent_state: %s\nbranch: %s\nattempt: %d\npriority: %d\ncreated: %s\nupdated: %s\nstarted: %s\n",
+	fmt.Fprintf(w, "id: %s\nstatus: %s\nsource: %s:%s\nrepository: %s\nagent: %s\nagent_state: %s\nbranch: %s\nname: %s\nattempt: %d\npriority: %d\ncreated: %s\nupdated: %s\nstarted: %s\n",
 		task.ID, task.Status, task.SourceProvider, task.SourceRef,
-		task.Repository, task.AgentProfile, orDash(task.AgentState), task.BranchName, task.Attempt,
+		task.Repository, task.AgentProfile, orDash(task.AgentState), task.BranchName,
+		orDash(task.DisplayName), task.Attempt,
 		task.Priority, task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339), started)
 	fmt.Fprintf(w, "sandbox: %s\nsession: %s\n",
 		task.SandboxID, task.AgentSessionID)
@@ -478,6 +480,7 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 	branch := fs.String("branch", "", "working branch name")
 	goal := fs.String("goal", "", "issue goal text seeded into the agent prompt")
 	priority := fs.Int("priority", 0, "dispatch priority (higher runs first)")
+	name := fs.String("name", "", "panel name for the task's herdr workspace (default: <repo>-issue-<ref>)")
 	actorType := fs.String("actor-type", "controller", "event actor type")
 	actorID := fs.String("actor-id", "cli", "event actor id")
 	if err := fs.Parse(args); err != nil {
@@ -502,11 +505,18 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 			profile, strings.Join(config.AgentNames(cfg), ", "))
 		return 1
 	}
+	displayName := tasks.SanitizeDisplayName(*name)
+	if displayName == "" {
+		displayName = ingest.DisplayName(ingest.TriggerEvent{
+			Provider: *provider, Repository: *repo, IssueRef: issueRefPart(*sourceRef),
+		})
+	}
 	created, err := store.CreateTask(storage.CreateInput{
 		SourceProvider: *provider, SourceRef: *sourceRef,
 		Repository: *repo, AgentProfile: profile, BranchName: *branch, Goal: *goal,
-		Priority:  *priority,
-		ActorType: *actorType, ActorID: *actorID,
+		DisplayName: displayName,
+		Priority:    *priority,
+		ActorType:   *actorType, ActorID: *actorID,
 	})
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -612,9 +622,9 @@ func ingestDelivery(path string, args []string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: usage: herder ingest --delivery ID --repo R --issue N [--title T] [--body B] [--label L]...\n")
 		return 2
 	}
-	out, err := ingest.New(cfg, store).Handle(ingest.IssueEvent{
-		DeliveryID: *delivery, Repository: *repo,
-		IssueNumber: *issue, Title: *title, Body: *body, Labels: labels,
+	out, err := ingest.New(cfg, store).Handle(ingest.TriggerEvent{
+		DeliveryID: *delivery, Provider: ingest.ProviderGitHub, Repository: *repo,
+		IssueRef: strconv.Itoa(*issue), Title: *title, Body: *body, Labels: labels,
 	})
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
@@ -705,4 +715,13 @@ usage: herder [--config PATH] <command> [args]
   version                 print the binary version
   help                    print this text
 `)
+}
+
+// issueRefPart extracts the ref after the last '#' in a source ref
+// (acme/web#7 -> 7), or the whole string when there is none.
+func issueRefPart(sourceRef string) string {
+	if i := strings.LastIndex(sourceRef, "#"); i >= 0 {
+		return sourceRef[i+1:]
+	}
+	return sourceRef
 }

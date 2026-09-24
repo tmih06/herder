@@ -146,3 +146,26 @@ func TestUnknownStatesRejected(t *testing.T) {
 		t.Error("unknown target state must be rejected")
 	}
 }
+
+// SanitizeDisplayName normalizes operator input into Herdr's name class:
+// lowercase, unsafe runs become dashes, edges trimmed, 31-char cap, and
+// a leading digit gains a t- prefix.
+func TestSanitizeDisplayName(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in, want string
+	}{
+		"plain":         {"web-issue-7", "web-issue-7"},
+		"spaces+case":   {"  Web Issue 7 ", "web-issue-7"},
+		"unsafe chars":  {"fix: oauth/race!", "fix-oauth-race"},
+		"leading digit": {"7-fix", "t-7-fix"},
+		"underscores":   {"my_task__x", "my_task__x"},
+		"long":          {"abcdefghijklmnopqrstuvwxyz0123456789", "abcdefghijklmnopqrstuvwxyz01234"},
+		"empty":         {"", ""},
+		"all unsafe":    {"!!!", ""},
+		"unicode":       {"café-üñí", "caf"}, // non-ascii is outside the name class
+	} {
+		if got := SanitizeDisplayName(tc.in); got != tc.want {
+			t.Errorf("%s: SanitizeDisplayName(%q) = %q, want %q", name, tc.in, got, tc.want)
+		}
+	}
+}

@@ -80,7 +80,7 @@ raw socket.
 | Package               | Role                                                                                          |
 | --------------------- | --------------------------------------------------------------------------------------------- |
 | `cmd/herder`          | Single binary: subcommand dispatch, exit-code discipline, `printUsage` surface.               |
-| `internal/ingest`     | Webhook deliveries → exactly one policy-approved task; dedup by delivery id and source ref.   |
+| `internal/ingest`     | Source adapters (GitHub, Linear, API) → normalized trigger events → exactly one policy-approved task; dedup by delivery id and source ref. |
 | `internal/tasks`      | Task state machine + structured events; pure transition table, no I/O.                        |
 | `internal/scheduler`  | Dispatch loop: caps, expiring leases, restart reconciliation, time/resource limits.           |
 | `internal/sandbox`    | Worker isolation boundary; `Provider` interface + least-privilege `DockerProvider`.           |
@@ -88,7 +88,7 @@ raw socket.
 | `internal/validation` | The gate between "agent says done" and "work may ship": commands + forbidden-path/clean-tree. |
 | `internal/deliver`    | Controller-side delivery: staging-repo push, PR, issue comment, stage labels.                 |
 | `internal/storage`    | SQLite store: tasks, `task_events`, `webhook_deliveries`, `leases`; one transaction per mutation. |
-| `internal/api`        | Local HTTP surface: status view, `/v1/tasks`, `/v1/deliveries`, `/v1/webhooks/github`, `/v1/health`. |
+| `internal/api`        | Local HTTP surface: status view, `/v1/tasks`, `/v1/deliveries`, `/v1/webhooks/{provider}`, `/v1/health`. |
 | `internal/dispatch`   | Shared launch pipeline behind `task start|retry|handoff`, `sandbox provision`, scheduler.     |
 | `internal/health`     | `doctor` probes: controller, storage, Herdr, Docker reported distinctly.                      |
 | `internal/config`     | Strict YAML load, `${ENV}` expansion, field-level validation.                                 |

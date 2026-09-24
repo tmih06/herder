@@ -325,8 +325,22 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 		map[string]string{"branch": branch, "repository": task.Repository}, ew); err != nil {
 		return 1
 	}
-	if err := engine.PushBranch(dctx, workspace, task.Repository, branch, validatedHead(store, task.ID)); err != nil {
+	if err := engine.PushBranch(dctx, workspace, repo.Remote(task.Repository), branch, validatedHead(store, task.ID)); err != nil {
 		return deliverFailed(store, task, err, ew)
+	}
+	if repo.IsLocal() {
+		// Forge-less delivery: the branch is the artifact. No PR, issue
+		// comment, or labels exist to move; the push is the whole ship.
+		if err := transition(store, task, tasks.PROpen, ew); err != nil {
+			fmt.Fprintf(ew, "herder: %v\n", err)
+			return 1
+		}
+		if err := emitEvent(store, task.ID, "delivery.completed",
+			map[string]string{"branch": branch, "remote": repo.Remote(task.Repository)}, ew); err != nil {
+			return 1
+		}
+		fmt.Fprintf(w, "herder: task %s delivered: branch %s pushed to %s\n", task.ID, branch, repo.Remote(task.Repository))
+		return 0
 	}
 	issue, _ := deliver.IssueNumber(task.SourceRef)
 	title := prTitle(*task)

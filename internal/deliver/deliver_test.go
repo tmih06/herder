@@ -52,7 +52,7 @@ func TestPushBranchStagingRepo(t *testing.T) {
 		return sandbox.RunResult{}, nil
 	}}
 	e := &Engine{Runner: f.run}
-	if err := e.PushBranch(context.Background(), "/tmp/ws", "acme/web", "herder/7-fix", "deadbeef"); err != nil {
+	if err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef"); err != nil {
 		t.Fatalf("PushBranch = %v", err)
 	}
 	var fetch, push []string
@@ -102,7 +102,7 @@ func TestPushBranchDrift(t *testing.T) {
 		return sandbox.RunResult{}, nil
 	}}
 	e := &Engine{Runner: f.run}
-	err := e.PushBranch(context.Background(), "/tmp/ws", "acme/web", "herder/7-fix", "deadbeef")
+	err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef")
 	if err == nil || !strings.Contains(err.Error(), "moved") {
 		t.Fatalf("drift must fail naming the move, got %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPushBranchFailure(t *testing.T) {
 		return sandbox.RunResult{Stdout: "deadbeef\n"}, nil
 	}}
 	e := &Engine{Runner: f.run}
-	err := e.PushBranch(context.Background(), "/tmp/ws", "acme/web", "herder/7-fix", "deadbeef")
+	err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef")
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("push failure must name stderr, got %v", err)
 	}
@@ -320,5 +320,40 @@ func TestCommentIssueProbeFailure(t *testing.T) {
 	}
 	if comments != 0 {
 		t.Errorf("no comment may post when the probe failed, posted %d", comments)
+	}
+}
+
+// A local-path remote pushes verbatim — no github.com URL is ever
+// constructed, and an empty remote fails instead of guessing one.
+func TestPushBranchLocalRemote(t *testing.T) {
+	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+		if strings.Contains(strings.Join(args, " "), "rev-parse FETCH_HEAD") {
+			return sandbox.RunResult{Stdout: "deadbeef\n"}, nil
+		}
+		return sandbox.RunResult{}, nil
+	}}
+	e := &Engine{Runner: f.run}
+	if err := e.PushBranch(context.Background(), "/tmp/ws", "/srv/git/acme-web.git", "herder/9-x", "deadbeef"); err != nil {
+		t.Fatalf("PushBranch = %v", err)
+	}
+	var push []string
+	for _, c := range f.calls {
+		if strings.Contains(strings.Join(c, " "), "push") {
+			push = c
+		}
+	}
+	if push == nil {
+		t.Fatalf("missing push call, ran %v", f.calls)
+	}
+	joined := strings.Join(push, " ")
+	if !strings.Contains(joined, "push /srv/git/acme-web.git") {
+		t.Errorf("push must target the local path, ran %v", push)
+	}
+	if strings.Contains(joined, "github.com") {
+		t.Errorf("local push must never name github.com, ran %v", push)
+	}
+	// Empty remote is a caller bug, not a fallback.
+	if err := e.PushBranch(context.Background(), "/tmp/ws", "", "herder/9-x", "deadbeef"); err == nil {
+		t.Error("empty remote must fail")
 	}
 }

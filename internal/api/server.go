@@ -31,24 +31,40 @@ import (
 
 // Server is the daemon HTTP server.
 type Server struct {
-	cfg     *config.Config
-	cfgPath string
-	store   *storage.Store
-	ingest  *ingest.Handler
-	http    *http.Server
-	mux     *http.ServeMux
+	cfg      *config.Config
+	cfgPath  string
+	store    *storage.Store
+	ingest   *ingest.Handler
+	adapters map[string]ingest.SourceAdapter
+	api      ingest.SourceAdapter
+	http     *http.Server
+	mux      *http.ServeMux
 }
 
 // New builds a Server that serves cfg/store on the configured listen addr.
 // cfgPath is the config file location reported by /v1/health.
+// Every inbound route runs the same flow: the provider's SourceAdapter
+// verifies the request and translates the payload, then ingest.Handler
+// applies the one policy gate. POST /v1/tasks answers 404 unless
+// api.secret is configured — the daemon never runs an unauthenticated
+// queue.
 func New(cfg *config.Config, store *storage.Store, cfgPath string) *Server {
-	s := &Server{cfg: cfg, cfgPath: cfgPath, store: store, ingest: ingest.New(cfg, store), mux: http.NewServeMux()}
+	s := &Server{
+		cfg: cfg, cfgPath: cfgPath, store: store, ingest: ingest.New(cfg, store),
+		adapters: map[string]ingest.SourceAdapter{
+			ingest.ProviderGitHub: ingest.NewGitHubAdapter(cfg),
+			ingest.ProviderLinear: ingest.NewLinearAdapter(cfg),
+		},
+		api: ingest.NewAPIAdapter(cfg),
+		mux: http.NewServeMux(),
+	}
 	s.mux.HandleFunc("GET /", s.handleStatusView)
 	s.mux.HandleFunc("GET /v1/tasks", s.handleListTasks)
 	s.mux.HandleFunc("GET /v1/tasks/{id}", s.handleInspectTask)
 	s.mux.HandleFunc("GET /v1/deliveries", s.handleListDeliveries)
 	s.mux.HandleFunc("GET /v1/deliveries/{id}", s.handleInspectDelivery)
-	s.mux.HandleFunc("POST /v1/webhooks/github", s.handleGitHubWebhook)
+	s.mux.HandleFunc("POST /v1/webhooks/{provider}", s.handleWebhook)
+	s.mux.HandleFunc("POST /v1/tasks", s.handleSubmitTask)
 	s.mux.HandleFunc("GET /v1/health", s.handleHealth)
 	s.http = &http.Server{Addr: cfg.Server.Listen, Handler: s.mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
@@ -123,44 +139,69 @@ func (s *Server) handleInspectTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"task": task, "events": events})
 }
 
-// maxWebhookBody caps one GitHub delivery body: issues events are small
-// JSON, and the daemon must not buffer unbounded uploads.
-const maxWebhookBody = 1 << 20
+// maxInboundBody caps one inbound delivery body: trigger payloads are
+// small JSON, and the daemon must not buffer unbounded uploads. It
+// applies to every inbound route — both webhooks and /v1/tasks.
+const maxInboundBody = 1 << 20
 
-// webhookOutcome is the JSON decision envelope for POST /v1/webhooks/github.
-type webhookOutcome struct {
+// decisionEnvelope is the JSON decision envelope every inbound route
+// answers: accepted tasks carry the new task id, duplicates point at the
+// survivor, and denials carry the policy reason.
+type decisionEnvelope struct {
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
 	TaskID   string `json:"task_id,omitempty"`
 }
 
-// handleGitHubWebhook receives one GitHub issues delivery, gates it
-// through internal/ingest, and reports the durable decision. GitHub only
-// needs 2xx: accepted claims answer 201, duplicate and policy_denied
-// deliveries answer 200 (both recorded), ignored event types answer 202,
-// and malformed deliveries answer 400 with nothing recorded.
-func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-GitHub-Event") != "" && r.Header.Get("X-GitHub-Event") != "issues" {
-		writeJSON(w, http.StatusAccepted, webhookOutcome{Decision: "ignored", Reason: "only issues events trigger work"})
+// handleWebhook receives one source-provider delivery on
+// POST /v1/webhooks/{provider}: the matching adapter verifies the request
+// and translates the payload, then ingest.Handler reports the durable
+// decision. Unknown providers answer 404. Accepted claims answer 201,
+// duplicate and policy_denied deliveries answer 200 (both recorded),
+// ignored event types answer 202, malformed deliveries answer 400 with
+// nothing recorded, and failed authentication answers 401 with nothing
+// recorded.
+func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	adapter, ok := s.adapters[r.PathValue("provider")]
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("unknown source provider %q", r.PathValue("provider")))
 		return
 	}
-	delivery := r.Header.Get("X-GitHub-Delivery")
-	if strings.TrimSpace(delivery) == "" {
-		writeError(w, http.StatusBadRequest, "missing X-GitHub-Delivery header")
+	s.handleDelivery(w, r, adapter)
+}
+
+// handleSubmitTask queues one direct task submission on POST /v1/tasks.
+// The endpoint answers the mux's own 404 when api.secret is unset — an
+// unauthenticated queue is indistinguishable from a route that does not
+// exist.
+func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.API.Secret == "" {
+		http.NotFound(w, r)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBody))
+	s.handleDelivery(w, r, s.api)
+}
+
+// handleDelivery runs the shared inbound flow behind every trigger
+// route: read the bounded body, authenticate through the adapter,
+// translate the payload, then gate and claim through ingest.Handler.
+func (s *Server) handleDelivery(w http.ResponseWriter, r *http.Request, adapter ingest.SourceAdapter) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxInboundBody))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("read webhook body: %v", err))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read delivery body: %v", err))
 		return
 	}
-	event, ignored, err := ingest.ParseGitHubIssuesEvent(delivery, body)
+	if err := adapter.Verify(r, body); err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	event, ignored, err := adapter.Parse(r, body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if ignored {
-		writeJSON(w, http.StatusAccepted, webhookOutcome{Decision: "ignored", Reason: "only labeled actions trigger work"})
+	if ignored != "" {
+		writeJSON(w, http.StatusAccepted, decisionEnvelope{Decision: "ignored", Reason: ignored})
 		return
 	}
 	out, err := s.ingest.Handle(event)
@@ -172,7 +213,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	if out.Decision == storage.DecisionAccepted {
 		code = http.StatusCreated
 	}
-	writeJSON(w, code, webhookOutcome{Decision: out.Decision, Reason: out.Reason, TaskID: out.TaskID})
+	writeJSON(w, code, decisionEnvelope{Decision: out.Decision, Reason: out.Reason, TaskID: out.TaskID})
 }
 
 // handleListDeliveries returns every recorded delivery oldest-first: the
@@ -187,8 +228,8 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"deliveries": found})
 }
 
-// handleInspectDelivery returns one recorded delivery by its GitHub
-// delivery id.
+// handleInspectDelivery returns one recorded delivery by its provider
+// delivery id (GitHub/Linear delivery UUID or API idempotency key).
 func (s *Server) handleInspectDelivery(w http.ResponseWriter, r *http.Request) {
 	delivery, err := s.store.GetDelivery(r.PathValue("id"))
 	if err != nil {

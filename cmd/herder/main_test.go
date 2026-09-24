@@ -296,3 +296,35 @@ func TestFlagScanStopsAtSeparator(t *testing.T) {
 		t.Errorf("rest = %v, want %v", rest, want)
 	}
 }
+
+// --name lands on the task as the panel name (sanitized); without it the
+// name derives <repo>-issue-<ref>. task inspect surfaces either.
+func TestTaskCreateNameThroughCLI(t *testing.T) {
+	path := writeTestConfig(t)
+	code, id, errOut := runCmd(t, "--config", path, "task", "create",
+		"--repo", "acme/web", "--source-ref", "acme/web#7",
+		"--name", "My Panel: OAuth")
+	if code != 0 {
+		t.Fatalf("create exit = %d (%s)", code, errOut)
+	}
+	code, out, errOut := runCmd(t, "--config", path, "task", "inspect", strings.TrimSpace(id))
+	if code != 0 {
+		t.Fatalf("inspect exit = %d (%s)", code, errOut)
+	}
+	if !strings.Contains(out, "name: my-panel-oauth") {
+		t.Errorf("inspect should print the sanitized name, got %q", out)
+	}
+	// Derived default on a second task.
+	code, id2, errOut := runCmd(t, "--config", path, "task", "create",
+		"--repo", "acme/web", "--source-ref", "acme/web#9")
+	if code != 0 {
+		t.Fatalf("create exit = %d (%s)", code, errOut)
+	}
+	code, out, errOut = runCmd(t, "--config", path, "task", "inspect", strings.TrimSpace(id2))
+	if code != 0 {
+		t.Fatalf("inspect exit = %d (%s)", code, errOut)
+	}
+	if !strings.Contains(out, "name: web-issue-9") {
+		t.Errorf("inspect should print the derived name, got %q", out)
+	}
+}
