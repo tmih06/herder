@@ -211,7 +211,7 @@ func SpecForTask(cfg *config.Config, task tasks.Task) sandbox.Spec {
 	return sandbox.Spec{
 		TaskID: task.ID, Repository: task.Repository,
 		RemoteURL: repo.Remote(task.Repository),
-		Branch: BranchForTask(task), Image: repo.Sandbox.Image,
+		Branch:    BranchForTask(task), Image: repo.Sandbox.Image,
 		CPUs: agent.Resources["cpu"], Memory: agent.Resources["memory"],
 		WorkspaceRoot: SandboxRoot(cfg.Database.Path),
 	}

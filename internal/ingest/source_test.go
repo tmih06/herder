@@ -393,7 +393,7 @@ func TestAPIAdapterParseLocalIssueOptional(t *testing.T) {
 	}
 	// Non-local and unknown repositories still require the issue.
 	for name, repoName := range map[string]string{
-		"github repo": "other/repo",
+		"github repo":  "other/repo",
 		"unknown repo": "nobody/nothing",
 	} {
 		cfg2, _, _ := testSetup(t)

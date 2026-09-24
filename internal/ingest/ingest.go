@@ -237,7 +237,7 @@ func BranchName(issueRef, title string) string {
 	if slug := Slug(title); slug != "" {
 		return fmt.Sprintf("herder/%s-%s", ref, slug)
 	}
-	return fmt.Sprintf("herder/%s", ref)
+	return "herder/" + ref
 }
 
 // Slug lowercases the issue title into a branch-safe slug of up to 40
