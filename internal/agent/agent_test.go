@@ -114,9 +114,6 @@ func TestSessionNameIsStable(t *testing.T) {
 	if got := SessionName("task_abc123"); got != "herder-task_abc123" {
 		t.Errorf("session = %q, want herder-task_abc123", got)
 	}
-	if SessionName("task_abc123") != SessionName("task_abc123") {
-		t.Error("session name must be deterministic")
-	}
 }
 
 // stripMachine drops the `--machine <label>` forwarding prefix so scripted

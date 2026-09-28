@@ -568,14 +568,14 @@ func (l *Launcher) PromptDelivered(ctx context.Context, machineLabel, session, t
 	return err == nil && strings.Contains(tail, first)
 }
 
-// AgentInfo is the parsed `agent get` report for one live session: the
+// Info is the parsed `agent get` report for one live session: the
 // detected kind, the normalized status Herdr reports, the pane identity
 // needed to stop or attach the worker, and whether the agent process is
 // actually still running. Herdr keeps a named agent's record after the
 // process exits (the pane falls back to its shell while `agent get`
 // still answers), so Running comes from `pane process-info`: the pane's
 // foreground process group must differ from its shell.
-type AgentInfo struct {
+type Info struct {
 	Kind    string
 	Status  string
 	PaneID  string
@@ -587,17 +587,17 @@ type AgentInfo struct {
 // means the session is gone or never existed (ErrSessionGone), while any
 // other failure — including an unreachable worker — is a plain error so
 // callers can tell "dead" from "machine unreachable".
-func (l *Launcher) Get(ctx context.Context, machineLabel, session string) (AgentInfo, error) {
+func (l *Launcher) Get(ctx context.Context, machineLabel, session string) (Info, error) {
 	out, err := l.runner()(ctx, "herdr", machineArgv(machineLabel, "agent", "get", session)...)
 	if err != nil {
-		return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, err)
+		return Info{}, fmt.Errorf("agent: get %s: %w", session, err)
 	}
 	if out.ExitCode != 0 {
 		if strings.Contains(out.Stderr, "agent_not_found") ||
 			strings.Contains(out.Stdout, "agent_not_found") {
-			return AgentInfo{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
+			return Info{}, fmt.Errorf("agent: get %s: %w", session, ErrSessionGone)
 		}
-		return AgentInfo{}, fmt.Errorf("agent: get %s: %s", session, textutil.FirstLine(out.Stderr))
+		return Info{}, fmt.Errorf("agent: get %s: %s", session, textutil.FirstLine(out.Stderr))
 	}
 	var parsed struct {
 		Result struct {
@@ -609,16 +609,16 @@ func (l *Launcher) Get(ctx context.Context, machineLabel, session string) (Agent
 		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(out.Stdout), &parsed); err != nil {
-		return AgentInfo{}, fmt.Errorf("agent: get %s: unreadable output", session)
+		return Info{}, fmt.Errorf("agent: get %s: unreadable output", session)
 	}
-	info := AgentInfo{
+	info := Info{
 		Kind:   parsed.Result.Agent.Kind,
 		Status: parsed.Result.Agent.Status,
 		PaneID: parsed.Result.Agent.PaneID,
 	}
 	running, err := l.agentRunning(ctx, machineLabel, info)
 	if err != nil {
-		return AgentInfo{}, err
+		return Info{}, err
 	}
 	info.Running = running
 	return info, nil
@@ -633,7 +633,7 @@ func (l *Launcher) Get(ctx context.Context, machineLabel, session string) (Agent
 // missing pane id or an unreadable process list is uncertain — the
 // caller must not act on a maybe-dead reading, so it returns an error
 // rather than a guess.
-func (l *Launcher) agentRunning(ctx context.Context, machineLabel string, info AgentInfo) (bool, error) {
+func (l *Launcher) agentRunning(ctx context.Context, machineLabel string, info Info) (bool, error) {
 	if info.PaneID == "" || info.Kind == "" {
 		// A record without pane_id or kind is malformed/transient —
 		// uncertain, not dead. Error so callers retry instead of
