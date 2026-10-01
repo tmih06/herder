@@ -158,9 +158,11 @@ say "Replay same webhook (duplicate delivery)"
 DUP=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/webhooks/github" \
 	-H "X-GitHub-Event: issues" -H "X-GitHub-Delivery: $DELIVERY_ID" \
 	-H "Content-Type: application/json" -d "$PAYLOAD")
-printf '%s' "$DUP" | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("decision")=="duplicate" else 1)' \
-	&& ok "duplicate delivery deduped" \
-	|| die "expected duplicate, got: $DUP"
+if printf '%s' "$DUP" | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("decision")=="duplicate" else 1)'; then
+	ok "duplicate delivery deduped"
+else
+	die "expected duplicate, got: $DUP"
+fi
 
 # ---------- scheduler: provision + launch ----------
 say "Scheduler provisions sandbox and launches agent"
@@ -168,16 +170,22 @@ wait_for "task RUNNING (sandbox + agent up)" 240 task_status RUNNING
 
 # The worker is a herdr machine: the container-local server answers
 # forwarded calls and the agent session lives on it, not on the host.
-herdr machine list --json | python3 -c \
-	'import json,sys; exit(0 if any(m["label"]=="'"$TASK_ID"'" for m in json.load(sys.stdin)) else 1)' \
-	&& ok "machine profile registered: $TASK_ID" \
-	|| die "no machine profile for $TASK_ID"
-herdr --machine "$TASK_ID" status server >/dev/null 2>&1 \
-	&& ok "container-local herdr server answering over SSH" \
-	|| die "worker herdr server not reachable"
-herdr --machine "$TASK_ID" agent get "herder-$TASK_ID" >/dev/null 2>&1 \
-	&& ok "agent session live on the worker's server" \
-	|| die "agent session not found on worker"
+if herdr machine list --json | python3 -c \
+	'import json,sys; exit(0 if any(m["label"]=="'"$TASK_ID"'" for m in json.load(sys.stdin)) else 1)'; then
+	ok "machine profile registered: $TASK_ID"
+else
+	die "no machine profile for $TASK_ID"
+fi
+if herdr --machine "$TASK_ID" status server >/dev/null 2>&1; then
+	ok "container-local herdr server answering over SSH"
+else
+	die "worker herdr server not reachable"
+fi
+if herdr --machine "$TASK_ID" agent get "herder-$TASK_ID" >/dev/null 2>&1; then
+	ok "agent session live on the worker's server"
+else
+	die "agent session not found on worker"
+fi
 ok "agent visible: herder task attach $TASK_ID (herdr --remote herder-$TASK_ID)"
 
 # ---------- kill -9 restart resilience ----------
@@ -185,7 +193,9 @@ say "kill -9 the daemon, restart, verify state survives"
 kill -9 "$DAEMON_PID" 2>/dev/null; sleep 1
 "$DEMO_DIR/herder" --config "$CFG" daemon >>"$DEMO_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
-task_status RUNNING && ok "task still RUNNING, agent session survived the kill" || {
+if task_status RUNNING; then
+	ok "task still RUNNING, agent session survived the kill"
+else
 	# Give reconcile one tick before judging — a transient liveness
 	# probe right at daemon startup must not read as a lost task.
 	sleep 5
@@ -196,7 +206,7 @@ task_status RUNNING && ok "task still RUNNING, agent session survived the kill" 
 		tail -20 "$DEMO_DIR/daemon.log" >&2 || true
 		die "task lost after restart"
 	fi
-}
+fi
 # ---------- human message round-trip ----------
 say "Human -> agent message (task tell)"
 "$DEMO_DIR/herder" --config "$CFG" task tell "$TASK_ID" "human checkpoint: please finish the task now" >/dev/null
@@ -206,26 +216,35 @@ ok "round-trip complete: message reached the agent, work committed"
 # ---------- validation gate ----------
 say "Validation gate"
 "$DEMO_DIR/herder" --config "$CFG" task validate "$TASK_ID" >/dev/null
-task_status REVIEWING \
-	&& ok "gate passed -> REVIEWING" \
-	|| die "validation did not reach REVIEWING"
+if task_status REVIEWING; then
+	ok "gate passed -> REVIEWING"
+else
+	die "validation did not reach REVIEWING"
+fi
 
 # ---------- delivery ----------
 say "Deliver: push branch + open PR + move issue labels"
 "$DEMO_DIR/herder" --config "$CFG" task deliver "$TASK_ID" >/dev/null
-gh pr list --repo "$REPO" --json number --jq '.[0].number' | grep '[0-9]' >/dev/null \
-	&& ok "PR open on $REPO" \
-	|| die "no PR found"
-gh issue view "$ISSUE" --repo "$REPO" --json labels --jq '[.labels[].name]|join(" ")' \
-	| grep 'agent-review' >/dev/null && ok "issue labeled agent-review" \
-	|| die "issue labels not advanced"
+if gh pr list --repo "$REPO" --json number --jq '.[0].number' | grep '[0-9]' >/dev/null; then
+	ok "PR open on $REPO"
+else
+	die "no PR found"
+fi
+if gh issue view "$ISSUE" --repo "$REPO" --json labels --jq '[.labels[].name]|join(" ")' \
+	| grep 'agent-review' >/dev/null; then
+	ok "issue labeled agent-review"
+else
+	die "issue labels not advanced"
+fi
 
 # ---------- done ----------
 say "Mark done"
-"$DEMO_DIR/herder" --config "$CFG" task done "$TASK_ID" >/dev/null
-task_status DONE \
-	&& ok "task DONE" \
-	|| die "task not DONE"
+"$DEMO_DIR/herder" --config "$CFG" task "done" "$TASK_ID" >/dev/null
+if task_status DONE; then
+	ok "task DONE"
+else
+	die "task not DONE"
+fi
 
 say "DEMO PASSED"
 echo "labeled issue -> task -> sandbox -> agent -> human round-trip -> validation -> PR -> labels -> done"
