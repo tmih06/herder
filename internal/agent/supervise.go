@@ -1,7 +1,7 @@
-// Supervision loop (issue #5; SPEC sections 19-22, 61): the daemon polls
-// Herdr for every live worker session and folds the reports into durable
-// task state — normalized agent states with event history, BLOCKED tasks
-// with human-visible notifications, and automatic unblock when the agent
+// Package agent — supervision loop (issue #5; SPEC sections 19-22, 61): the
+// daemon polls Herdr for every live worker session and folds the reports into
+// durable task state — normalized agent states with event history, BLOCKED
+// tasks with human-visible notifications, and automatic unblock when the agent
 // moves again.
 //
 // Why: a running agent is supervised, not fire-and-forget; the terminal

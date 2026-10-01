@@ -378,9 +378,9 @@ func TestPollSkipsPausedAndUnbound(t *testing.T) {
 	}
 }
 
-// TestGetParsesAgentInfo proves `agent get` JSON lands as AgentInfo with
-// the pane identity needed to stop the worker.
-func TestGetParsesAgentInfo(t *testing.T) {
+// TestGetParsesInfo proves `agent get` JSON lands as Info with the pane
+// identity needed to stop the worker.
+func TestGetParsesInfo(t *testing.T) {
 	fake := &scriptedHerdr{statuses: map[string]string{"herder-task_x": "blocked"}, gone: map[string]bool{}}
 	l := &Launcher{Runner: fake.run}
 	info, err := l.Get(context.Background(), "task_x", "herder-task_x")
