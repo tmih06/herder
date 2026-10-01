@@ -16,6 +16,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -186,9 +187,14 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 // route: read the bounded body, authenticate through the adapter,
 // translate the payload, then gate and claim through ingest.Handler.
 func (s *Server) handleDelivery(w http.ResponseWriter, r *http.Request, adapter ingest.SourceAdapter) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxInboundBody))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInboundBody))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("read delivery body: %v", err))
+		code := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, code, fmt.Sprintf("read delivery body: %v", err))
 		return
 	}
 	if err := adapter.Verify(r, body); err != nil {

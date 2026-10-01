@@ -779,3 +779,40 @@ func TestSubmitTaskDeniesAndBadRequests(t *testing.T) {
 		t.Errorf("delivery provider = %q, want api", deliveries[0].SourceProvider)
 	}
 }
+
+// Inbound bodies may fill the limit, but oversized requests must not be
+// truncated into valid submissions or leave task/delivery records.
+func TestSubmitTaskBodyLimit(t *testing.T) {
+	const limit = 1 << 20
+	const prefix = `{"repository":"owner/repo","issue":"7"}`
+	for _, tc := range []struct {
+		name string
+		tail string
+		code int
+		rows int
+	}{
+		{"at limit", "", http.StatusCreated, 1},
+		{"past limit", "not-json", http.StatusRequestEntityTooLarge, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, store := apiServer(t)
+			body := prefix + strings.Repeat(" ", limit-len(prefix)) + tc.tail
+			rec := postTask(t, srv, body, "s3cret", "body-limit")
+			if rec.Code != tc.code {
+				t.Fatalf("POST = %d, want %d: %s", rec.Code, tc.code, rec.Body.String())
+			}
+			found, err := store.ListTasks()
+			if err != nil {
+				t.Fatal(err)
+			}
+			deliveries, err := store.ListDeliveries()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(found) != tc.rows || len(deliveries) != tc.rows {
+				t.Fatalf("tasks/deliveries = %d/%d, want %d/%d",
+					len(found), len(deliveries), tc.rows, tc.rows)
+			}
+		})
+	}
+}
