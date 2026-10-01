@@ -7,7 +7,7 @@
 //
 // Why: black-box runners hide the worker; Herder stays glass-box by keeping
 // the agent in a real Herdr pane the host can watch, prompt, and attach.
-// Approach: Stage 1 CLI orchestration (SPEC section 17) against the real
+// Approach: CLI orchestration (SPEC section 17) against the real
 // Herdr 0.9.x surface, forwarded to the worker's container-local herdr
 // server (issue #19): every call carries `--machine <task-id>`, so
 // `workspace create` yields a shell pane inside the sandbox and
@@ -15,7 +15,7 @@
 // run the canonical binary, detect the real process (no comm spoofing),
 // bind the deterministic session name, and gate on interactive
 // readiness; `agent prompt` seeds the task contract. The machine.Runner
-// seam scripts subprocesses in tests; the socket API comes later.
+// seam scripts subprocesses in tests.
 // Inputs: task + repo/agent config + a provisioned worker (container plus
 // saved machine profile). Flow: ResolveProfile -> BuildPrompt ->
 // Launcher.Start records the session name; attach re-enters via

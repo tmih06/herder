@@ -83,14 +83,15 @@ raw socket.
 | `internal/ingest`     | Source adapters (GitHub, Linear, API) → normalized trigger events → exactly one policy-approved task; dedup by delivery id and source ref. |
 | `internal/tasks`      | Task state machine + structured events; pure transition table, no I/O.                        |
 | `internal/scheduler`  | Dispatch loop: caps, expiring leases, restart reconciliation, time/resource limits.           |
+| `internal/machine`    | Native saved-SSH-machine registry and the shared subprocess `Runner`/`RunResult` seam.        |
 | `internal/sandbox`    | Worker isolation boundary; `Provider` interface + least-privilege `DockerProvider`.           |
-| `internal/agent`      | Herdr launcher + supervision loop; seeds prompts, normalizes agent states.                    |
+| `internal/agent`      | Native Herdr startup/readiness + durable supervision; seeds prompts, normalizes agent states. |
 | `internal/validation` | The gate between "agent says done" and "work may ship": commands + forbidden-path/clean-tree. |
 | `internal/deliver`    | Controller-side delivery: staging-repo push, PR, issue comment, stage labels.                 |
 | `internal/storage`    | SQLite store: tasks, `task_events`, `webhook_deliveries`, `leases`; one transaction per mutation. |
 | `internal/api`        | Local HTTP surface: status view, `/v1/tasks`, `/v1/deliveries`, `/v1/webhooks/{provider}`, `/v1/health`. |
 | `internal/dispatch`   | Shared launch pipeline behind `task start|retry|handoff`, `sandbox provision`, scheduler.     |
-| `internal/health`     | `doctor` probes: controller, storage, Herdr, Docker reported distinctly.                      |
+| `internal/health`     | `doctor` probes: controller, storage, Herdr, Docker, SSH reported distinctly.                 |
 | `internal/config`     | Strict YAML load, `${ENV}` expansion, field-level validation.                                 |
 | `internal/textutil`   | Shared string helpers (truncate, first-line).                                                 |
 | `internal/testutil`   | Test scaffolding: scripted `Runner` recorder, temp-dir store.                                 |
@@ -136,5 +137,10 @@ truth — the event log is the audit trail and the recovery record.
 - **Leasing**: every dispatch takes a row in `leases` (owner, heartbeat,
   expiry) before any subprocess; a dead owner's lease expires and the
   task requeues — never strands, never double-dispatches.
+  `Dispatcher.BeatLease` owns the heartbeat loop shared by scheduler dispatch
+  and CLI worker operations; losing a lease cancels the active operation.
+- **Bindings**: partial task/runtime binding updates merge in one atomic SQL
+  statement, so heartbeat observations cannot clobber a concurrent launch or
+  handoff update.
 
 
