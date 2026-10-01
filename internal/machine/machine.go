@@ -144,7 +144,7 @@ func (r *Registry) Ensure(ctx context.Context, label, target string) (*Machine, 
 		return nil, fmt.Errorf("machine: add %s: %w", label, err)
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("machine: add %s: %s", label, textutil.FirstLine(out.Stderr))
+		return nil, fmt.Errorf("machine: add %s: %s", label, textutil.Truncate(strings.TrimSpace(out.Stderr), 4096))
 	}
 	created, err := r.Find(ctx, label, target)
 	if err != nil {

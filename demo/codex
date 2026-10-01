@@ -12,17 +12,21 @@
 #   a line containing "finish"     -> write FIX.md, git commit, exit 0
 #   EOF                            -> commit whatever is pending, exit
 
-#
-# Output stays terse and declarative: Herdr classifies agent_status from
-# screen heuristics, so prompt-like text (a trailing "?", "blocked",
-# "done"-style idle banners) would misreport the session as blocked and
-# `agent prompt` would refuse with agent_blocked.
-set -u
+# Native agent startup waits for interactive readiness. Report the demo's
+# actual state instead of relying on Codex screen-detection heuristics.
+set -eu
 cd /workspace 2>/dev/null || exit 1
 
+report_state() {
+	herdr pane report-agent "$HERDR_PANE_ID" --source custom:herder-demo \
+		--agent codex --state "$1" >/dev/null
+}
+
+report_state idle
 echo "codex demo agent ready"
 
 finish() {
+	report_state working
 	echo "fix for ${HERDER_TASK:-task}" > FIX.md
 	git add -A >/dev/null 2>&1
 	git -c user.name="herder-demo" -c user.email="demo@herder.local" \
