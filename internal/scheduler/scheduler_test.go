@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/deliver"
 	"github.com/tmih06/herder/internal/dispatch"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -74,28 +76,28 @@ func herdrArgv(args []string) []string {
 // happyRespond scripts a healthy fleet: existing clean repo, running
 // container, live agent session, successful launch flow, and readable
 // labels.
-func happyRespond(name string, args []string) (sandbox.RunResult, error) {
+func happyRespond(name string, args []string) (machine.RunResult, error) {
 	if name == "herdr" {
 		args = herdrArgv(args)
 	}
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "docker" && strings.HasPrefix(argv, "inspect --format"):
-		return sandbox.RunResult{Stdout: "running\n"}, nil
+		return machine.RunResult{Stdout: "running\n"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
-		return sandbox.RunResult{Stdout: inspectJSON("running", false)}, nil
+		return machine.RunResult{Stdout: inspectJSON("running", false)}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "status server"):
-		return sandbox.RunResult{Stdout: "status: running\n"}, nil
+		return machine.RunResult{Stdout: "status: running\n"}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "workspace create"):
-		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "agent get"):
-		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w5:p7"}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w5:p7"}}}`}, nil
 	case name == "herdr" && strings.HasPrefix(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
-		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
+		return machine.RunResult{Stdout: "agent-ready\n"}, nil
 	}
-	return sandbox.RunResult{}, nil
+	return machine.RunResult{}, nil
 }
 
 // inspectJSON renders the docker inspect document the provider parses.
@@ -113,9 +115,9 @@ func newScheduler(store *storage.Store, cfg *config.Config, rec *testutil.Record
 		Cfg:   cfg,
 		Dispatcher: &dispatch.Dispatcher{
 			Store:    store,
-			Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-			Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
-			Engine:   &deliver.Engine{Runner: rec.DockerRun},
+			Launcher: &agent.Launcher{Runner: rec.Run},
+			Provider: &sandbox.DockerProvider{Runner: rec.Run},
+			Engine:   &deliver.Engine{Runner: rec.Run},
 		},
 	}
 }
@@ -162,7 +164,7 @@ func TestDispatchHonorsCapsAndPriority(t *testing.T) {
 	if got := taskStatus(t, store, newest.ID); got != tasks.Queued {
 		t.Errorf("newest task = %s, want QUEUED (cap reached)", got)
 	}
-	if n := rec.CountCalls("herdr", "pane", "run"); n != 2 {
+	if n := rec.CountCalls("herdr", "agent", "start"); n != 2 {
 		t.Errorf("agent launches = %d, want exactly 2", n)
 	}
 }
@@ -262,7 +264,7 @@ func TestExpiredLeaseRequeues(t *testing.T) {
 		t.Errorf("expired-lease task = %s, want QUEUED", got)
 	}
 	types := testutil.EventTypes(t, store, victim.ID)
-	if !testutil.HasEvent(types, tasks.EventLeaseExpired) {
+	if !slices.Contains(types, tasks.EventLeaseExpired) {
 		t.Errorf("want lease.expired event, got %v", types)
 	}
 	if got := taskStatus(t, store, occupant.ID); got != tasks.Running {
@@ -322,7 +324,7 @@ func TestAbandonedProvisioningRequeues(t *testing.T) {
 	if got := taskStatus(t, store, leased.ID); got != tasks.Provisioning {
 		t.Errorf("leased task = %s, want PROVISIONING (mid-dispatch, untouched)", got)
 	}
-	if types := testutil.EventTypes(t, store, leased.ID); testutil.HasEvent(types, tasks.EventDispatchFailed) {
+	if types := testutil.EventTypes(t, store, leased.ID); slices.Contains(types, tasks.EventDispatchFailed) {
 		t.Errorf("leased task must not record dispatch_failed, got %v", types)
 	}
 }
@@ -339,7 +341,7 @@ func TestInflightProvisionedCountsOnce(t *testing.T) {
 	// Provision lands PROVISIONING — the exact window where a second
 	// count would double-book the slot.
 	release := make(chan struct{})
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if name == "herdr" && strings.HasPrefix(strings.Join(herdrArgv(args), " "), "workspace create") {
 			<-release
 		}
@@ -402,7 +404,7 @@ func TestMissingSessionDisconnects(t *testing.T) {
 		t.Errorf("session-less task = %s, want WAITING_FOR_HUMAN", got)
 	}
 	types := testutil.EventTypes(t, store, task.ID)
-	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
+	if !slices.Contains(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -440,7 +442,7 @@ func TestAgentTimeoutStopsWorker(t *testing.T) {
 		t.Errorf("timed-out task = %s, want TIMED_OUT", got)
 	}
 	types := testutil.EventTypes(t, store, task.ID)
-	if !testutil.HasEvent(types, tasks.EventTaskTimedOut) {
+	if !slices.Contains(types, tasks.EventTaskTimedOut) {
 		t.Errorf("want task.timed_out event, got %v", types)
 	}
 	if !rec.Called("herdr", "pane", "close") {
@@ -454,10 +456,10 @@ func TestAgentTimeoutStopsWorker(t *testing.T) {
 func TestOOMKilledSandboxFails(t *testing.T) {
 	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect ") {
-			return sandbox.RunResult{Stdout: inspectJSON("exited", true)}, nil
+			return machine.RunResult{Stdout: inspectJSON("exited", true)}, nil
 		}
 		return happyRespond(name, args)
 	}}
@@ -483,7 +485,7 @@ func TestOOMKilledSandboxFails(t *testing.T) {
 		t.Errorf("OOM-killed task = %s, want FAILED", got)
 	}
 	types := testutil.EventTypes(t, store, task.ID)
-	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
+	if !slices.Contains(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -517,7 +519,7 @@ func TestBlockedSessionGoneDisconnects(t *testing.T) {
 		t.Errorf("blocked session-less task = %s, want WAITING_FOR_HUMAN", got)
 	}
 	types := testutil.EventTypes(t, store, task.ID)
-	if !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
+	if !slices.Contains(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected event, got %v", types)
 	}
 }
@@ -530,10 +532,10 @@ func TestBlockedSessionGoneDisconnects(t *testing.T) {
 func TestOOMKilledAfterSessionClearedFails(t *testing.T) {
 	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect ") {
-			return sandbox.RunResult{Stdout: inspectJSON("exited", true)}, nil
+			return machine.RunResult{Stdout: inspectJSON("exited", true)}, nil
 		}
 		return happyRespond(name, args)
 	}}
@@ -577,13 +579,13 @@ func TestOOMKilledAfterSessionClearedFails(t *testing.T) {
 func TestProvisionFailureBacksOff(t *testing.T) {
 	store := testutil.OpenStore(t)
 	cfg := testConfig()
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		switch {
 		case name == "docker" && strings.HasPrefix(argv, "inspect --format"):
-			return sandbox.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
 		case name == "docker" && strings.HasPrefix(argv, "create "):
-			return sandbox.RunResult{ExitCode: 1, Stderr: "docker daemon exploded"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "docker daemon exploded"}, nil
 		}
 		return happyRespond(name, args)
 	}}
@@ -598,7 +600,7 @@ func TestProvisionFailureBacksOff(t *testing.T) {
 		t.Errorf("failed provision task = %s, want QUEUED", got)
 	}
 	types := testutil.EventTypes(t, store, task.ID)
-	if !testutil.HasEvent(types, tasks.EventDispatchFailed) {
+	if !slices.Contains(types, tasks.EventDispatchFailed) {
 		t.Errorf("want task.dispatch_failed event, got %v", types)
 	}
 	creates := rec.CountCalls("docker", "create")
@@ -633,8 +635,8 @@ func TestForeignLeaseBlocksDispatch(t *testing.T) {
 	s.Tick(context.Background())
 	waitDispatch(s)
 
-	if rec.Called("herdr", "pane", "run") {
-		t.Error("foreign-held lease must block the launch: no pane run")
+	if rec.Called("herdr", "agent", "start") {
+		t.Error("foreign-held lease must block the launch: no agent start")
 	}
 	if got := taskStatus(t, store, task.ID); got != tasks.Queued {
 		t.Errorf("task = %s, want QUEUED (still owned elsewhere)", got)
@@ -678,7 +680,7 @@ func TestLiveLeaseSkipsReconcile(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.Running {
 		t.Errorf("leased task = %s, want RUNNING (mid-dispatch, untouched)", got)
 	}
-	if types := testutil.EventTypes(t, store, task.ID); testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
+	if types := testutil.EventTypes(t, store, task.ID); slices.Contains(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("live lease must suppress worker.disconnected, got %v", types)
 	}
 
@@ -693,7 +695,7 @@ func TestLiveLeaseSkipsReconcile(t *testing.T) {
 	if got := taskStatus(t, store, task.ID); got != tasks.WaitingForHuman {
 		t.Errorf("expired-lease task = %s, want WAITING_FOR_HUMAN", got)
 	}
-	if types := testutil.EventTypes(t, store, task.ID); !testutil.HasEvent(types, tasks.EventWorkerDisconnected) {
+	if types := testutil.EventTypes(t, store, task.ID); !slices.Contains(types, tasks.EventWorkerDisconnected) {
 		t.Errorf("want worker.disconnected after lease lapse, got %v", types)
 	}
 }

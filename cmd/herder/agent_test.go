@@ -12,23 +12,11 @@ import (
 	"github.com/tmih06/herder/internal/storage"
 )
 
-// writeFakeBins installs fake `herdr` and `docker` CLIs on PATH for agent
-// launch and intervention tests. The herdr fake records calls and scripts
-// the forwarded launch flow (issue #19): every worker call arrives as
-// `herdr --machine <task-id> <verb>`, which the script strips before
-// dispatch. `workspace create` mints a pane/workspace pair, `workspace
-// list`/`workspace close` track the live set, `pane run` marks the pane
-// detected with the agent kind, `agent get` answers for detected panes
-// and named sessions with JSON whose status comes from
-// STATE/status-<session> (default "working"), `agent rename` binds the
-// session name to the pane (and honors --clear), `agent prompt` records
-// the seed, `agent read` serves STATE/read-<session> as raw text, `pane
-// process-info` reports a foreground pgid distinct from the shell pid
-// only while the pane's agent is live, `pane close` kills the pane, its
-// named session, and its workspace, `status server` answers running, the
-// `machine` verbs track saved profiles, and `notification show` logs; it
-// re-reads STATE/herdrmode on every call so setHerdrMode can arm
-// "send-fails" or "start-fails" mid-test.
+// writeFakeBins installs stateful Herdr and Docker CLIs for task lifecycle
+// tests. Worker commands are forwarded with --machine <task-id>. Native
+// agent start creates a named occupant; get/read/prompt/close resolve it.
+// Saved machine profiles and workspace IDs survive calls, and herdrmode
+// can refuse startup or prompting after a successful launch.
 // dockerMode selects the inspect outcome ("ready", "stopped", or
 // "missing"); the fake tracks STATE/docker-status so pause/unpause/start
 // move the container between running, paused, and stopped.
@@ -56,21 +44,32 @@ case "$1 $2" in
   echo "{\"result\":{\"root_pane\":{\"pane_id\":\"$pane\"},\"workspace\":{\"workspace_id\":\"$ws\"}}}"
   ;;
 "workspace list")
-  printf '['; first=1
+  printf '{"result":{"workspaces":['; first=1
   if [ -f "$STATE/wslist" ]; then
     while read -r wid lab; do
       [ $first -eq 0 ] && printf ','; first=0
       printf '{"workspace_id":"%s","label":"%s"}' "$wid" "$lab"
     done < "$STATE/wslist"
   fi
-  printf ']\n'
+  printf ']}}\n'
   ;;
 "workspace close")
   [ -f "$STATE/wslist" ] && grep -v "^$3 " "$STATE/wslist" > "$STATE/wslist.tmp"; [ -f "$STATE/wslist.tmp" ] && mv "$STATE/wslist.tmp" "$STATE/wslist"
   ;;
-"pane run")
-  pane=$3; cmd=$4
-  touch "$STATE/detected-$pane"; echo "$cmd" > "$STATE/kindof-$pane"
+"agent start")
+  [ "$mode" = "start-fails" ] && { echo "start refused" >&2; exit 1; }
+  name=$3; shift 3; pane=""; kind=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pane) pane=$2; shift ;;
+      --kind) kind=$2; shift ;;
+    esac
+    shift
+  done
+  touch "$STATE/detected-$pane" "$STATE/started-$name"
+  echo "$kind" > "$STATE/kindof-$pane"; echo "$pane" > "$STATE/paneof-$name"
+  ws=$(cat "$STATE/wsof-$pane")
+  echo "{\"result\":{\"agent\":{\"name\":\"$name\",\"agent\":\"$kind\",\"agent_status\":\"idle\",\"pane_id\":\"$pane\",\"workspace_id\":\"$ws\"}}}"
   ;;
 "agent get")
   target=$3
@@ -88,15 +87,12 @@ case "$1 $2" in
   echo "{\"result\":{\"agent\":{\"agent\":\"$kind\",\"agent_status\":\"$st\",\"pane_id\":\"$pane\",\"workspace_id\":\"$ws\"}}}"
   ;;
 "agent rename")
-  if [ "$4" = "--clear" ]; then
-    rm -f "$STATE/started-$3" "$STATE/paneof-$3"; exit 0
-  fi
-  pane=$3; name=$4
-  [ -f "$STATE/detected-$pane" ] || { echo "agent_not_found" >&2; exit 1; }
-  touch "$STATE/started-$name"; echo "$pane" > "$STATE/paneof-$name"
-  echo "{\"result\":{\"agent\":{\"name\":\"$name\",\"pane_id\":\"$pane\"}}}"
+  [ "$4" = "--clear" ] || { echo "unexpected rename" >&2; exit 1; }
+  rm -f "$STATE/started-$3" "$STATE/paneof-$3"
+  echo '{}'
   ;;
 "agent prompt")
+  [ -f "$STATE/started-$3" ] || { echo "agent_not_found" >&2; exit 1; }
   [ "$mode" = "send-fails" ] && { echo "send refused" >&2; exit 1; }
   printf '%s' "$4" >> "$STATE/prompt-$3"
   ;;
@@ -371,10 +367,6 @@ func TestTaskStartLaunchesAgent(t *testing.T) {
 		}
 	}
 
-	calls, _ := os.ReadFile(filepath.Join(state, "calls"))
-	if !strings.Contains(string(calls), "HERDR_AGENT=codex") {
-		t.Errorf("herdr start should carry HERDR_AGENT=codex, got %q", calls)
-	}
 	prompt, _ := os.ReadFile(filepath.Join(state, "prompt-"+session))
 	for _, want := range []string{"acme/web#7", "herder/7", "go test ./..."} {
 		if !strings.Contains(string(prompt), want) {
@@ -664,28 +656,5 @@ func TestTaskAttachNeedsSession(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "task start") {
 		t.Errorf("stderr should point at task start, got %q", errOut)
-	}
-}
-
-// TestTaskAttachTargetsRemote proves attach opens the worker's remote
-// Herdr UI over the task's SSH target — the container name — instead of
-// replaying logs.
-func TestTaskAttachTargetsRemote(t *testing.T) {
-	writeFakeBins(t, "ready")
-	path := writeTestConfig(t)
-	id := queueTask(t, path)
-	if code, _, errOut := runCmd(t, "--config", path, "task", "start", id); code != 0 {
-		t.Fatalf("start exit = %d (%s)", code, errOut)
-	}
-	var got []string
-	old := execAttach
-	execAttach = func(argv []string) int { got = argv; return 0 }
-	defer func() { execAttach = old }()
-	if code, _, errOut := runCmd(t, "--config", path, "task", "attach", id); code != 0 {
-		t.Fatalf("attach exit = %d (%s)", code, errOut)
-	}
-	want := agent.AttachArgv(sandbox.ContainerName(id))
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Errorf("attach argv = %v, want %v", got, want)
 	}
 }

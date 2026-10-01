@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
 )
@@ -21,36 +23,36 @@ type scriptedHerdr struct {
 	calls    []string
 }
 
-func (s *scriptedHerdr) run(ctx context.Context, name string, args ...string) (RunResult, error) {
+func (s *scriptedHerdr) run(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
 	s.calls = append(s.calls, strings.Join(args, " "))
 	argv := stripMachine(args)
 	switch strings.Join(argv[:2], " ") {
 	case "agent get":
 		session := argv[2]
 		if s.gone[session] {
-			return RunResult{ExitCode: 1, Stderr: "agent_not_found"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "agent_not_found"}, nil
 		}
 		status := s.statuses[session]
 		if status == "" {
 			status = "working"
 		}
-		return RunResult{Stdout: fmt.Sprintf(
+		return machine.RunResult{Stdout: fmt.Sprintf(
 			`{"result":{"agent":{"agent":"codex","agent_status":%q,"pane_id":"w9:p-%s","workspace_id":"w9"}}}`,
 			status, session)}, nil
 	case "agent read":
 		// herdr 0.9.x prints the pane tail directly, no JSON envelope.
-		return RunResult{Stdout: s.readText + "\n"}, nil
+		return machine.RunResult{Stdout: s.readText + "\n"}, nil
 	case "pane process-info":
 		// The agent stays foreground while the session lives; a dead
 		// agent's pane fell back to its shell (foreground == shell pid).
 		pane := argv[3]
 		sess := strings.TrimPrefix(pane, "w9:p-")
 		if s.gone[sess] {
-			return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":100,"shell_pid":100}}}`}, nil
+			return machine.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":100,"shell_pid":100}}}`}, nil
 		}
-		return RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":4242,"shell_pid":100}}}`}, nil
 	}
-	return RunResult{}, nil
+	return machine.RunResult{}, nil
 }
 
 // openSupervisedStore opens a temp store and returns it with a scripted
@@ -109,15 +111,6 @@ func eventTypes(t *testing.T, store *storage.Store, taskID string) []string {
 	return types
 }
 
-func hasEvent(types []string, want string) bool {
-	for _, typ := range types {
-		if typ == want {
-			return true
-		}
-	}
-	return false
-}
-
 // TestPollRecordsNormalizedState proves the acceptance core: a live Herdr
 // report lands on the owning task as a normalized agent state with an
 // agent.state_changed event.
@@ -135,7 +128,7 @@ func TestPollRecordsNormalizedState(t *testing.T) {
 	if got.AgentState != tasks.AgentWorking {
 		t.Errorf("agent state = %q, want working", got.AgentState)
 	}
-	if !hasEvent(eventTypes(t, store, task.ID), tasks.EventAgentStateChanged) {
+	if !slices.Contains(eventTypes(t, store, task.ID), tasks.EventAgentStateChanged) {
 		t.Error("agent.state_changed event missing")
 	}
 }
@@ -161,7 +154,7 @@ func TestPollBlockedNotifies(t *testing.T) {
 		t.Errorf("agent state = %q, want blocked", got.AgentState)
 	}
 	types := eventTypes(t, store, task.ID)
-	if !hasEvent(types, tasks.EventAgentBlocked) {
+	if !slices.Contains(types, tasks.EventAgentBlocked) {
 		t.Error("agent.blocked event missing")
 	}
 	var notified bool
@@ -321,8 +314,8 @@ func TestPollExitedFiresOnce(t *testing.T) {
 // agent_not_found stays a plain error: an unreachable daemon must not
 // masquerade as a dead session.
 func TestGetHerdrOutageIsNotGone(t *testing.T) {
-	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (RunResult, error) {
-		return RunResult{ExitCode: 1, Stderr: "dial unix /run/herdr.sock: connect: no such file"}, nil
+	l := &Launcher{Runner: func(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
+		return machine.RunResult{ExitCode: 1, Stderr: "dial unix /run/herdr.sock: connect: no such file"}, nil
 	}}
 	_, err := l.Get(context.Background(), "task_x", "herder-task_x")
 	if err == nil || errors.Is(err, ErrSessionGone) {
@@ -349,7 +342,7 @@ func TestPollExitedSession(t *testing.T) {
 	if got.Status != tasks.Running {
 		t.Errorf("exited session must not move the task, got %s", got.Status)
 	}
-	if !hasEvent(eventTypes(t, store, task.ID), tasks.EventAgentExited) {
+	if !slices.Contains(eventTypes(t, store, task.ID), tasks.EventAgentExited) {
 		t.Error("agent.exited event missing")
 	}
 }

@@ -1,13 +1,11 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -16,57 +14,14 @@ import (
 	"github.com/tmih06/herder/internal/textutil"
 )
 
-// RunResult is one finished subprocess: split streams plus exit status.
-// ExitCode is the process exit; err is non-nil only when the binary could
-// not run at all (missing, signaled, context done).
-type RunResult struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
-}
-
-// Runner runs one subprocess; the injectable seam behind DockerProvider.
-// Production uses DefaultRunner (LookPath-resolved binaries, timeout);
-// tests script canned results and assert argv instead of needing a daemon.
-type Runner func(ctx context.Context, name string, args ...string) (RunResult, error)
-
-// runTimeout bounds one docker/git invocation.
-const runTimeout = 2 * time.Minute
-
-// DefaultRunner resolves name in PATH and captures both streams,
-// translating ExitError into ExitCode so "command failed" (a normal exec
-// outcome) is data, not a transport error.
-func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult, error) {
-	path, err := exec.LookPath(name)
-	if err != nil {
-		return RunResult{}, fmt.Errorf("sandbox: %s not in PATH: %w", name, err)
-	}
-	ctx, cancel := context.WithTimeout(ctx, runTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
-	out := RunResult{Stdout: stdout.String(), Stderr: stderr.String()}
-	if runErr == nil {
-		return out, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		out.ExitCode = exitErr.ExitCode()
-		return out, nil
-	}
-	return out, fmt.Errorf("sandbox: run %s: %w", name, runErr)
-}
-
 // DockerProvider provisions least-privilege worker containers through the
 // Docker CLI (SPEC section 24). StateDir roots the controller's SSH
 // assets (<statedir>/ssh); when set, Provision also wires the container
 // as a saved herdr SSH machine (issue #19). Machines is the injectable
 // herdr-machine registry; nil defaults to the real CLI through Runner.
 type DockerProvider struct {
-	// Runner executes subprocesses; DefaultRunner in production.
-	Runner Runner
+	// Runner executes subprocesses; machine.DefaultRunner in production.
+	Runner machine.Runner
 	// Log receives no-op notes (stop/destroy of unknown sandboxes).
 	// Defaults to discard.
 	Log func(format string, args ...any)
@@ -80,19 +35,16 @@ type DockerProvider struct {
 
 // NewDockerProvider builds a DockerProvider on the real CLIs.
 func NewDockerProvider() *DockerProvider {
-	return &DockerProvider{Runner: DefaultRunner, Log: func(string, ...any) {}}
+	return &DockerProvider{Runner: machine.DefaultRunner, Log: func(string, ...any) {}}
 }
 
-// Name reports the config provider key.
-func (p *DockerProvider) Name() string { return "docker" }
-
 // run executes one subprocess through the injectable Runner, falling back
-// to DefaultRunner when none is set.
-func (p *DockerProvider) run(ctx context.Context, name string, args ...string) (RunResult, error) {
+// to machine.DefaultRunner when none is set.
+func (p *DockerProvider) run(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
 	if p.Runner != nil {
 		return p.Runner(ctx, name, args...)
 	}
-	return DefaultRunner(ctx, name, args...)
+	return machine.DefaultRunner(ctx, name, args...)
 }
 
 // logf reports no-op notes to the caller's log, discarding when unset.
@@ -156,10 +108,8 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 		}
 	}
 	if state != "running" {
-		if out, err := p.run(ctx, "docker", "start", name); err != nil {
+		if err := p.startContainer(ctx, name); err != nil {
 			return nil, err
-		} else if out.ExitCode != 0 {
-			return nil, fmt.Errorf("sandbox: start %s: %s", name, textutil.FirstLine(out.Stderr))
 		}
 	}
 	// The entrypoint is `herdr server`: an image without herdr exits
@@ -204,16 +154,14 @@ func (p *DockerProvider) Provision(ctx context.Context, spec Spec) (*Sandbox, er
 // server to open its socket after the container starts.
 const remoteReadyTimeout = 30 * time.Second
 
-// MachineRegistry resolves the injectable registry default, adapting the
-// provider's Runner seam to the machine package's result type.
+// MachineRegistry resolves the injectable registry default: the
+// provider's own Runner is the machine package's shared subprocess
+// seam, so the default registry runs on the same scripted calls.
 func (p *DockerProvider) MachineRegistry() *machine.Registry {
 	if p.Machines != nil {
 		return p.Machines
 	}
-	return &machine.Registry{Runner: func(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
-		out, err := p.run(ctx, name, args...)
-		return machine.RunResult{Stdout: out.Stdout, Stderr: out.Stderr, ExitCode: out.ExitCode}, err
-	}}
+	return &machine.Registry{Runner: p.run}
 }
 
 // ensureSSH converges the worker's SSH access (issue #19): the
@@ -314,7 +262,7 @@ func (p *DockerProvider) create(ctx context.Context, spec Spec, name, workspace 
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--cpus", cpusOf(spec),
 		"--memory", memoryOf(spec),
-		"--pids-limit", strconv.Itoa(pidsOf(spec)),
+		"--pids-limit", strconv.Itoa(DefaultPidsLimit),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--network", "bridge",
@@ -616,13 +564,21 @@ func (p *DockerProvider) EnsureRunning(ctx context.Context, id string) error {
 	case "":
 		return fmt.Errorf("sandbox: ensure-running %s: %w", id, ErrNotFound)
 	}
+	return p.startContainer(ctx, id)
+}
+
+// startContainer runs docker start for a container known to exist but
+// not run: Provision reaches it after create-or-inspect, EnsureRunning
+// after its own state probe. A container that disappeared between the
+// two calls reports ErrNotFound like the other verbs.
+func (p *DockerProvider) startContainer(ctx context.Context, id string) error {
 	out, err := p.run(ctx, "docker", "start", id)
 	if err != nil {
 		return err
 	}
 	if out.ExitCode != 0 {
 		if isNoSuch(out.Stderr) {
-			return fmt.Errorf("sandbox: ensure-running %s: %w", id, ErrNotFound)
+			return fmt.Errorf("sandbox: start %s: %w", id, ErrNotFound)
 		}
 		return fmt.Errorf("sandbox: start %s: %s", id, textutil.FirstLine(out.Stderr))
 	}

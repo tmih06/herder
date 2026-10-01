@@ -40,7 +40,6 @@ func writeTestConfig(t *testing.T) string {
 	return path
 }
 
-
 // TestUnknownCommand Unknown verbs exit 2 with usage.
 func TestUnknownCommand(t *testing.T) {
 	code, _, errOut := runCmd(t, "frobnicate")
@@ -178,7 +177,6 @@ func TestTaskCreateUnknownRepo(t *testing.T) {
 		t.Errorf("stderr should name the unknown repo, got %q", errOut)
 	}
 }
-
 
 // TestIngestAcceptsThroughCLI An eligible delivery claims a queued task
 // visible in task list, task inspect, and ingest log end to end.

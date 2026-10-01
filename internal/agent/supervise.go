@@ -122,10 +122,11 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 		s.logf("herder: supervise: %s: %v", task.ID, err)
 		return
 	}
-	// Herdr keeps the named record after the agent process exits, so a
-	// successful Get is not proof of life: the pane's foreground must
-	// still be the agent. A dead agent is the same exit the gone-session
-	// path handles — the pane stays for post-mortem reads.
+	// Detection clears the record when the agent exits, but it lags the
+	// kill: a record caught in that window still answers Get, so the
+	// pane's foreground must still be the agent. A dead agent is the
+	// same exit the gone-session path handles — the pane stays for
+	// post-mortem reads.
 	if !info.Running {
 		s.onExited(ctx, task)
 		return

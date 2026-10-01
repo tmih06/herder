@@ -7,10 +7,11 @@
 // when the label already exists — so re-provisioning must converge by
 // listing first, and teardown must remove by profile id (labels are not
 // accepted by `machine remove`).
-// Approach: the same Runner seam as sandbox/agent so tests script the
-// herdr CLI; profile ids come from `machine list --json`, never derived.
-// Inputs: SSH target (the container's Host alias) and the machine label
-// (the task id). Flow: List -> Ensure (add when absent) -> Remove.
+// Approach: the Runner seam lets tests script the herdr CLI; profile ids
+// come from `machine list --json`, never derived. Runner, RunResult, and
+// DefaultRunner also serve as the shared subprocess seam used by the
+// worker pipeline; this leaf package owns its single implementation.
+// Flow: List -> Ensure (add when absent) -> Remove.
 // Returns: Machine records carrying the durable profile id.
 package machine
 
@@ -31,7 +32,7 @@ import (
 // remote server, so it needs real time.
 const runTimeout = 2 * time.Minute
 
-// RunResult is one finished herdr invocation: split streams plus exit.
+// RunResult is one finished subprocess: split streams plus exit.
 type RunResult struct {
 	Stdout   string
 	Stderr   string
@@ -43,7 +44,7 @@ type RunResult struct {
 type Runner func(ctx context.Context, name string, args ...string) (RunResult, error)
 
 // DefaultRunner resolves the binary in PATH and captures both streams,
-// translating ExitError into ExitCode so a failed herdr call is data.
+// translating ExitError into ExitCode so a failed command is data.
 func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult, error) {
 	path, err := exec.LookPath(name)
 	if err != nil {
@@ -65,12 +66,12 @@ func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult,
 }
 
 // Machine is one saved SSH machine profile: the durable id herdr minted,
-// its sidebar label, and the SSH target it connects to.
+// its sidebar label, and the SSH target it connects to. The tags mirror
+// `machine list --json` so List decodes rows directly.
 type Machine struct {
-	ID      string
-	Label   string
-	Target  string
-	Enabled bool
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Target string `json:"target"`
 }
 
 // Registry talks to the herdr machine catalog through the CLI.
@@ -96,18 +97,12 @@ func (r *Registry) List(ctx context.Context) ([]Machine, error) {
 	if out.ExitCode != 0 {
 		return nil, fmt.Errorf("machine: list: %s", textutil.FirstLine(out.Stderr))
 	}
-	var raw []struct {
-		ID      string `json:"id"`
-		Label   string `json:"label"`
-		Target  string `json:"target"`
-		Enabled bool   `json:"enabled"`
-	}
-	if err := json.Unmarshal([]byte(out.Stdout), &raw); err != nil {
+	var machines []Machine
+	if err := json.Unmarshal([]byte(out.Stdout), &machines); err != nil {
 		return nil, errors.New("machine: list: unreadable output")
 	}
-	machines := make([]Machine, 0, len(raw))
-	for _, m := range raw {
-		machines = append(machines, Machine{ID: m.ID, Label: m.Label, Target: m.Target, Enabled: m.Enabled})
+	if machines == nil {
+		machines = []Machine{}
 	}
 	return machines, nil
 }
@@ -179,9 +174,12 @@ func (r *Registry) Remove(ctx context.Context, label, target string) error {
 			continue
 		}
 		out, err := r.runner()(ctx, "herdr", "machine", "remove", m.ID)
-		if err != nil && firstErr == nil {
+		if firstErr != nil {
+			continue
+		}
+		if err != nil {
 			firstErr = fmt.Errorf("machine: remove %s: %w", m.ID, err)
-		} else if out.ExitCode != 0 && firstErr == nil {
+		} else if out.ExitCode != 0 {
 			firstErr = fmt.Errorf("machine: remove %s: %s", m.ID, textutil.FirstLine(out.Stderr))
 		}
 	}

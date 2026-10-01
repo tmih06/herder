@@ -26,12 +26,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -224,10 +222,8 @@ func BranchForTask(task tasks.Task) string {
 	if strings.TrimSpace(task.BranchName) != "" {
 		return strings.TrimSpace(task.BranchName)
 	}
-	if _, num, ok := strings.Cut(task.SourceRef, "#"); ok {
-		if n, err := strconv.Atoi(strings.TrimSpace(num)); err == nil && n > 0 {
-			return fmt.Sprintf("herder/%d", n)
-		}
+	if n, ok := deliver.IssueNumber(task.SourceRef); ok {
+		return fmt.Sprintf("herder/%d", n)
 	}
 	return "herder/" + task.ID
 }
@@ -284,16 +280,11 @@ func (d *Dispatcher) Provision(ctx context.Context, cfg *config.Config, task *ta
 	if err := d.advanceToProvisioning(ctx, task); err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]string{
+	return d.emitEvent(task.ID, "sandbox.provisioned", map[string]string{
 		"sandbox": sb.ID, "branch": sb.Branch,
 		"workspace": sb.Workspace, "image": sb.Image,
 		"base_sha": sb.BaseSHA,
 	})
-	if _, err := d.Store.AppendEvent(task.ID, "sandbox.provisioned",
-		d.actorType(), d.actorID(), string(payload)); err != nil {
-		return fmt.Errorf("record provision event: %w", err)
-	}
-	return nil
 }
 
 // advanceToRunning walks QUEUED -> PROVISIONING -> RUNNING so the durable
@@ -418,6 +409,26 @@ func (d *Dispatcher) HoldLease(ctx context.Context, task *tasks.Task) (context.C
 		return nil, nil, err
 	}
 	hctx, cancel := context.WithCancel(ctx)
+	stop := d.BeatLease(hctx, task.ID, owner, cancel)
+	var once sync.Once
+	return hctx, func() {
+		once.Do(func() {
+			stop()
+			cancel()
+			_ = d.Store.ReleaseLease(task.ID, owner)
+		})
+	}, nil
+}
+
+// BeatLease renews the task's lease until stopped: one beat every
+// TTL/HeartbeatDivisor (floor one second) keeps a live dispatch renewed
+// through slow provisions. Only ErrLeaseLost calls cancel — the lease is
+// gone, so the in-flight dispatch aborts instead of finishing work the
+// store already requeued to another owner. Transient store errors warn
+// and keep beating: one missed beat never kills a healthy dispatch.
+// the shared context through stop-then-cancel teardown. The stop func is
+// idempotent: calling it after the beat already exited is a no-op.
+func (d *Dispatcher) BeatLease(ctx context.Context, taskID, owner string, cancel context.CancelFunc) func() {
 	done := make(chan struct{})
 	interval := d.leaseTTL() / HeartbeatDivisor
 	if interval <= 0 {
@@ -430,28 +441,22 @@ func (d *Dispatcher) HoldLease(ctx context.Context, task *tasks.Task) (context.C
 			select {
 			case <-done:
 				return
-			case <-hctx.Done():
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := d.Store.HeartbeatLease(task.ID, owner, d.leaseTTL())
+				err := d.Store.HeartbeatLease(taskID, owner, d.leaseTTL())
 				switch {
 				case err == nil:
 				case errors.Is(err, storage.ErrLeaseLost):
-					d.warnf("herder: dispatch %s: lease lost", task.ID)
+					d.warnf("herder: dispatch %s: lease lost", taskID)
 					cancel()
 					return
 				default:
-					d.warnf("herder: dispatch %s: lease heartbeat: %v", task.ID, err)
+					d.warnf("herder: dispatch %s: lease heartbeat: %v", taskID, err)
 				}
 			}
 		}
 	}()
 	var once sync.Once
-	return hctx, func() {
-		once.Do(func() {
-			close(done)
-			cancel()
-			_ = d.Store.ReleaseLease(task.ID, owner)
-		})
-	}, nil
+	return func() { once.Do(func() { close(done) }) }
 }

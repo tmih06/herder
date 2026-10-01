@@ -7,56 +7,44 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/tmih06/herder/internal/machine"
+	"github.com/tmih06/herder/internal/testutil"
 )
-
-// fakeRunner scripts subprocess results by argv and records every call.
-type fakeRunner struct {
-	calls [][]string
-	// respond maps the joined argv to a result; unmatched calls succeed empty.
-	respond func(name string, args []string) (RunResult, error)
-}
-
-func (f *fakeRunner) run(ctx context.Context, name string, args ...string) (RunResult, error) {
-	f.calls = append(f.calls, append([]string{name}, args...))
-	if f.respond != nil {
-		return f.respond(name, args)
-	}
-	return RunResult{}, nil
-}
 
 // okGit responds to the git half of Provision: fresh workspace (rev-parse
 // fails), successful clone, clean status.
-func okGit(name string, args []string) (RunResult, error) {
+func okGit(name string, args []string) (machine.RunResult, error) {
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "git" && strings.Contains(argv, "rev-parse"):
-		return RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
+		return machine.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
 	case name == "git" && strings.Contains(argv, " clone "):
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	case name == "git" && strings.Contains(argv, "status"):
-		return RunResult{Stdout: ""}, nil
+		return machine.RunResult{Stdout: ""}, nil
 	}
-	return RunResult{}, nil
+	return machine.RunResult{}, nil
 }
 
 func TestProvisionCloneFailureAborts(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "git" && strings.Contains(argv, "rev-parse") {
-			return RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
 		}
 		if name == "git" && strings.Contains(argv, " clone ") {
-			return RunResult{ExitCode: 128, Stderr: "repository not found"}, nil
+			return machine.RunResult{ExitCode: 128, Stderr: "repository not found"}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	_, err := p.Provision(context.Background(), testSpec())
 	if err == nil || !strings.Contains(err.Error(), "clone") {
 		t.Fatalf("failed clone must abort with a clone error, got %v", err)
 	}
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		if len(c) > 0 && c[0] == "docker" {
 			t.Errorf("failed clone must never reach docker, ran %v", c)
 		}
@@ -100,18 +88,18 @@ func TestContainerNameDeterministic(t *testing.T) {
 }
 
 func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		if out, err := okGit(name, args); name == "git" {
 			return out, err
 		}
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect --format") {
-			return RunResult{ExitCode: 1, Stderr: "No such container"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "No such container"}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	sb, err := p.Provision(context.Background(), testSpec())
 	if err != nil {
 		t.Fatalf("provision: %v", err)
@@ -119,7 +107,7 @@ func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
 	if sb.ID != "herder-task_abc123" || sb.Status != "running" || sb.Branch != "herder/7-fix-refresh" {
 		t.Errorf("sandbox = %+v, want deterministic id/running/branch", sb)
 	}
-	create := argvOf(f.calls, "docker", "create")
+	create := argvOf(f.Calls(), "docker", "create")
 	if create == nil {
 		t.Fatal("provision must docker create the missing container")
 	}
@@ -154,21 +142,21 @@ func TestProvisionCreatesLeastPrivilegeContainer(t *testing.T) {
 
 func TestProvisionPreservesDirtyWorkspace(t *testing.T) {
 	var created bool
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		if name == "git" && strings.Contains(argv, "rev-parse") {
-			return RunResult{}, nil // existing checkout
+			return machine.RunResult{}, nil // existing checkout
 		}
 		if name == "git" && strings.Contains(argv, "status") {
-			return RunResult{Stdout: " M internal/api/server.go\n?? scratch.txt\n"}, nil
+			return machine.RunResult{Stdout: " M internal/api/server.go\n?? scratch.txt\n"}, nil
 		}
 		if name == "docker" && args[0] == "create" {
 			created = true
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	_, err := p.Provision(context.Background(), testSpec())
 	var dirty *DirtyError
 	if !errors.As(err, &dirty) {
@@ -177,7 +165,7 @@ func TestProvisionPreservesDirtyWorkspace(t *testing.T) {
 	if created {
 		t.Error("dirty re-provision must never create a container")
 	}
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		if len(c) > 0 && c[0] == "docker" {
 			t.Errorf("dirty re-provision must not touch docker, ran %v", c)
 		}
@@ -185,22 +173,22 @@ func TestProvisionPreservesDirtyWorkspace(t *testing.T) {
 }
 
 func TestProvisionReusesRunningContainer(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		if out, err := okGit(name, args); name == "git" {
 			return out, err
 		}
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect --format") {
-			return RunResult{Stdout: "running\n"}, nil
+			return machine.RunResult{Stdout: "running\n"}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	if _, err := p.Provision(context.Background(), testSpec()); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
-	if argvOf(f.calls, "docker", "create") != nil {
+	if argvOf(f.Calls(), "docker", "create") != nil {
 		t.Error("running container must be reused, not recreated")
 	}
 }
@@ -209,23 +197,23 @@ func TestProvisionReusesRunningContainer(t *testing.T) {
 // sandbox thaws before docker start: start alone cannot wake a paused
 // container, so unpause must precede it in the call log.
 func TestProvisionUnpausesPausedContainer(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		if out, err := okGit(name, args); name == "git" {
 			return out, err
 		}
 		argv := strings.Join(args, " ")
 		if name == "docker" && strings.HasPrefix(argv, "inspect --format") {
-			return RunResult{Stdout: "paused\n"}, nil
+			return machine.RunResult{Stdout: "paused\n"}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	if _, err := p.Provision(context.Background(), testSpec()); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
 	unpause, start := -1, -1
-	for i, c := range f.calls {
+	for i, c := range f.Calls() {
 		if len(c) >= 2 && c[0] == "docker" {
 			switch c[1] {
 			case "unpause":
@@ -236,19 +224,19 @@ func TestProvisionUnpausesPausedContainer(t *testing.T) {
 		}
 	}
 	if unpause < 0 || start < 0 || unpause > start {
-		t.Errorf("paused container must unpause before start, calls %v", f.calls)
+		t.Errorf("paused container must unpause before start, calls %v", f.Calls())
 	}
-	if argvOf(f.calls, "docker", "create") != nil {
+	if argvOf(f.Calls(), "docker", "create") != nil {
 		t.Error("paused container must be thawed, not recreated")
 	}
 }
 
 func TestExecReturnsOutputAndExit(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
-		return RunResult{Stdout: "ok\n", Stderr: "warn\n", ExitCode: 3}, nil
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{Stdout: "ok\n", Stderr: "warn\n", ExitCode: 3}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	res, err := p.Exec(context.Background(), "herder-task_abc123", []string{"go", "test", "./..."})
 	if err != nil {
 		t.Fatalf("exec: %v", err)
@@ -256,21 +244,21 @@ func TestExecReturnsOutputAndExit(t *testing.T) {
 	if res.Stdout != "ok\n" || res.Stderr != "warn\n" || res.ExitCode != 3 {
 		t.Errorf("result = %+v, want split streams with exit 3", res)
 	}
-	if len(f.calls) != 1 {
-		t.Fatalf("exec must run one docker call, ran %v", f.calls)
+	if len(f.Calls()) != 1 {
+		t.Fatalf("exec must run one docker call, ran %v", f.Calls())
 	}
 	want := []string{"docker", "exec", "herder-task_abc123", "go", "test", "./..."}
-	if strings.Join(f.calls[0], " ") != strings.Join(want, " ") {
-		t.Errorf("exec argv = %v, want %v (docker exec takes no --)", f.calls[0], want)
+	if strings.Join(f.Calls()[0], " ") != strings.Join(want, " ") {
+		t.Errorf("exec argv = %v, want %v (docker exec takes no --)", f.Calls()[0], want)
 	}
 }
 
 func TestExecUnknownSandboxIsNotFound(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
-		return RunResult{ExitCode: 1, Stderr: "Error: No such container: herder-gone"}, nil
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{ExitCode: 1, Stderr: "Error: No such container: herder-gone"}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	_, err := p.Exec(context.Background(), "herder-gone", []string{"true"})
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("exec on unknown sandbox must wrap ErrNotFound, got %v", err)
@@ -279,32 +267,31 @@ func TestExecUnknownSandboxIsNotFound(t *testing.T) {
 
 func TestDestroyUnknownIsLoggedNoOp(t *testing.T) {
 	var logged []string
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
-		// docker rm -f masks absence with exit 0, so Destroy pre-checks.
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) { // docker rm -f masks absence with exit 0, so Destroy pre-checks.
 		if name == "docker" && args[0] == "inspect" {
-			return RunResult{ExitCode: 1, Stderr: "Error: No such container"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "Error: No such container"}, nil
 		}
 		// Destroy always sweeps the machine catalog; an empty list means
 		// no profile to remove.
 		if name == "herdr" && strings.Join(args, " ") == "machine list --json" {
-			return RunResult{Stdout: "[]"}, nil
+			return machine.RunResult{Stdout: "[]"}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(f string, a ...any) { logged = append(logged, f) }}
+	p := &DockerProvider{Runner: f.Run, Log: func(f string, a ...any) { logged = append(logged, f) }}
 	if err := p.Destroy(context.Background(), "herder-gone"); err != nil {
 		t.Errorf("destroy of unknown sandbox must be a no-op, got %v", err)
 	}
 	if len(logged) != 1 {
 		t.Errorf("destroy no-op must log once, logged %v", logged)
 	}
-	if argvOf(f.calls, "docker", "rm") != nil {
-		t.Errorf("destroy no-op must not remove anything, ran %v", f.calls)
+	if argvOf(f.Calls(), "docker", "rm") != nil {
+		t.Errorf("destroy no-op must not remove anything, ran %v", f.Calls())
 	}
-	if argvOf(f.calls, "herdr", "machine") != nil &&
-		strings.Join(argvOf(f.calls, "herdr", "machine"), " ") != "herdr machine list --json" {
-		t.Errorf("destroy no-op must not remove a machine profile, ran %v", f.calls)
+	if argvOf(f.Calls(), "herdr", "machine") != nil &&
+		strings.Join(argvOf(f.Calls(), "herdr", "machine"), " ") != "herdr machine list --json" {
+		t.Errorf("destroy no-op must not remove a machine profile, ran %v", f.Calls())
 	}
 }
 
@@ -323,27 +310,27 @@ func TestDestroyRemovesMachineProfileAndSSHFiles(t *testing.T) {
 			t.Fatalf("seed %s: %v", path, err)
 		}
 	}
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		if name == "docker" && args[0] == "inspect" {
-			return RunResult{Stdout: "running\n"}, nil
+			return machine.RunResult{Stdout: "running\n"}, nil
 		}
 		if name == "herdr" && strings.Join(args, " ") == "machine list --json" {
-			return RunResult{Stdout: `[{"id":"m1","label":"task_abc123","target":"herder-task_abc123","enabled":true},` +
+			return machine.RunResult{Stdout: `[{"id":"m1","label":"task_abc123","target":"herder-task_abc123","enabled":true},` +
 				`{"id":"m2","label":"other","target":"herder-task_abc123","enabled":true},` +
 				`{"id":"m3","label":"task_other","target":"herder-task_other","enabled":true}]`}, nil
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
-	p := &DockerProvider{Runner: f.run, StateDir: stateDir, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, StateDir: stateDir, Log: func(string, ...any) {}}
 	if err := p.Destroy(context.Background(), "herder-task_abc123"); err != nil {
 		t.Fatalf("destroy: %v", err)
 	}
-	if argvOf(f.calls, "docker", "rm") == nil {
-		t.Errorf("destroy must docker rm the live container, ran %v", f.calls)
+	if argvOf(f.Calls(), "docker", "rm") == nil {
+		t.Errorf("destroy must docker rm the live container, ran %v", f.Calls())
 	}
 	var removed []string
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		if len(c) == 4 && c[0] == "herdr" && c[1] == "machine" && c[2] == "remove" {
 			removed = append(removed, c[3])
 		}
@@ -368,11 +355,11 @@ func TestShellArgvEntersContainerInteractively(t *testing.T) {
 
 func TestStopUnknownIsLoggedNoOp(t *testing.T) {
 	var logged int
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
-		return RunResult{ExitCode: 1, Stderr: "Error: No such object"}, nil
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{ExitCode: 1, Stderr: "Error: No such object"}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) { logged++ }}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) { logged++ }}
 	if err := p.Stop(context.Background(), "herder-gone"); err != nil {
 		t.Errorf("stop of unknown sandbox must be a no-op, got %v", err)
 	}
@@ -382,14 +369,14 @@ func TestStopUnknownIsLoggedNoOp(t *testing.T) {
 }
 
 func TestInspectParsesLiveSandbox(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
-		return RunResult{Stdout: `[{"Id":"abc","Name":"/herder-task_abc123",` +
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{Stdout: `[{"Id":"abc","Name":"/herder-task_abc123",` +
 			`"Config":{"Image":"golang:1.22-bookworm"},` +
 			`"State":{"Status":"running"},` +
 			`"Mounts":[{"Source":"/state/task_abc123","Destination":"/workspace"}]}]`}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	sb, err := p.Inspect(context.Background(), "herder-task_abc123")
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -403,15 +390,15 @@ func TestInspectParsesLiveSandbox(t *testing.T) {
 }
 
 func TestListShowsManagedSandboxes(t *testing.T) {
-	f := &fakeRunner{}
-	f.respond = func(name string, args []string) (RunResult, error) {
+	f := &testutil.Recorder{}
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		if !strings.Contains(joined, "label=herder-managed=true") {
 			t.Errorf("list must filter managed containers, ran %v", args)
 		}
-		return RunResult{Stdout: "abc\therder-task_a\timg\tUp 3 minutes\n"}, nil
+		return machine.RunResult{Stdout: "abc\therder-task_a\timg\tUp 3 minutes\n"}, nil
 	}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	got, err := p.List(context.Background())
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -432,7 +419,7 @@ func TestNormalizeMemory(t *testing.T) {
 }
 
 func TestProvisionRejectsEmptySpec(t *testing.T) {
-	p := &DockerProvider{Runner: (&fakeRunner{}).run, Log: func(string, ...any) {}}
+	p := &DockerProvider{Runner: (&testutil.Recorder{}).Run, Log: func(string, ...any) {}}
 	if _, err := p.Provision(context.Background(), Spec{}); err == nil {
 		t.Error("empty spec must fail")
 	}
@@ -440,20 +427,20 @@ func TestProvisionRejectsEmptySpec(t *testing.T) {
 
 // statefulDocker fakes a container whose status moves with pause,
 // unpause, and start so EnsureRunning can be tested end to end.
-func statefulDocker(status *string) func(string, []string) (RunResult, error) {
-	return func(name string, args []string) (RunResult, error) {
+func statefulDocker(status *string) func(string, []string) (machine.RunResult, error) {
+	return func(name string, args []string) (machine.RunResult, error) {
 		if name != "docker" {
-			return RunResult{}, nil
+			return machine.RunResult{}, nil
 		}
 		switch args[0] {
 		case "inspect":
-			return RunResult{Stdout: *status + "\n"}, nil
+			return machine.RunResult{Stdout: *status + "\n"}, nil
 		case "pause":
 			*status = "paused"
 		case "unpause", "start":
 			*status = "running"
 		}
-		return RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
 }
 
@@ -461,8 +448,8 @@ func statefulDocker(status *string) func(string, []string) (RunResult, error) {
 // verbs against the container without touching the workspace.
 func TestPauseFreezeThaw(t *testing.T) {
 	status := "running"
-	f := &fakeRunner{respond: statefulDocker(&status)}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	f := &testutil.Recorder{Respond: statefulDocker(&status)}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	if err := p.Pause(context.Background(), "herder-task_x"); err != nil {
 		t.Fatalf("Pause = %v", err)
 	}
@@ -475,8 +462,8 @@ func TestPauseFreezeThaw(t *testing.T) {
 	if status != "running" {
 		t.Errorf("container status = %s, want running", status)
 	}
-	if argvOf(f.calls, "docker", "pause") == nil || argvOf(f.calls, "docker", "unpause") == nil {
-		t.Errorf("expected docker pause and unpause calls, got %v", f.calls)
+	if argvOf(f.Calls(), "docker", "pause") == nil || argvOf(f.Calls(), "docker", "unpause") == nil {
+		t.Errorf("expected docker pause and unpause calls, got %v", f.Calls())
 	}
 }
 
@@ -485,14 +472,14 @@ func TestPauseFreezeThaw(t *testing.T) {
 // ErrNotFound so the caller knows to provision.
 func TestEnsureRunningConverges(t *testing.T) {
 	status := "running"
-	f := &fakeRunner{respond: statefulDocker(&status)}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	f := &testutil.Recorder{Respond: statefulDocker(&status)}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 
 	if err := p.EnsureRunning(context.Background(), "herder-task_x"); err != nil {
 		t.Fatalf("EnsureRunning on running = %v", err)
 	}
-	if len(f.calls) != 1 {
-		t.Errorf("running container needs only the inspect, ran %v", f.calls)
+	if len(f.Calls()) != 1 {
+		t.Errorf("running container needs only the inspect, ran %v", f.Calls())
 	}
 
 	status = "paused"
@@ -507,12 +494,12 @@ func TestEnsureRunningConverges(t *testing.T) {
 	if err := p.EnsureRunning(context.Background(), "herder-task_x"); err != nil {
 		t.Fatalf("EnsureRunning on exited = %v", err)
 	}
-	if status != "running" || argvOf(f.calls, "docker", "start") == nil {
-		t.Errorf("exited container should start, status = %s calls %v", status, f.calls)
+	if status != "running" || argvOf(f.Calls(), "docker", "start") == nil {
+		t.Errorf("exited container should start, status = %s calls %v", status, f.Calls())
 	}
 
-	f.respond = func(name string, args []string) (RunResult, error) {
-		return RunResult{ExitCode: 1, Stderr: "Error: No such container: herder-task_x"}, nil
+	f.Respond = func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{ExitCode: 1, Stderr: "Error: No such container: herder-task_x"}, nil
 	}
 	if err := p.EnsureRunning(context.Background(), "herder-task_x"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing container = %v, want ErrNotFound", err)
@@ -522,15 +509,15 @@ func TestEnsureRunningConverges(t *testing.T) {
 // A local-path remote clones the filesystem path verbatim: the gh
 // credential helper stays URL-scoped and never applies to it.
 func TestProvisionClonesLocalRemote(t *testing.T) {
-	f := &fakeRunner{respond: okGit}
-	p := &DockerProvider{Runner: f.run, Log: func(string, ...any) {}}
+	f := &testutil.Recorder{Respond: okGit}
+	p := &DockerProvider{Runner: f.Run, Log: func(string, ...any) {}}
 	spec := testSpec()
 	spec.RemoteURL = "/srv/git/acme-web.git"
 	if _, err := p.Provision(context.Background(), spec); err != nil {
 		t.Fatalf("Provision = %v", err)
 	}
 	var clone []string
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		if c[0] == "git" && strings.Contains(strings.Join(c, " "), " clone ") {
 			clone = c
 		}

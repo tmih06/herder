@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
+	"github.com/tmih06/herder/internal/testutil"
 )
 
 // fakeExec scripts sandbox exec results by command text and records calls.
@@ -24,30 +26,21 @@ func (f *fakeExec) run(ctx context.Context, id string, cmd []string) (*sandbox.R
 	return &sandbox.Result{}, nil
 }
 
-// fakeGit scripts host-side git results and records argv. A respond func
-// returning the zero RunResult falls through to the defaults:
-// symbolic-ref answers the task branch, everything else an empty success.
-type fakeGit struct {
-	calls   [][]string
-	respond func(args []string) (sandbox.RunResult, error)
-}
-
-func (f *fakeGit) run(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	f.calls = append(f.calls, append([]string{name}, args...))
-	if f.respond != nil {
-		if res, err := f.respond(args); err != nil || res != (sandbox.RunResult{}) {
-			return res, err
+// fakeGit scripts host-side git answers through the shared Recorder.
+// A nil or zero-answer script falls back to the gate's defaults:
+// symbolic-ref reports the task branch, everything else succeeds empty.
+func fakeGit(script func(args []string) (machine.RunResult, error)) *testutil.Recorder {
+	return &testutil.Recorder{Respond: func(_ string, args []string) (machine.RunResult, error) {
+		if script != nil {
+			if res, err := script(args); err != nil || res != (machine.RunResult{}) {
+				return res, err
+			}
 		}
-	}
-	if strings.Contains(strings.Join(args, " "), "symbolic-ref") {
-		return sandbox.RunResult{Stdout: "herder/7\n"}, nil
-	}
-	return sandbox.RunResult{}, nil
-}
-
-// cleanGit answers the host-side probes with an empty diff and clean tree.
-func cleanGit(args []string) (sandbox.RunResult, error) {
-	return sandbox.RunResult{}, nil
+		if strings.Contains(strings.Join(args, " "), "symbolic-ref") {
+			return machine.RunResult{Stdout: "herder/7\n"}, nil
+		}
+		return machine.RunResult{}, nil
+	}}
 }
 
 // collectEvents captures the gate's emitted events in order.
@@ -81,9 +74,9 @@ func testInput(cfg config.ValidationConfig) Input {
 // final validation.passed (issue #6 acceptance criterion).
 func TestGateAllCommandsPass(t *testing.T) {
 	exec := &fakeExec{}
-	git := &fakeGit{respond: cleanGit}
+	git := fakeGit(nil)
 	events := &eventLog{}
-	gate := &Gate{Exec: exec.run, Runner: git.run, Emit: events.emit}
+	gate := &Gate{Exec: exec.run, Runner: git.Run, Emit: events.emit}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{
 		Commands: []string{"gofmt -l .", "go test ./..."},
@@ -119,9 +112,9 @@ func TestGateCommandFailure(t *testing.T) {
 		}
 		return &sandbox.Result{}, nil
 	}}
-	git := &fakeGit{respond: cleanGit}
+	git := fakeGit(nil)
 	events := &eventLog{}
-	gate := &Gate{Exec: exec.run, Runner: git.run, Emit: events.emit}
+	gate := &Gate{Exec: exec.run, Runner: git.Run, Emit: events.emit}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{
 		Commands: []string{"go test ./...", "gofmt -l ."},
@@ -148,17 +141,17 @@ func TestGateCommandFailure(t *testing.T) {
 // even when every command passes.
 func TestGateForbiddenPath(t *testing.T) {
 	exec := &fakeExec{}
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "merge-base"):
-			return sandbox.RunResult{Stdout: "abc123\n"}, nil
+			return machine.RunResult{Stdout: "abc123\n"}, nil
 		case strings.Contains(joined, "diff"):
-			return sandbox.RunResult{Stdout: "internal/app.go\x00.github/workflows/ci.yml\x00"}, nil
+			return machine.RunResult{Stdout: "internal/app.go\x00.github/workflows/ci.yml\x00"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: exec.run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: exec.run, Runner: git.Run}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{
 		Commands:         []string{"go test ./..."},
@@ -181,15 +174,15 @@ func TestGateForbiddenPath(t *testing.T) {
 // Uncommitted or untracked work must fail the clean-tree check naming the
 // offending paths; require_clean_git: false lifts the check.
 func TestGateDirtyTree(t *testing.T) {
-	dirty := func(args []string) (sandbox.RunResult, error) {
+	dirty := func(args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "status") {
-			return sandbox.RunResult{Stdout: " M internal/app.go\n?? notes.txt\n"}, nil
+			return machine.RunResult{Stdout: " M internal/app.go\n?? notes.txt\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}
 	exec := &fakeExec{}
-	git := &fakeGit{respond: dirty}
-	gate := &Gate{Exec: exec.run, Runner: git.run}
+	git := fakeGit(dirty)
+	gate := &Gate{Exec: exec.run, Runner: git.Run}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{}))
 	if err != nil {
@@ -223,7 +216,7 @@ func TestGateExecTransportError(t *testing.T) {
 	exec := &fakeExec{respond: func(cmd string) (*sandbox.Result, error) {
 		return nil, errors.New("container not running")
 	}}
-	gate := &Gate{Exec: exec.run, Runner: (&fakeGit{respond: cleanGit}).run}
+	gate := &Gate{Exec: exec.run, Runner: fakeGit(nil).Run}
 	if _, err := gate.Run(context.Background(), testInput(config.ValidationConfig{
 		Commands: []string{"go test ./..."},
 	})); err == nil {
@@ -235,28 +228,28 @@ func TestGateExecTransportError(t *testing.T) {
 // workspaces still get a forbidden-path scan.
 func TestGateBaseFallback(t *testing.T) {
 	exec := &fakeExec{}
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "merge-base"):
-			return sandbox.RunResult{ExitCode: 128, Stderr: "no origin"}, nil
+			return machine.RunResult{ExitCode: 128, Stderr: "no origin"}, nil
 		case strings.Contains(joined, "origin/HEAD"):
-			return sandbox.RunResult{ExitCode: 128, Stderr: "no origin"}, nil
+			return machine.RunResult{ExitCode: 128, Stderr: "no origin"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: exec.run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: exec.run, Runner: git.Run}
 	if _, err := gate.Run(context.Background(), testInput(config.ValidationConfig{})); err != nil {
 		t.Fatalf("Run = %v", err)
 	}
 	var diff []string
-	for _, c := range git.calls {
+	for _, c := range git.Calls() {
 		if strings.Contains(strings.Join(c, " "), "diff --name-only") {
 			diff = c
 		}
 	}
 	if diff == nil || diff[len(diff)-1] != "HEAD" {
-		t.Errorf("diff base must fall back to HEAD, calls %v", git.calls)
+		t.Errorf("diff base must fall back to HEAD, calls %v", git.Calls())
 	}
 }
 
@@ -264,8 +257,8 @@ func TestGateBaseFallback(t *testing.T) {
 // workspace are agent-writable, so merge-base against origin/HEAD would
 // be forgeable. With BaseSHA set, no ref lookup runs at all.
 func TestGateBaseSHAPinned(t *testing.T) {
-	git := &fakeGit{respond: cleanGit}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+	git := fakeGit(nil)
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	in := testInput(config.ValidationConfig{})
 	in.BaseSHA = "abc123"
@@ -273,7 +266,7 @@ func TestGateBaseSHAPinned(t *testing.T) {
 		t.Fatalf("Run = %v", err)
 	}
 	var diff []string
-	for _, c := range git.calls {
+	for _, c := range git.Calls() {
 		joined := strings.Join(c, " ")
 		if strings.Contains(joined, "merge-base") {
 			t.Errorf("a pinned base must not consult refs, ran %v", c)
@@ -283,7 +276,7 @@ func TestGateBaseSHAPinned(t *testing.T) {
 		}
 	}
 	if diff == nil || diff[len(diff)-1] != "abc123" {
-		t.Errorf("diff must run against the recorded SHA, calls %v", git.calls)
+		t.Errorf("diff must run against the recorded SHA, calls %v", git.Calls())
 	}
 }
 
@@ -291,13 +284,13 @@ func TestGateBaseSHAPinned(t *testing.T) {
 // HEAD: validation proves the task branch's tree and delivery pushes that
 // branch, so a mismatch would ship an unverified ref.
 func TestGateWrongBranch(t *testing.T) {
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "symbolic-ref") {
-			return sandbox.RunResult{Stdout: "agent-scratch\n"}, nil
+			return machine.RunResult{Stdout: "agent-scratch\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{}))
 	if err != nil {
@@ -314,13 +307,13 @@ func TestGateWrongBranch(t *testing.T) {
 // A detached HEAD is a wrong branch too: symbolic-ref exits non-zero and
 // the gate must fail rather than ship an unnamed ref.
 func TestGateDetachedHead(t *testing.T) {
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "symbolic-ref") {
-			return sandbox.RunResult{ExitCode: 128, Stderr: "fatal: ref HEAD is not a symbolic ref"}, nil
+			return machine.RunResult{ExitCode: 128, Stderr: "fatal: ref HEAD is not a symbolic ref"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{}))
 	if err != nil {
@@ -338,25 +331,25 @@ func TestGateDetachedHead(t *testing.T) {
 // origin/HEAD tip: upstream commits after the branch point are not the
 // task's changes and must not trip the forbidden-path check.
 func TestGateDiffsMergeBase(t *testing.T) {
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "merge-base") {
-			return sandbox.RunResult{Stdout: "abc123\n"}, nil
+			return machine.RunResult{Stdout: "abc123\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	if _, err := gate.Run(context.Background(), testInput(config.ValidationConfig{})); err != nil {
 		t.Fatalf("Run = %v", err)
 	}
 	var diff []string
-	for _, c := range git.calls {
+	for _, c := range git.Calls() {
 		if strings.Contains(strings.Join(c, " "), "diff --name-only") {
 			diff = c
 		}
 	}
 	if diff == nil || diff[len(diff)-1] != "abc123" {
-		t.Errorf("diff must run against the merge-base, calls %v", git.calls)
+		t.Errorf("diff must run against the merge-base, calls %v", git.Calls())
 	}
 }
 
@@ -364,14 +357,14 @@ func TestGateDiffsMergeBase(t *testing.T) {
 // -uall lists every untracked file and the -c override pins
 // status.showUntrackedFiles so .git/config cannot hide work.
 func TestGateStatusNotConfigurable(t *testing.T) {
-	git := &fakeGit{respond: cleanGit}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+	git := fakeGit(nil)
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	if _, err := gate.Run(context.Background(), testInput(config.ValidationConfig{})); err != nil {
 		t.Fatalf("Run = %v", err)
 	}
 	var status []string
-	for _, c := range git.calls {
+	for _, c := range git.Calls() {
 		if strings.Contains(strings.Join(c, " "), "status") {
 			status = c
 		}
@@ -385,13 +378,13 @@ func TestGateStatusNotConfigurable(t *testing.T) {
 // git diff -z emits raw paths separated by NUL: a C-quoted name would
 // evade the forbidden glob, so the scan must read the -z format.
 func TestGateDiffNULSeparated(t *testing.T) {
-	git := &fakeGit{respond: func(args []string) (sandbox.RunResult, error) {
+	git := fakeGit(func(args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "diff --name-only") {
-			return sandbox.RunResult{Stdout: ".github/workflows/évil.yml\x00internal/app.go\x00"}, nil
+			return machine.RunResult{Stdout: ".github/workflows/évil.yml\x00internal/app.go\x00"}, nil
 		}
-		return sandbox.RunResult{}, nil
-	}}
-	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.run}
+		return machine.RunResult{}, nil
+	})
+	gate := &Gate{Exec: (&fakeExec{}).run, Runner: git.Run}
 
 	rep, err := gate.Run(context.Background(), testInput(config.ValidationConfig{
 		ForbiddenChanges: []string{".github/workflows/**"},
@@ -403,7 +396,7 @@ func TestGateDiffNULSeparated(t *testing.T) {
 		t.Errorf("forbidden = %v, want the raw UTF-8 path", rep.Forbidden)
 	}
 	var diff []string
-	for _, c := range git.calls {
+	for _, c := range git.Calls() {
 		if strings.Contains(strings.Join(c, " "), "diff --name-only") {
 			diff = c
 		}

@@ -373,5 +373,3 @@ func expandSandboxTargets(ctx context.Context, listManaged func(context.Context)
 	}
 	return out, nil
 }
-
-

@@ -199,7 +199,6 @@ func commitWork(t *testing.T, workspace, rel, content string) {
 	}
 }
 
-
 // taskEvents re-reads one task's event types in order.
 func taskEvents(t *testing.T, cfgPath, id string) []string {
 	t.Helper()
@@ -222,7 +221,6 @@ func taskEvents(t *testing.T, cfgPath, id string) []string {
 	}
 	return types
 }
-
 
 // ghCalls returns the recorded gh argv lines containing the fragment.
 func ghCalls(t *testing.T, state, fragment string) []string {

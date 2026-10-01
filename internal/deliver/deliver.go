@@ -26,19 +26,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/textutil"
 )
 
-// Runner runs one host-side subprocess; satisfied by
-// sandbox.DefaultRunner.
-type Runner = sandbox.Runner
-
 // Engine performs controller-side delivery operations.
 type Engine struct {
 	// Runner executes git/gh on the controller host; defaults to
-	// sandbox.DefaultRunner.
-	Runner Runner
+	// machine.DefaultRunner.
+	Runner machine.Runner
 }
 
 // PushBranch ships the validated head of the task branch to origin under
@@ -260,10 +257,10 @@ func IssueNumber(sourceRef string) (int, bool) {
 }
 
 // run executes one subprocess through the injectable Runner.
-func (e *Engine) run(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
+func (e *Engine) run(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
 	r := e.Runner
 	if r == nil {
-		r = sandbox.DefaultRunner
+		r = machine.DefaultRunner
 	}
 	return r(ctx, name, args...)
 }
