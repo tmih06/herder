@@ -4,12 +4,7 @@ server:
 database:
   path: ~/.local/state/herder/herder.db
 
-herdr:
-  mode: socket
-
 github:
-  app_id: ${HERDER_GITHUB_APP_ID}
-  private_key_file: ${HERDER_GITHUB_PRIVATE_KEY}
   # HMAC secret for X-Hub-Signature-256 on POST /v1/webhooks/github.
   # Empty means deliveries are not verified (local dev only).
   webhook_secret: ${HERDER_GITHUB_WEBHOOK_SECRET}
@@ -58,7 +53,6 @@ repositories:
       require_clean_git: true
     delivery:
       create_pr: true
-      auto_merge: false
       labels:
         running: agent-running
         review: agent-review
