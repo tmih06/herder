@@ -79,10 +79,8 @@ type Spec struct {
 	// CPUs and Memory translate to --cpus/--memory; empty means defaults.
 	CPUs   string
 	Memory string
-	// PidsLimit translates to --pids-limit; <=0 means DefaultPidsLimit.
-	PidsLimit int
-	// WorkspaceRoot holds one directory per task id; empty means a
-	// sandboxes/ sibling of the state database (resolved by the caller).
+	// WorkspaceRoot holds one directory per task id; the caller resolves
+	// it (dispatch roots it beside the state database). Required.
 	WorkspaceRoot string
 }
 
@@ -123,13 +121,12 @@ type Result struct {
 	ExitCode int
 }
 
-// Provider isolates one worker runtime behind task orchestration (SPEC
-// section 23: alternative runtimes without changing orchestration).
-// Provision fuses create+start into the one converging call issue #3
-// needs; Snapshot/Attach land with the agent-launch slice that needs them.
+// Provider isolates one worker runtime behind task orchestration (ADR
+// 0003; SPEC section 23: alternative runtimes without changing
+// orchestration). Provision fuses create+start into the one converging
+// call issue #3 needs; the seam keeps a future runtime from touching
+// tasks, scheduler, or delivery.
 type Provider interface {
-	// Name reports the provider key from config (docker).
-	Name() string
 	// Provision ensures the workspace checkout and a running container,
 	// preserving dirty state via DirtyError.
 	Provision(ctx context.Context, spec Spec) (*Sandbox, error)
@@ -181,31 +178,17 @@ func WorkspacePath(root, taskID string) string {
 
 // imageOf applies the default image.
 func imageOf(spec Spec) string {
-	if strings.TrimSpace(spec.Image) != "" {
-		return strings.TrimSpace(spec.Image)
-	}
-	return DefaultImage
+	return orDefault(spec.Image, DefaultImage)
 }
 
 // cpusOf applies the default CPU limit.
 func cpusOf(spec Spec) string {
-	if strings.TrimSpace(spec.CPUs) != "" {
-		return strings.TrimSpace(spec.CPUs)
-	}
-	return DefaultCPUs
+	return orDefault(spec.CPUs, DefaultCPUs)
 }
 
 // memoryOf normalizes the memory limit to Docker units (4Gi -> 4g).
 func memoryOf(spec Spec) string {
 	return normalizeMemory(orDefault(spec.Memory, DefaultMemory))
-}
-
-// pidsOf applies the default process limit.
-func pidsOf(spec Spec) int {
-	if spec.PidsLimit > 0 {
-		return spec.PidsLimit
-	}
-	return DefaultPidsLimit
 }
 
 var memPattern = regexp.MustCompile(`(?i)^([0-9]+)\s*([kmg])(i)?(b)?$`)

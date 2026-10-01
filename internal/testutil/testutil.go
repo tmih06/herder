@@ -11,9 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/machine"
-	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 )
 
@@ -23,36 +21,19 @@ import (
 type Recorder struct {
 	mu      sync.Mutex
 	calls   [][]string
-	Respond func(name string, args []string) (sandbox.RunResult, error)
+	Respond func(name string, args []string) (machine.RunResult, error)
 }
 
 // Run records the call and answers from Respond; unmatched calls
 // succeed empty.
-func (r *Recorder) Run(_ context.Context, name string, args ...string) (sandbox.RunResult, error) {
+func (r *Recorder) Run(_ context.Context, name string, args ...string) (machine.RunResult, error) {
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string{name}, args...))
 	r.mu.Unlock()
 	if r.Respond != nil {
 		return r.Respond(name, args)
 	}
-	return sandbox.RunResult{}, nil
-}
-
-// DockerRun adapts the script to the sandbox.Runner seam.
-func (r *Recorder) DockerRun(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	return r.Run(ctx, name, args...)
-}
-
-// HerdrRun adapts the script to the agent.Runner seam.
-func (r *Recorder) HerdrRun(ctx context.Context, name string, args ...string) (agent.RunResult, error) {
-	out, err := r.Run(ctx, name, args...)
-	return agent.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
-}
-
-// MachineRun adapts the script to the machine.Runner seam.
-func (r *Recorder) MachineRun(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
-	out, err := r.Run(ctx, name, args...)
-	return machine.RunResult{ExitCode: out.ExitCode, Stdout: out.Stdout, Stderr: out.Stderr}, err
+	return machine.RunResult{}, nil
 }
 
 // Calls returns a copy of the recorded argv log so tests can assert
@@ -125,14 +106,4 @@ func EventTypes(t *testing.T, store *storage.Store, taskID string) []string {
 		types[i] = e.Type
 	}
 	return types
-}
-
-// HasEvent reports whether the type list contains want.
-func HasEvent(types []string, want string) bool {
-	for _, typ := range types {
-		if typ == want {
-			return true
-		}
-	}
-	return false
 }

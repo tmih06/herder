@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -72,14 +73,7 @@ func prepareTask(cfg *config.Config, store *storage.Store, args []string,
 	if err != nil {
 		return fail(1, "herder: task %q not found\n", args[0])
 	}
-	allowed := false
-	for _, s := range states {
-		if task.Status == s {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
+	if !slices.Contains(states, task.Status) {
 		return fail(1, "herder: task %s in %s cannot %s (want %s)\n",
 			task.ID, task.Status, verb, strings.Join(stateNames(states), " or "))
 	}
@@ -186,7 +180,7 @@ func taskDeliver(cfg *config.Config, store *storage.Store, args []string, w, ew 
 		// A task resumed from DELIVERING rests back in REVIEWING; the
 		// delivery.skipped event records why no remote work happened.
 		if task.Status == tasks.Delivering {
-			if err := transition(store, &task, tasks.Reviewing, ew); err != nil {
+			if err := transition(store, &task, tasks.Reviewing); err != nil {
 				fmt.Fprintf(ew, "herder: %v\n", err)
 				return 1
 			}
@@ -316,7 +310,7 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 	// A task already in DELIVERING is resuming after a mid-delivery
 	// failure; the state machine has no self-transition, so skip it.
 	if task.Status != tasks.Delivering {
-		if err := transition(store, task, tasks.Delivering, ew); err != nil {
+		if err := transition(store, task, tasks.Delivering); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return 1
 		}
@@ -331,7 +325,7 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 	if repo.IsLocal() {
 		// Forge-less delivery: the branch is the artifact. No PR, issue
 		// comment, or labels exist to move; the push is the whole ship.
-		if err := transition(store, task, tasks.PROpen, ew); err != nil {
+		if err := transition(store, task, tasks.PROpen); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return 1
 		}
@@ -368,7 +362,7 @@ func deliverPR(ctx context.Context, cfg *config.Config, store *storage.Store,
 			return deliverFailed(store, task, err, ew)
 		}
 	}
-	if err := transition(store, task, tasks.PROpen, ew); err != nil {
+	if err := transition(store, task, tasks.PROpen); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -406,7 +400,7 @@ func taskDone(cfg *config.Config, store *storage.Store, args []string, w, ew io.
 			return 1
 		}
 	}
-	if err := transition(store, &task, tasks.Done, ew); err != nil {
+	if err := transition(store, &task, tasks.Done); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -429,7 +423,7 @@ func runGate(ctx context.Context, store *storage.Store, provider *sandbox.Docker
 	// RUNNING enters the gate normally; REVIEWING/DELIVERING re-enter it
 	// when the branch moved since the recorded pass (drift re-check).
 	if task.Status != tasks.Validating {
-		if err := transition(store, task, tasks.Validating, ew); err != nil {
+		if err := transition(store, task, tasks.Validating); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return validation.Report{}, false
 		}
@@ -460,7 +454,7 @@ func runGate(ctx context.Context, store *storage.Store, provider *sandbox.Docker
 		return rep, false
 	}
 	if rep.Passed() {
-		if err := transition(store, task, tasks.Reviewing, ew); err != nil {
+		if err := transition(store, task, tasks.Reviewing); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return rep, false
 		}
@@ -487,7 +481,7 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 		// RETRYING waypoint would only open a window where reconcile's
 		// lease check requeues the task mid-transition and a second
 		// dispatch launches a duplicate worker.
-		if err := transition(store, task, tasks.Running, ew); err != nil {
+		if err := transition(store, task, tasks.Running); err != nil {
 			fmt.Fprintf(ew, "herder: %v\n", err)
 			return 1
 		}
@@ -495,7 +489,7 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 			bumped.Attempt, summary)
 		if err := launcher.SendPrompt(ctx, task.ID, task.AgentSessionID, prompt); err != nil {
 			// The agent is live but unreachable: a human must look.
-			if err := transition(store, task, tasks.WaitingForHuman, ew); err != nil {
+			if err := transition(store, task, tasks.WaitingForHuman); err != nil {
 				fmt.Fprintf(ew, "herder: %v\n", err)
 			}
 			_ = emitEvent(store, task.ID, "validation.awaiting_human",
@@ -511,7 +505,7 @@ func routeValidationFailure(ctx context.Context, store *storage.Store, task *tas
 			task.ID, bumped.Attempt)
 		return 1
 	}
-	if err := transition(store, task, tasks.WaitingForHuman, ew); err != nil {
+	if err := transition(store, task, tasks.WaitingForHuman); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
@@ -534,7 +528,7 @@ func deliverFailed(store *storage.Store, task *tasks.Task, cause error, ew io.Wr
 }
 
 // transition moves the task and keeps the caller's copy in sync.
-func transition(store *storage.Store, task *tasks.Task, to tasks.State, ew io.Writer) error {
+func transition(store *storage.Store, task *tasks.Task, to tasks.State) error {
 	if _, err := store.Transition(task.ID, to, "controller", "cli"); err != nil {
 		return fmt.Errorf("transition %s -> %s: %w", task.Status, to, err)
 	}

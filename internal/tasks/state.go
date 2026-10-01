@@ -186,13 +186,15 @@ type Event struct {
 }
 
 // NewInput carries the fields New needs to seed a task: source identity,
-// repository, agent profile, and the issue goal text seeded into the
-// agent prompt. Priority orders the dispatch queue (zero is normal).
+// repository, agent profile, the claimed branch, and the issue goal text
+// seeded into the agent prompt. Priority orders the dispatch queue (zero
+// is normal).
 type NewInput struct {
 	SourceProvider string
 	SourceRef      string
 	Repository     string
 	AgentProfile   string
+	BranchName     string
 	Goal           string
 	// DisplayName is the operator-facing panel name (herdr workspace label).
 	DisplayName string
@@ -201,7 +203,7 @@ type NewInput struct {
 
 // New builds a DISCOVERED task with fresh identity and timestamps.
 // Inputs: a NewInput carrying source identity, repository, agent
-// profile, and the issue goal text seeded into the agent prompt.
+// profile, claimed branch, and the issue goal text.
 func New(in NewInput) Task {
 	now := time.Now().UTC()
 	return Task{
@@ -212,6 +214,7 @@ func New(in NewInput) Task {
 		Status:         Discovered,
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
+		BranchName:     in.BranchName,
 		Priority:       in.Priority,
 		DisplayName:    in.DisplayName,
 		Attempt:        1,

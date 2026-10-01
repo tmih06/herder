@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tmih06/herder/internal/config"
-	"github.com/tmih06/herder/internal/storage"
 )
 
 // runCmd runs the CLI with argv and returns exit code plus outputs.
@@ -37,26 +38,6 @@ func writeTestConfig(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
-}
-
-// readTaskGoal opens the test store and returns the task's goal column:
-// task inspect does not print it, so flag coverage reads the row.
-func readTaskGoal(t *testing.T, cfgPath, id string) string {
-	t.Helper()
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := storage.Open(cfg.Database.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	task, err := store.GetTask(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return task.Goal
 }
 
 // TestUnknownCommand Unknown verbs exit 2 with usage.
@@ -157,7 +138,7 @@ func TestTaskCreateGoalThroughCLI(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("create exit = %d (%s)", code, errOut)
 	}
-	if goal := readTaskGoal(t, path, strings.TrimSpace(id)); goal != "Ship the goal flag" {
+	if goal := readTask(t, path, strings.TrimSpace(id)).Goal; goal != "Ship the goal flag" {
 		t.Errorf("goal = %q, want the --goal text", goal)
 	}
 }
@@ -197,20 +178,6 @@ func TestTaskCreateUnknownRepo(t *testing.T) {
 	}
 }
 
-// TestDoctorReportsFiveSections doctor prints all five sections distinctly on a good setup.
-func TestDoctorReportsFiveSections(t *testing.T) {
-	path := writeTestConfig(t)
-	code, out, _ := runCmd(t, "--config", path, "doctor")
-	if code != 0 {
-		t.Errorf("doctor exit = %d, want 0 on a good setup", code)
-	}
-	for _, section := range []string{"controller:", "storage:", "herdr:", "docker:", "ssh:"} {
-		if !strings.Contains(out, section) {
-			t.Errorf("doctor output should report %q distinctly, got:\n%s", section, out)
-		}
-	}
-}
-
 // TestIngestAcceptsThroughCLI An eligible delivery claims a queued task
 // visible in task list, task inspect, and ingest log end to end.
 func TestIngestAcceptsThroughCLI(t *testing.T) {
@@ -230,7 +197,7 @@ func TestIngestAcceptsThroughCLI(t *testing.T) {
 	}
 	taskID := strings.TrimSpace(strings.Split(strings.Split(out, "task: ")[1], "\n")[0])
 	// The issue body seeds the claimed task's agent goal.
-	if goal := readTaskGoal(t, cfg, taskID); !strings.Contains(goal, "The body spells the goal.") {
+	if goal := readTask(t, cfg, taskID).Goal; !strings.Contains(goal, "The body spells the goal.") {
 		t.Errorf("claimed task goal should carry the issue body, got %q", goal)
 	}
 	if _, out, _ := runCmd(t, "--config", cfg, "task", "inspect", taskID); !strings.Contains(out, "policy.decision") {
@@ -326,5 +293,56 @@ func TestTaskCreateNameThroughCLI(t *testing.T) {
 	}
 	if !strings.Contains(out, "name: web-issue-9") {
 		t.Errorf("inspect should print the derived name, got %q", out)
+	}
+}
+
+// A storage-open failure must fail doctor without misclassifying valid
+// controller configuration as broken.
+func TestDoctorSeparatesStorageFailure(t *testing.T) {
+	path := writeTestConfig(t)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cfg.Database.Path, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	code, out, errOut := runCmd(t, "--config", path, "doctor")
+	if code != 1 {
+		t.Fatalf("doctor = %d, want 1: %s", code, errOut)
+	}
+	states := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			states[strings.TrimSuffix(fields[0], ":")] = fields[1]
+		}
+	}
+	if states["controller"] != "ok" || states["storage"] != "fail" {
+		t.Fatalf("doctor misclassified storage failure: %v", states)
+	}
+}
+
+// A valid JSON error from the daemon must not be reported as an empty,
+// healthy task list.
+func TestStatusRejectsDaemonFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"cannot read task state"}`, http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	path := writeTestConfig(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(raw), config.DefaultListen,
+		strings.TrimPrefix(server.URL, "http://"), 1)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runCmd(t, "--config", path, "status")
+	if code != 1 || out != "" {
+		t.Fatalf("status = %d, stdout %q, stderr %q; want failure without a task list", code, out, errOut)
 	}
 }

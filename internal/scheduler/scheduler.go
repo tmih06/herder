@@ -176,16 +176,11 @@ func (s *Scheduler) expireLeases(ctx context.Context) {
 			}
 		}
 		if task.Status != tasks.Queued {
-			if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
-				s.logf("herder: scheduler: expired lease: requeue %s: %v", task.ID, err)
-			}
+			s.transition(task.ID, tasks.Queued)
 		}
-		if _, err := s.Store.AppendEvent(task.ID, tasks.EventLeaseExpired, "controller", s.owner(),
-			tasks.EventPayload(map[string]string{
-				"owner": owner, "task_id": task.ID, "previous_status": string(task.Status),
-			})); err != nil {
-			s.logf("herder: scheduler: expired lease: event %s: %v", task.ID, err)
-		}
+		s.appendEvent(task.ID, tasks.EventLeaseExpired, map[string]string{
+			"owner": owner, "task_id": task.ID, "previous_status": string(task.Status),
+		})
 	}
 }
 
@@ -293,18 +288,14 @@ func (s *Scheduler) enforceTimeout(ctx context.Context, task *tasks.Task) bool {
 		s.logf("herder: scheduler: timeout %s: stop worker: %v", task.ID, err)
 		return true
 	}
-	if _, err := s.Store.Transition(task.ID, tasks.TimedOut, "controller", s.owner()); err != nil {
-		s.logf("herder: scheduler: timeout %s: transition: %v", task.ID, err)
+	if !s.transition(task.ID, tasks.TimedOut) {
 		return true
 	}
-	if _, err := s.Store.AppendEvent(task.ID, tasks.EventTaskTimedOut, "controller", s.owner(),
-		tasks.EventPayload(map[string]string{
-			"timeout":       timeout.String(),
-			"started_at":    task.StartedAt.UTC().Format(time.RFC3339Nano),
-			"agent_profile": task.AgentProfile,
-		})); err != nil {
-		s.logf("herder: scheduler: timeout %s: event: %v", task.ID, err)
-	}
+	s.appendEvent(task.ID, tasks.EventTaskTimedOut, map[string]string{
+		"timeout":       timeout.String(),
+		"started_at":    task.StartedAt.UTC().Format(time.RFC3339Nano),
+		"agent_profile": task.AgentProfile,
+	})
 	return true
 }
 
@@ -343,11 +334,10 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 	// verdict regardless of the status word beside it.
 	if sb.OOMKilled {
 		s.stopWorkerBestEffort(ctx, task)
-		if _, err := s.Store.Transition(task.ID, tasks.Failed, "controller", s.owner()); err != nil {
-			s.logf("herder: scheduler: reconcile %s: fail OOM task: %v", task.ID, err)
+		if !s.transition(task.ID, tasks.Failed) {
 			return false
 		}
-		s.appendDisconnectEvent(task, map[string]string{
+		s.appendEvent(task.ID, tasks.EventWorkerDisconnected, map[string]string{
 			"reason": "resource limit: container OOM-killed", "sandbox": container,
 		})
 		return false
@@ -383,20 +373,31 @@ func (s *Scheduler) checkSandbox(ctx context.Context, task *tasks.Task) bool {
 // decides whether the preserved work retries or stops (SPEC section
 // 48).
 func (s *Scheduler) disconnect(task *tasks.Task, why string, payload map[string]string) {
-	if _, err := s.Store.Transition(task.ID, tasks.WaitingForHuman, "controller", s.owner()); err != nil {
-		s.logf("herder: scheduler: reconcile %s: %s: %v", task.ID, why, err)
+	if !s.transition(task.ID, tasks.WaitingForHuman) {
 		return
 	}
 	payload["reason"] = why
-	s.appendDisconnectEvent(task, payload)
+	s.appendEvent(task.ID, tasks.EventWorkerDisconnected, payload)
 }
 
-// appendDisconnectEvent records worker.disconnected; a failed append
-// only logs because the state change it annotates already committed.
-func (s *Scheduler) appendDisconnectEvent(task *tasks.Task, payload map[string]string) {
-	if _, err := s.Store.AppendEvent(task.ID, tasks.EventWorkerDisconnected,
+// transition applies one scheduler-attributed state change, logging
+// failures: a rejected jump means the task raced elsewhere, so the
+// caller treats false as "leave it alone this pass".
+func (s *Scheduler) transition(taskID string, to tasks.State) bool {
+	if _, err := s.Store.Transition(taskID, to, "controller", s.owner()); err != nil {
+		s.logf("herder: scheduler: transition %s -> %s: %v", taskID, to, err)
+		return false
+	}
+	return true
+}
+
+// appendEvent records one scheduler-attributed event, logging failures:
+// the state change an event annotates has already committed, so a
+// failed append must not abort the pass.
+func (s *Scheduler) appendEvent(taskID, eventType string, payload any) {
+	if _, err := s.Store.AppendEvent(taskID, eventType,
 		"controller", s.owner(), tasks.EventPayload(payload)); err != nil {
-		s.logf("herder: scheduler: reconcile %s: event: %v", task.ID, err)
+		s.logf("herder: scheduler: %s on %s: %v", eventType, taskID, err)
 	}
 }
 
@@ -464,9 +465,6 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 		if workers >= maxWorkers {
 			break
 		}
-		if !s.dispatchable(task.ID, now) {
-			continue
-		}
 		if limit, ok := s.Cfg.Scheduler.PerRepository[task.Repository]; ok && repos[task.Repository] >= limit {
 			continue
 		}
@@ -474,8 +472,16 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 		if limit, ok := s.Cfg.Scheduler.PerAgent[kind]; ok && kinds[kind] >= limit {
 			continue
 		}
+		// Check-and-mark under one lock: already dispatching
+		// (inflight) or inside the retry backoff skips without
+		// consuming a slot.
 		s.mu.Lock()
 		s.maps()
+		until, hasBackoff := s.backoff[task.ID]
+		if s.inflight[task.ID] || (hasBackoff && now.Before(until)) {
+			s.mu.Unlock()
+			continue
+		}
 		s.inflight[task.ID] = true
 		s.mu.Unlock()
 		workers++
@@ -486,29 +492,17 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 	}
 }
 
-// dispatchable reports whether a queued task may start now: not already
-// dispatching and not inside its post-failure backoff window.
-func (s *Scheduler) dispatchable(taskID string, now time.Time) bool {
-	s.mu.Lock()
-	s.maps()
-	defer s.mu.Unlock()
-	if s.inflight[taskID] {
-		return false
-	}
-	until, ok := s.backoff[taskID]
-	return !ok || !now.Before(until)
-}
-
 // dispatchOne runs one task's dispatch under its store lease: acquire,
-// heartbeat through provision and launch, release. The lease — not the
-// queue scan — serializes competing dispatchers: ErrLeaseHeld means
-// someone else owns the task and this attempt simply ends. A dirty
-// workspace or a permanent misconfiguration (ErrPermanent) fails the
-// task — the work is preserved, never re-provisioned over, and a
-// broken config must not requeue forever; any other provision failure
-// requeues with a dispatch_failed event and a backoff stamp so the
-// next tick does not hammer a broken task. Launch failures need no
-// state work here: the launch path already failed the task itself.
+// beat through provision and launch (the dispatcher's shared BeatLease),
+// release. The lease — not the queue scan — serializes competing
+// dispatchers: ErrLeaseHeld means someone else owns the task and this
+// attempt simply ends. A dirty workspace or a permanent misconfiguration
+// (ErrPermanent) fails the task — the work is preserved, never
+// re-provisioned over, and a broken config must not requeue forever; any
+// other provision failure requeues with a dispatch_failed event and a
+// backoff stamp so the next tick does not hammer a broken task. Launch
+// failures need no state work here: the launch path already failed the
+// task itself.
 func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 	defer s.wg.Done()
 	defer func() {
@@ -543,12 +537,14 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 	if cur.Status != tasks.Queued {
 		return
 	}
-	// The heartbeat cancels pctx on lease loss so a mid-flight provision
+	// BeatLease cancels pctx on lease loss so a mid-flight provision
 	// aborts promptly instead of racing the next owner's dispatch for
-	// the full provision timeout.
+	// the full provision timeout; pctx.Err() != nil then marks both the
+	// lost lease and a shutting-down daemon, which share the same "just
+	// end this attempt" disposition.
 	pctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	lost, stopHeartbeat := s.heartbeat(pctx, task.ID, owner, cancel)
+	stopHeartbeat := s.Dispatcher.BeatLease(pctx, task.ID, owner, cancel)
 	defer stopHeartbeat()
 	if err := s.Dispatcher.Provision(pctx, s.Cfg, &cur); err != nil {
 		var dirty *sandbox.DirtyError
@@ -557,7 +553,7 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 			s.failDispatch(cur, err.Error(), true)
 		case errors.Is(err, dispatch.ErrPermanent):
 			s.failDispatch(cur, err.Error(), false)
-		case s.leaseLost(lost) || pctx.Err() != nil:
+		case pctx.Err() != nil:
 			// The lease lapsed mid-provision (or the daemon is
 			// stopping): expireLeases already requeued the task, so
 			// this attempt just ends — no event, no backoff.
@@ -566,7 +562,7 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 		}
 		return
 	}
-	if s.leaseLost(lost) {
+	if pctx.Err() != nil {
 		return
 	}
 	if err := s.Dispatcher.Launch(pctx, s.Cfg, &cur, "", ""); err != nil {
@@ -583,60 +579,6 @@ func (s *Scheduler) dispatchOne(ctx context.Context, task tasks.Task) {
 	s.mu.Lock()
 	delete(s.backoff, task.ID)
 	s.mu.Unlock()
-}
-
-// heartbeat keeps the dispatch lease alive while Provision and Launch
-// run: a slow provision must not let the lease lapse mid-dispatch, or
-// expireLeases would requeue a task whose launch is still live. The
-// goroutine ticks every TTL/3; ErrLeaseLost means the lease is gone —
-// expired under a stalled beat or released — so it closes lost and
-// cancels the dispatch context, aborting the in-flight call instead of
-// racing the next owner for the rest of the provision timeout.
-// Transient store errors only log: one missed beat never kills a
-// healthy dispatch. Returns the loss signal and a stop func for the
-// owning dispatchOne.
-func (s *Scheduler) heartbeat(ctx context.Context, taskID, owner string, cancel context.CancelFunc) (<-chan struct{}, func()) {
-	lost := make(chan struct{})
-	done := make(chan struct{})
-	interval := s.leaseTTL() / dispatch.HeartbeatDivisor
-	if interval <= 0 {
-		interval = time.Second
-	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				err := s.Store.HeartbeatLease(taskID, owner, s.leaseTTL())
-				switch {
-				case err == nil:
-				case errors.Is(err, storage.ErrLeaseLost):
-					s.logf("herder: scheduler: dispatch %s: lease lost", taskID)
-					close(lost)
-					cancel()
-					return
-				default:
-					s.logf("herder: scheduler: dispatch %s: heartbeat: %v", taskID, err)
-				}
-			}
-		}
-	}()
-	return lost, func() { close(done) }
-}
-
-// leaseLost reports whether the heartbeat declared the lease gone.
-func (s *Scheduler) leaseLost(lost <-chan struct{}) bool {
-	select {
-	case <-lost:
-		return true
-	default:
-		return false
-	}
 }
 
 // leaseHeld reports whether a live dispatch lease covers the task: a
@@ -660,17 +602,12 @@ func (s *Scheduler) leaseHeld(taskID string) bool {
 // not retry: a dirty workspace means re-provisioning would destroy
 // uncommitted work, so the task fails with the preservation recorded.
 func (s *Scheduler) failDispatch(task tasks.Task, reason string, preserved bool) {
-	if _, err := s.Store.Transition(task.ID, tasks.Failed, "controller", s.owner()); err != nil {
-		s.logf("herder: scheduler: dispatch %s: fail task: %v", task.ID, err)
-	}
+	s.transition(task.ID, tasks.Failed)
 	payload := map[string]any{"reason": reason, "stage": "provision"}
 	if preserved {
 		payload["workspace_preserved"] = true
 	}
-	if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
-		"controller", s.owner(), tasks.EventPayload(payload)); err != nil {
-		s.logf("herder: scheduler: dispatch %s: event: %v", task.ID, err)
-	}
+	s.appendEvent(task.ID, tasks.EventDispatchFailed, payload)
 }
 
 // requeueDispatch returns a task to QUEUED after a failed or abandoned
@@ -689,20 +626,15 @@ func (s *Scheduler) requeueDispatch(task tasks.Task, stage, reason string) {
 		s.logf("herder: scheduler: dispatch %s: re-read: %v", task.ID, err)
 	} else if cur.Status == tasks.Queued {
 		queued = true
-	} else if _, err := s.Store.Transition(task.ID, tasks.Queued, "controller", s.owner()); err != nil {
-		s.logf("herder: scheduler: dispatch %s: requeue: %v", task.ID, err)
-	} else {
+	} else if s.transition(task.ID, tasks.Queued) {
 		queued = true
 	}
 	if !queued {
 		return
 	}
-	if _, err := s.Store.AppendEvent(task.ID, tasks.EventDispatchFailed,
-		"controller", s.owner(), tasks.EventPayload(map[string]any{
-			"reason": reason, "stage": stage,
-		})); err != nil {
-		s.logf("herder: scheduler: dispatch %s: event: %v", task.ID, err)
-	}
+	s.appendEvent(task.ID, tasks.EventDispatchFailed, map[string]any{
+		"reason": reason, "stage": stage,
+	})
 	s.mu.Lock()
 	s.maps()
 	s.backoff[task.ID] = time.Now().Add(defaultRetryDelay)

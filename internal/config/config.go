@@ -18,7 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,9 +36,11 @@ var supportedSandboxProviders = []string{"docker"}
 // plus other Herdr-supported CLI agents).
 var supportedAgentKinds = []string{"codex", "claude", "opencode", "gemini"}
 
-// Supported Herdr driver modes (SPEC section 17: CLI first, socket for
-// long-lived production orchestration).
-var supportedHerdrModes = []string{"socket", "cli", "disabled"}
+// IsSupportedAgentKind reports whether kind has a supported launch profile.
+// Herdr owns the executable and startup behavior for each supported kind.
+func IsSupportedAgentKind(kind string) bool {
+	return slices.Contains(supportedAgentKinds, kind)
+}
 
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9_.\-/]+$`)
 
@@ -46,7 +48,6 @@ var labelPattern = regexp.MustCompile(`^[A-Za-z0-9_.\-/]+$`)
 type Config struct {
 	Server       ServerConfig                `yaml:"server"`
 	Database     DatabaseConfig              `yaml:"database"`
-	Herdr        HerdrConfig                 `yaml:"herdr"`
 	Github       GithubConfig                `yaml:"github"`
 	Linear       LinearConfig                `yaml:"linear"`
 	API          APIConfig                   `yaml:"api"`
@@ -65,18 +66,10 @@ type DatabaseConfig struct {
 	Path string `yaml:"path"`
 }
 
-// HerdrConfig selects how Herder talks to the Herdr runtime.
-type HerdrConfig struct {
-	Mode string `yaml:"mode"`
-}
-
-// GithubConfig holds GitHub App credentials (env-expanded) plus the
-// webhook signing secret. WebhookSecret empty means deliveries are not
-// signature-verified (documented dev mode); set it in production.
+// GithubConfig holds the env-expanded webhook signing secret.
+// Empty skips signature verification for local development only.
 type GithubConfig struct {
-	AppID          string `yaml:"app_id"`
-	PrivateKeyFile string `yaml:"private_key_file"`
-	WebhookSecret  string `yaml:"webhook_secret"`
+	WebhookSecret string `yaml:"webhook_secret"`
 }
 
 // LinearConfig holds the Linear webhook signing secret (env-expanded)
@@ -227,9 +220,8 @@ type DeliveryLabels struct {
 
 // DeliveryConfig controls pull-request delivery.
 type DeliveryConfig struct {
-	CreatePR  bool           `yaml:"create_pr"`
-	AutoMerge bool           `yaml:"auto_merge"`
-	Labels    DeliveryLabels `yaml:"labels"`
+	CreatePR bool           `yaml:"create_pr"`
+	Labels   DeliveryLabels `yaml:"labels"`
 }
 
 // LabelSet returns the configured stage labels with spec defaults filled:
@@ -286,9 +278,6 @@ func (c *Config) applyDefaults() {
 	if c.Server.Listen == "" {
 		c.Server.Listen = DefaultListen
 	}
-	if c.Herdr.Mode == "" {
-		c.Herdr.Mode = "socket"
-	}
 	if c.Scheduler.MaxWorkers == 0 {
 		c.Scheduler.MaxWorkers = 4
 	}
@@ -304,10 +293,6 @@ func (c *Config) validate() []error {
 	if strings.TrimSpace(c.Database.Path) == "" {
 		errs = append(errs, errors.New("database.path is required (example \"~/.local/state/herder/herder.db\")"))
 	}
-	if !contains(supportedHerdrModes, c.Herdr.Mode) {
-		errs = append(errs, fmt.Errorf("herdr.mode %q unknown: want one of %s",
-			c.Herdr.Mode, strings.Join(supportedHerdrModes, ", ")))
-	}
 	if c.Scheduler.MaxWorkers < 1 {
 		errs = append(errs, fmt.Errorf("scheduler.max_workers must be >= 1, got %d", c.Scheduler.MaxWorkers))
 	}
@@ -321,7 +306,7 @@ func (c *Config) validate() []error {
 		}
 	}
 	for kind, limit := range c.Scheduler.PerAgent {
-		if !contains(supportedAgentKinds, kind) {
+		if !IsSupportedAgentKind(kind) {
 			errs = append(errs, fmt.Errorf("scheduler.per_agent.%q is not a supported agent kind (want one of %s)",
 				kind, strings.Join(supportedAgentKinds, ", ")))
 		}
@@ -363,7 +348,7 @@ func (c *Config) validate() []error {
 		errs = append(errs, errors.New("agents must define at least one agent profile"))
 	}
 	for name, agent := range c.Agents {
-		if !contains(supportedAgentKinds, agent.Kind) {
+		if !IsSupportedAgentKind(agent.Kind) {
 			errs = append(errs, fmt.Errorf("agents.%q.kind %q unknown: want one of %s",
 				name, agent.Kind, strings.Join(supportedAgentKinds, ", ")))
 		}
@@ -401,7 +386,7 @@ func validateRepository(name string, repo RepositoryConfig, agents map[string]Ag
 		errs = append(errs, fmt.Errorf("%s.agent.default %q unknown: defined agent profiles are [%s]",
 			prefix, repo.Agent.Default, strings.Join(sortedKeys(agents), ", ")))
 	}
-	if !contains(supportedSandboxProviders, repo.Sandbox.Provider) {
+	if !slices.Contains(supportedSandboxProviders, repo.Sandbox.Provider) {
 		errs = append(errs, fmt.Errorf("%s.sandbox.provider %q unknown: want one of %s",
 			prefix, repo.Sandbox.Provider, strings.Join(supportedSandboxProviders, ", ")))
 	}
@@ -452,18 +437,6 @@ func validPort(s string) bool {
 	return err == nil && n >= 1 && n <= 65535
 }
 
-// contains reports whether list holds s.
-// Purpose: membership tests for provider/kind/mode allow-lists.
-// Inputs: allow-list and candidate. Returns true on exact match.
-func contains(list []string, s string) bool {
-	for _, item := range list {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
 // sortedKeys returns the map keys in sorted order for stable messages.
 // Purpose: one helper for every name list in errors and CLI output.
 // Inputs: any map with string keys. Returns sorted keys, never nil.
@@ -472,7 +445,7 @@ func sortedKeys[V any](m map[string]V) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 

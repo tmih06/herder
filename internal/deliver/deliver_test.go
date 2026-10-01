@@ -5,22 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tmih06/herder/internal/sandbox"
+	"github.com/tmih06/herder/internal/machine"
+	"github.com/tmih06/herder/internal/testutil"
 )
-
-// fakeRunner scripts subprocess results and records every argv.
-type fakeRunner struct {
-	calls   [][]string
-	respond func(name string, args []string) (sandbox.RunResult, error)
-}
-
-func (f *fakeRunner) run(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
-	f.calls = append(f.calls, append([]string{name}, args...))
-	if f.respond != nil {
-		return f.respond(name, args)
-	}
-	return sandbox.RunResult{}, nil
-}
 
 // findCall returns the recorded argv containing all fragments, or nil.
 func findCall(calls [][]string, fragments ...string) []string {
@@ -45,18 +32,18 @@ outer:
 // SHA must equal the validated head, and the push must target the
 // explicit repository URL with only gh credentials.
 func TestPushBranchStagingRepo(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "rev-parse FETCH_HEAD") {
-			return sandbox.RunResult{Stdout: "deadbeef\n"}, nil
+			return machine.RunResult{Stdout: "deadbeef\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	if err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef"); err != nil {
 		t.Fatalf("PushBranch = %v", err)
 	}
 	var fetch, push []string
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		joined := strings.Join(c, " ")
 		switch {
 		case strings.Contains(joined, "fetch"):
@@ -66,10 +53,10 @@ func TestPushBranchStagingRepo(t *testing.T) {
 		}
 	}
 	if fetch == nil || !strings.Contains(strings.Join(fetch, " "), "uploadpack.packObjectsHook=") {
-		t.Errorf("fetch must neutralize source-side hooks, ran %v", f.calls)
+		t.Errorf("fetch must neutralize source-side hooks, ran %v", f.Calls())
 	}
 	if push == nil {
-		t.Fatalf("missing push call, ran %v", f.calls)
+		t.Fatalf("missing push call, ran %v", f.Calls())
 	}
 	joined := strings.Join(push, " ")
 	if !strings.Contains(joined, "https://github.com/acme/web.git") {
@@ -91,17 +78,17 @@ func TestPushBranchStagingRepo(t *testing.T) {
 // differs from the validated head and the push never runs.
 func TestPushBranchDrift(t *testing.T) {
 	var pushed bool
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "rev-parse FETCH_HEAD"):
-			return sandbox.RunResult{Stdout: "cafef00d\n"}, nil
+			return machine.RunResult{Stdout: "cafef00d\n"}, nil
 		case strings.Contains(joined, "push"):
 			pushed = true
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef")
 	if err == nil || !strings.Contains(err.Error(), "moved") {
 		t.Fatalf("drift must fail naming the move, got %v", err)
@@ -112,13 +99,13 @@ func TestPushBranchDrift(t *testing.T) {
 }
 
 func TestPushBranchFailure(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "push") {
-			return sandbox.RunResult{ExitCode: 1, Stderr: "permission denied"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "permission denied"}, nil
 		}
-		return sandbox.RunResult{Stdout: "deadbeef\n"}, nil
+		return machine.RunResult{Stdout: "deadbeef\n"}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	err := e.PushBranch(context.Background(), "/tmp/ws", "https://github.com/acme/web.git", "herder/7-fix", "deadbeef")
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("push failure must name stderr, got %v", err)
@@ -128,13 +115,13 @@ func TestPushBranchFailure(t *testing.T) {
 // A fresh PR returns its URL; an already-open PR for the branch is found
 // instead of failing (idempotent redelivery, SPEC section 49).
 func TestCreatePR(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "pr create") {
-			return sandbox.RunResult{Stdout: "https://github.com/acme/web/pull/201\n"}, nil
+			return machine.RunResult{Stdout: "https://github.com/acme/web/pull/201\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	url, err := e.CreatePR(context.Background(), "acme/web", "herder/7-fix", "Fix it", "body")
 	if err != nil {
 		t.Fatalf("CreatePR = %v", err)
@@ -142,24 +129,24 @@ func TestCreatePR(t *testing.T) {
 	if url != "https://github.com/acme/web/pull/201" {
 		t.Errorf("url = %q", url)
 	}
-	call := findCall(f.calls, "pr", "create", "--repo", "acme/web", "--head", "herder/7-fix")
+	call := findCall(f.Calls(), "pr", "create", "--repo", "acme/web", "--head", "herder/7-fix")
 	if call == nil {
-		t.Errorf("missing pr create call, ran %v", f.calls)
+		t.Errorf("missing pr create call, ran %v", f.Calls())
 	}
 }
 
 func TestCreatePRAlreadyExists(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "pr create"):
-			return sandbox.RunResult{ExitCode: 1, Stderr: "a pull request for branch already exists"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "a pull request for branch already exists"}, nil
 		case strings.Contains(joined, "pr view"):
-			return sandbox.RunResult{Stdout: "https://github.com/acme/web/pull/201\n"}, nil
+			return machine.RunResult{Stdout: "https://github.com/acme/web/pull/201\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	url, err := e.CreatePR(context.Background(), "acme/web", "herder/7-fix", "t", "b")
 	if err != nil {
 		t.Fatalf("CreatePR = %v", err)
@@ -170,23 +157,23 @@ func TestCreatePRAlreadyExists(t *testing.T) {
 }
 
 func TestCreatePRRealFailure(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
-		return sandbox.RunResult{ExitCode: 1, Stderr: "gh not authenticated"}, nil
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
+		return machine.RunResult{ExitCode: 1, Stderr: "gh not authenticated"}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	if _, err := e.CreatePR(context.Background(), "acme/web", "b", "t", "b"); err == nil {
 		t.Fatal("a failed create with no existing PR must error")
 	}
 }
 
 func TestCommentIssue(t *testing.T) {
-	f := &fakeRunner{}
-	e := &Engine{Runner: f.run}
+	f := &testutil.Recorder{}
+	e := &Engine{Runner: f.Run}
 	if err := e.CommentIssue(context.Background(), "acme/web", 7, "PR opened", ""); err != nil {
 		t.Fatalf("CommentIssue = %v", err)
 	}
-	if findCall(f.calls, "issue", "comment", "7", "--repo", "acme/web") == nil {
-		t.Errorf("missing issue comment call, ran %v", f.calls)
+	if findCall(f.Calls(), "issue", "comment", "7", "--repo", "acme/web") == nil {
+		t.Errorf("missing issue comment call, ran %v", f.Calls())
 	}
 	if err := e.CommentIssue(context.Background(), "acme/web", 0, "x", ""); err == nil {
 		t.Error("issue 0 must fail")
@@ -196,16 +183,16 @@ func TestCommentIssue(t *testing.T) {
 // Label advancement removes the previous stage labels and adds the next
 // in one gh call; nothing to change means no call at all.
 func TestSetLabels(t *testing.T) {
-	f := &fakeRunner{}
-	e := &Engine{Runner: f.run}
+	f := &testutil.Recorder{}
+	e := &Engine{Runner: f.Run}
 	err := e.SetLabels(context.Background(), "acme/web", 7,
 		[]string{"agent-review"}, []string{"agent-ready", "agent-running"})
 	if err != nil {
 		t.Fatalf("SetLabels = %v", err)
 	}
-	call := findCall(f.calls, "issue", "edit", "7")
+	call := findCall(f.Calls(), "issue", "edit", "7")
 	if call == nil {
-		t.Fatalf("missing issue edit call, ran %v", f.calls)
+		t.Fatalf("missing issue edit call, ran %v", f.Calls())
 	}
 	joined := strings.Join(call, " ")
 	for _, want := range []string{"--add-label agent-review", "--remove-label agent-ready", "--remove-label agent-running"} {
@@ -214,12 +201,13 @@ func TestSetLabels(t *testing.T) {
 		}
 	}
 
-	f.calls = nil
+	f = &testutil.Recorder{}
+	e = &Engine{Runner: f.Run}
 	if err := e.SetLabels(context.Background(), "acme/web", 7, nil, nil); err != nil {
 		t.Fatalf("empty SetLabels = %v", err)
 	}
-	if len(f.calls) != 0 {
-		t.Errorf("empty label change must not call gh, ran %v", f.calls)
+	if len(f.Calls()) != 0 {
+		t.Errorf("empty label change must not call gh, ran %v", f.Calls())
 	}
 }
 
@@ -244,23 +232,23 @@ func TestIssueNumber(t *testing.T) {
 // findPR must only match open PRs, so a retried delivery after a closed
 // attempt fails instead of reporting a dead PR.
 func TestCreatePRClosedExisting(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "pr create"):
-			return sandbox.RunResult{ExitCode: 1, Stderr: "a pull request for branch already exists"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "a pull request for branch already exists"}, nil
 		case strings.Contains(joined, "pr view"):
 			// gh applies --jq client-side: select(.state == "OPEN") drops
 			// the merged PR, so stdout is empty.
-			return sandbox.RunResult{Stdout: ""}, nil
+			return machine.RunResult{Stdout: ""}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	if _, err := e.CreatePR(context.Background(), "acme/web", "herder/7-fix", "t", "b"); err == nil {
 		t.Fatal("a closed/merged PR must not satisfy delivery")
 	}
-	view := findCall(f.calls, "pr", "view")
+	view := findCall(f.Calls(), "pr", "view")
 	if view == nil || !strings.Contains(strings.Join(view, " "), `select(.state == "OPEN")`) {
 		t.Errorf("findPR must filter to open PRs, ran %v", view)
 	}
@@ -271,21 +259,21 @@ func TestCreatePRClosedExisting(t *testing.T) {
 // probe paginates so a marker older than the last 100 comments is found.
 func TestCommentIssueIdempotent(t *testing.T) {
 	var comments int
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "issue comment"):
 			comments++
-			return sandbox.RunResult{}, nil
+			return machine.RunResult{}, nil
 		case name == "gh" && strings.HasPrefix(joined, "api"):
 			if !strings.Contains(joined, "--paginate") {
 				t.Errorf("comment probe must paginate past the 100-comment cap, ran %v", args)
 			}
-			return sandbox.RunResult{Stdout: "Herder opened https://github.com/acme/web/pull/201 for this issue\n"}, nil
+			return machine.RunResult{Stdout: "Herder opened https://github.com/acme/web/pull/201 for this issue\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	err := e.CommentIssue(context.Background(), "acme/web", 7,
 		"Herder opened https://github.com/acme/web/pull/201 for this issue",
 		"https://github.com/acme/web/pull/201")
@@ -302,18 +290,18 @@ func TestCommentIssueIdempotent(t *testing.T) {
 // of double-commenting.
 func TestCommentIssueProbeFailure(t *testing.T) {
 	var comments int
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "issue comment"):
 			comments++
-			return sandbox.RunResult{}, nil
+			return machine.RunResult{}, nil
 		case name == "gh" && strings.HasPrefix(joined, "api"):
-			return sandbox.RunResult{ExitCode: 1, Stderr: "HTTP 502"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "HTTP 502"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	err := e.CommentIssue(context.Background(), "acme/web", 7, "body", "marker")
 	if err == nil {
 		t.Fatal("a failed dedup probe must return an error")
@@ -326,24 +314,24 @@ func TestCommentIssueProbeFailure(t *testing.T) {
 // A local-path remote pushes verbatim — no github.com URL is ever
 // constructed, and an empty remote fails instead of guessing one.
 func TestPushBranchLocalRemote(t *testing.T) {
-	f := &fakeRunner{respond: func(name string, args []string) (sandbox.RunResult, error) {
+	f := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if strings.Contains(strings.Join(args, " "), "rev-parse FETCH_HEAD") {
-			return sandbox.RunResult{Stdout: "deadbeef\n"}, nil
+			return machine.RunResult{Stdout: "deadbeef\n"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
-	e := &Engine{Runner: f.run}
+	e := &Engine{Runner: f.Run}
 	if err := e.PushBranch(context.Background(), "/tmp/ws", "/srv/git/acme-web.git", "herder/9-x", "deadbeef"); err != nil {
 		t.Fatalf("PushBranch = %v", err)
 	}
 	var push []string
-	for _, c := range f.calls {
+	for _, c := range f.Calls() {
 		if strings.Contains(strings.Join(c, " "), "push") {
 			push = c
 		}
 	}
 	if push == nil {
-		t.Fatalf("missing push call, ran %v", f.calls)
+		t.Fatalf("missing push call, ran %v", f.Calls())
 	}
 	joined := strings.Join(push, " ")
 	if !strings.Contains(joined, "push /srv/git/acme-web.git") {

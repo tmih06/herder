@@ -105,11 +105,12 @@ than discards; exec output lands in `sandbox.exec` task events.
 Start seeds the agent with the issue goal, source metadata, repository
 instructions (`AGENTS.md`, else `CLAUDE.md` from the checkout), allowed
 operations, and completion requirements (validation commands plus delivery
-policy). The host-visible wrapper carries `HERDR_AGENT=<kind>` so Herdr
-attributes the session to the right agent, and the task-sandbox-session
-link is stored durably: relaunching reuses a live session instead of
-orphaning a pane. An unresolvable profile or agent kind fails the task
-with an `agent.start_failed` event rather than hanging.
+policy). Herdr's native `agent start --kind` chooses the executable, detects
+the process, binds its name, and waits for interactive readiness. The
+task-sandbox-machine-session link is stored durably: relaunching reuses a
+live session instead of orphaning a pane. Controllers and worker images
+need Herdr 0.9.1 or newer. A blocked startup stays visible for intervention;
+an unresolvable profile or kind fails with `agent.start_failed`.
 
 ## Developing
 

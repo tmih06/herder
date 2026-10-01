@@ -45,8 +45,8 @@ worker image, so no agent account is required.
 
 ## Configuration
 
-`herder init` writes `examples/herder.yaml` (pinned identical to
-`internal/config.ExampleYAML`). Every field:
+`herder init` writes the built-in starter; `examples/herder.yaml` is the
+editable deployment example. Core configuration:
 
 ```yaml
 server:
@@ -55,13 +55,8 @@ server:
 database:
   path: ~/.local/state/herder/herder.db   # SQLite state file
 
-herdr:
-  mode: socket                  # socket | cli | disabled — how Herder
-                                # talks to the Herdr runtime
-
 github:
-  app_id: ${HERDER_GITHUB_APP_ID}           # env-expanded at load
-  private_key_file: ${HERDER_GITHUB_PRIVATE_KEY}
+  webhook_secret: ${HERDER_GITHUB_WEBHOOK_SECRET}
 
 scheduler:
   max_workers: 4                # global concurrency cap
@@ -90,7 +85,6 @@ repositories:
       require_clean_git: true   # refuse to ship uncommitted/untracked work
     delivery:
       create_pr: true
-      auto_merge: false
       labels:                   # issue stage labels
         running: agent-running
         review: agent-review
@@ -107,10 +101,17 @@ agents:
 
 Notes:
 
-- `${ENV}` references expand at load; a missing variable fails validation.
+- `${ENV}` references expand at load. Missing required values fail validation;
+  optional secrets may be empty. An empty webhook secret disables signature
+  checks for development; an empty `api.secret` disables direct submissions.
 - Decoding is strict: unknown fields are rejected with a field-level
   message, and `config validate` reports every problem at once.
 - `--config PATH` or `$HERDER_CONFIG` overrides the default location.
+- GitHub delivery uses `gh` authentication (`gh auth login` or `GH_TOKEN`).
+- Remove retired keys from existing configs: `herdr.mode`, `github.app_id`,
+  `github.private_key_file`, and `delivery.auto_merge`. They had no runtime
+  implementation and are now rejected by the strict decoder. Herdr operations
+  always use its public CLI; merging remains a human/forge action.
 
 - Config: `~/.config/herder/config.yaml`
 - Database: `~/.local/state/herder/herder.db` (tasks, events, deliveries,
@@ -127,6 +128,9 @@ Every worker container runs `herdr server` as PID 1 and is registered as
 a saved herdr SSH machine labelled by task id. The controller reaches it
 with `herdr --machine <task-id> …`; a human attaches with
 `herder task attach <id>` (which runs `herdr --remote <container>`).
-Worker images must ship `herdr` and `openssh-server` — see
-`demo/Dockerfile.worker` for the minimal recipe. `herder sandbox
-destroy` removes the machine profile and the task's SSH files.
+Worker images must ship Herdr 0.9.1 or newer, `openssh-server`, and the
+configured agent binary — see `demo/Dockerfile.worker` for the minimal
+recipe. Native `agent start` waits for readiness; the demo uses native
+`pane report-agent` to report its waiting/working state rather than copying
+screen-detection heuristics. `herder sandbox destroy` removes the machine
+profile and the task's SSH files.

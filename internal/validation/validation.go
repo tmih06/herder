@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/textutil"
 )
@@ -55,16 +56,12 @@ const outputCap = 4096
 // *sandbox.DockerProvider.Exec.
 type Executor func(ctx context.Context, id string, cmd []string) (*sandbox.Result, error)
 
-// Runner runs one host-side subprocess (git probes on the workspace);
-// satisfied by sandbox.DefaultRunner.
-type Runner = sandbox.Runner
-
 // Gate runs the repository's validation sequence for one task.
 type Gate struct {
 	// Exec runs commands inside the sandbox; required.
 	Exec Executor
-	// Runner runs host-side git probes; defaults to sandbox.DefaultRunner.
-	Runner Runner
+	// Runner runs host-side git probes; defaults to machine.DefaultRunner.
+	Runner machine.Runner
 	// Emit receives structured events; nil discards them.
 	Emit func(eventType string, payload map[string]any)
 }
@@ -346,10 +343,10 @@ func (g *Gate) baseRef(ctx context.Context, in Input) (string, error) {
 }
 
 // run executes one host-side subprocess through the injectable Runner.
-func (g *Gate) run(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
+func (g *Gate) run(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
 	r := g.Runner
 	if r == nil {
-		r = sandbox.DefaultRunner
+		r = machine.DefaultRunner
 	}
 	return r(ctx, name, args...)
 }
@@ -370,7 +367,7 @@ func porcelainPath(line string) (string, bool) {
 		return "", false
 	}
 	path := line[3:]
-	if line[0] == 'R' || line[0] == 'C' || line[1] == 'R' || line[1] == 'C' {
+	if strings.ContainsAny(line[:2], "RC") {
 		if i := strings.LastIndex(path, " -> "); i >= 0 {
 			path = path[i+4:]
 		}

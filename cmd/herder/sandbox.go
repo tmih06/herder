@@ -168,15 +168,10 @@ func sandboxExec(path string, args []string, w, ew io.Writer) int {
 
 // splitExecArgs cuts <id> -- <command...> at the separator.
 func splitExecArgs(args []string) (target string, cmd []string, ok bool) {
-	for i, a := range args {
-		if a == "--" {
-			if i == 1 && i+1 < len(args) {
-				return args[0], args[i+1:], true
-			}
-			return "", nil, false
-		}
+	if len(args) < 3 || args[0] == "--" || args[1] != "--" {
+		return "", nil, false
 	}
-	return "", nil, false
+	return args[0], args[2:], true
 }
 
 // sandboxList prints every Herder-managed sandbox.
@@ -244,6 +239,7 @@ func sandboxShell(path string, args []string, w, ew io.Writer) int {
 	if store == nil {
 		return 1
 	}
+	defer store.Close()
 	container, _ := resolveTarget(store, args[0])
 	if !containerNamePattern.MatchString(container) {
 		fmt.Fprintf(ew, "herder: sandbox name %q is not a valid container name\n", container)
@@ -268,10 +264,24 @@ func sandboxShell(path string, args []string, w, ew io.Writer) int {
 // sandboxStop halts the container; unknown ids log a no-op via the
 // provider and still exit 0.
 func sandboxStop(path string, args []string, w, ew io.Writer) int {
-	return sandboxOneID(path, args, w, ew, "stop", "stopped",
-		func(ctx context.Context, p *sandbox.DockerProvider, id string) error {
-			return p.Stop(ctx, id)
-		})
+	if len(args) != 1 {
+		fmt.Fprintf(ew, "herder: usage: herder sandbox stop <task-or-container>\n")
+		return 2
+	}
+	_, store, provider := sandboxSetup(path, ew)
+	if store == nil {
+		return 1
+	}
+	defer store.Close()
+	container, _ := resolveTarget(store, args[0])
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := provider.Stop(ctx, container); err != nil {
+		fmt.Fprintf(ew, "herder: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(w, "herder: sandbox %s stopped\n", container)
+	return 0
 }
 
 // sandboxDestroy removes containers; unknown ids log a no-op via the
@@ -340,8 +350,8 @@ func expandSandboxTargets(ctx context.Context, listManaged func(context.Context)
 			matched := 0
 			for _, sb := range managed {
 				short := strings.TrimPrefix(sb.ID, "herder-")
-				ok, _ := gomatch(a, sb.ID)
-				okShort, _ := gomatch(a, short)
+				ok, _ := path.Match(a, sb.ID)
+				okShort, _ := path.Match(a, short)
 				if ok || okShort {
 					matched++
 					if !seen[sb.ID] {
@@ -362,34 +372,4 @@ func expandSandboxTargets(ctx context.Context, listManaged func(context.Context)
 		}
 	}
 	return out, nil
-}
-
-// gomatch wraps path.Match so the pattern type stays local.
-func gomatch(pattern, name string) (bool, error) {
-	return path.Match(pattern, name)
-}
-
-// sandboxOneID runs one stop/destroy-style action against a task id or
-// container name. Unknown ids are a logged no-op with exit 0.
-func sandboxOneID(path string, args []string, w, ew io.Writer, verb, done string,
-	action func(ctx context.Context, p *sandbox.DockerProvider, id string) error,
-) int {
-	if len(args) != 1 {
-		fmt.Fprintf(ew, "herder: usage: herder sandbox %s <task-or-container>\n", verb)
-		return 2
-	}
-	_, store, provider := sandboxSetup(path, ew)
-	if store == nil {
-		return 1
-	}
-	defer store.Close()
-	container, _ := resolveTarget(store, args[0])
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if err := action(ctx, provider, container); err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(w, "herder: sandbox %s %s\n", container, done)
-	return 0
 }

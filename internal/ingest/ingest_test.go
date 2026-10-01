@@ -410,6 +410,8 @@ func TestBranchName(t *testing.T) {
 		"blank title":   {"9", "  !!!  ", "herder/9"},
 		"long title":    {"3", "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk", "herder/3-aaaa-bbbb-cccc-dddd-eeee-ffff-gggg-hhhh"},
 		"unicode title": {"4", "Überprüfung fehlgeschlagen", "herder/4-berpr-fung-fehlgeschlagen"},
+		"unicode fold":  {"4", "Kelvin", "herder/4-kelvin"},
+		"slug limit":    {"3", strings.Repeat("a", 39) + " more", "herder/3-" + strings.Repeat("a", 39)},
 	}
 	for name, tc := range cases {
 		if got := ingest.BranchName(tc.issue, tc.title); got != tc.want {

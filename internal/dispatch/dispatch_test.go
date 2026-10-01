@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/tmih06/herder/internal/agent"
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/deliver"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/storage"
 	"github.com/tmih06/herder/internal/tasks"
@@ -62,59 +64,49 @@ func queueTask(t *testing.T, store *storage.Store) tasks.Task {
 // full inspect reports running, workspace create answers with pane ids,
 // agent get reports the detected kind, and every other call succeeds
 // empty.
-func launchRespond(name string, args []string) (sandbox.RunResult, error) {
+func launchRespond(name string, args []string) (machine.RunResult, error) {
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
-		return sandbox.RunResult{Stdout: `[{"Id":"cid","Name":"/herder-x","Config":{"Image":"img"},"State":{"Status":"running"}}]`}, nil
+		return machine.RunResult{Stdout: `[{"Id":"cid","Name":"/herder-x","Config":{"Image":"img"},"State":{"Status":"running"}}]`}, nil
 	case name == "herdr" && strings.Contains(argv, "workspace create"):
-		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
 	case name == "herdr" && strings.Contains(argv, "agent get"):
-		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
 	case name == "herdr" && strings.Contains(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
+		return machine.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 	case name == "gh" && strings.HasPrefix(argv, "issue view"):
-		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
+		return machine.RunResult{Stdout: "agent-ready\n"}, nil
 	}
-	return sandbox.RunResult{}, nil
+	return machine.RunResult{}, nil
 }
 
 // provisionRespond scripts a fresh provision: no repo yet (clone), clean
 // tree, no container (create + start).
-func provisionRespond(name string, args []string) (sandbox.RunResult, error) {
+func provisionRespond(name string, args []string) (machine.RunResult, error) {
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "git" && strings.Contains(argv, "rev-parse --git-dir"):
-		return sandbox.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
+		return machine.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect "):
-		return sandbox.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
+		return machine.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
 	}
-	return sandbox.RunResult{}, nil
+	return machine.RunResult{}, nil
 }
 
 // provisionThenLaunchRespond scripts a fresh provision followed by a
-// ready sandbox: the first inspect (the provision container check)
-// reports nothing, the full inspect Launch runs reports running, and the
-// Herdr launch flow answers with pane ids and a detected kind.
-func provisionThenLaunchRespond(name string, args []string) (sandbox.RunResult, error) {
+// ready sandbox: the first inspect (the provision container check,
+// inspect --format) reports nothing, then the full inspect Launch runs
+// plus the Herdr launch flow fall through to launchRespond.
+func provisionThenLaunchRespond(name string, args []string) (machine.RunResult, error) {
 	argv := strings.Join(args, " ")
 	switch {
 	case name == "git" && strings.Contains(argv, "rev-parse --git-dir"):
-		return sandbox.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
+		return machine.RunResult{ExitCode: 1, Stderr: "not a git repo"}, nil
 	case name == "docker" && strings.HasPrefix(argv, "inspect --format"):
-		return sandbox.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
-	case name == "docker" && strings.HasPrefix(argv, "inspect "):
-		return sandbox.RunResult{Stdout: `[{"Id":"cid","Name":"/herder-x","Config":{"Image":"img"},"State":{"Status":"running"}}]`}, nil
-	case name == "herdr" && strings.Contains(argv, "workspace create"):
-		return sandbox.RunResult{Stdout: `{"result":{"root_pane":{"pane_id":"w5:p7"},"workspace":{"workspace_id":"w5"}}}`}, nil
-	case name == "herdr" && strings.Contains(argv, "agent get"):
-		return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"idle","pane_id":"w5:p7"}}}`}, nil
-	case name == "herdr" && strings.Contains(argv, "pane process-info"):
-		return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
-	case name == "gh" && strings.HasPrefix(argv, "issue view"):
-		return sandbox.RunResult{Stdout: "agent-ready\n"}, nil
+		return machine.RunResult{ExitCode: 1, Stderr: "No such object: herder-x"}, nil
 	}
-	return sandbox.RunResult{}, nil
+	return launchRespond(name, args)
 }
 
 // TestBranchForTaskFallback derives the deterministic branch: claimed
@@ -164,9 +156,9 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
-		Engine:   &deliver.Engine{Runner: rec.DockerRun},
+		Launcher: &agent.Launcher{Runner: rec.Run},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
+		Engine:   &deliver.Engine{Runner: rec.Run},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
 	}
 	if err := d.Launch(context.Background(), testConfig(), &task, "", ""); err != nil {
@@ -192,7 +184,7 @@ func TestLaunchQueuedAcquiresAndReleasesLease(t *testing.T) {
 	}
 	types := testutil.EventTypes(t, store, task.ID)
 	for _, want := range []string{tasks.EventLeaseAcquired, tasks.EventLeaseReleased, "agent.started"} {
-		if !testutil.HasEvent(types, want) {
+		if !slices.Contains(types, want) {
 			t.Errorf("events %v missing %q", types, want)
 		}
 	}
@@ -219,8 +211,8 @@ func TestLaunchQueuedLeaseHeld(t *testing.T) {
 	rec := &testutil.Recorder{Respond: launchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Launcher: &agent.Launcher{Runner: rec.Run},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
 	}
 	err := d.Launch(context.Background(), testConfig(), &task, "", "")
 	if err == nil {
@@ -257,7 +249,7 @@ func TestProvisionEmitsEventAndAdvances(t *testing.T) {
 	var logs []string
 	d := &Dispatcher{
 		Store:    store,
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
 		Logf:     func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
 	}
 	if err := d.Provision(context.Background(), testConfig(), &task); err != nil {
@@ -273,7 +265,7 @@ func TestProvisionEmitsEventAndAdvances(t *testing.T) {
 	if got.Status != tasks.Provisioning {
 		t.Errorf("stored status = %s, want PROVISIONING", got.Status)
 	}
-	if !testutil.HasEvent(testutil.EventTypes(t, store, task.ID), "sandbox.provisioned") {
+	if !slices.Contains(testutil.EventTypes(t, store, task.ID), "sandbox.provisioned") {
 		t.Error("sandbox.provisioned event missing")
 	}
 	var running bool
@@ -297,9 +289,9 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 	rec := &testutil.Recorder{Respond: provisionThenLaunchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
-		Engine:   &deliver.Engine{Runner: rec.DockerRun},
+		Launcher: &agent.Launcher{Runner: rec.Run},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
+		Engine:   &deliver.Engine{Runner: rec.Run},
 	}
 	if err := d.Provision(context.Background(), testConfig(), &task); err != nil {
 		t.Fatalf("Provision = %v", err)
@@ -325,7 +317,7 @@ func TestLaunchAdvancesProvisioningToRunning(t *testing.T) {
 	}
 	types := testutil.EventTypes(t, store, task.ID)
 	for _, want := range []string{"sandbox.provisioned", "agent.started"} {
-		if !testutil.HasEvent(types, want) {
+		if !slices.Contains(types, want) {
 			t.Errorf("events %v missing %q", types, want)
 		}
 	}
@@ -338,7 +330,7 @@ func TestProvisionRejectsUnconfiguredRepo(t *testing.T) {
 	task := queueTask(t, store)
 	task.Repository = "acme/unknown"
 	rec := &testutil.Recorder{Respond: provisionRespond}
-	d := &Dispatcher{Store: store, Provider: &sandbox.DockerProvider{Runner: rec.DockerRun}}
+	d := &Dispatcher{Store: store, Provider: &sandbox.DockerProvider{Runner: rec.Run}}
 	err := d.Provision(context.Background(), testConfig(), &task)
 	if err == nil || !strings.Contains(err.Error(), `task repository "acme/unknown" not in config`) {
 		t.Fatalf("Provision = %v, want the not-in-config error", err)
@@ -387,16 +379,16 @@ func TestStaleLabels(t *testing.T) {
 func TestMarkIssueRunningWarnsNeverFails(t *testing.T) {
 	store := testutil.OpenStore(t)
 	task := queueTask(t, store)
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		if name == "gh" {
-			return sandbox.RunResult{ExitCode: 1, Stderr: "gh: command not found"}, nil
+			return machine.RunResult{ExitCode: 1, Stderr: "gh: command not found"}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
 	var warns []string
 	d := &Dispatcher{
 		Store:  store,
-		Engine: &deliver.Engine{Runner: rec.DockerRun},
+		Engine: &deliver.Engine{Runner: rec.Run},
 		Warnf:  func(format string, args ...any) { warns = append(warns, fmt.Sprintf(format, args...)) },
 	}
 	d.MarkIssueRunning(&task, testConfig().Repositories["acme/web"])
@@ -409,21 +401,21 @@ func TestMarkIssueRunningWarnsNeverFails(t *testing.T) {
 // before the session's pane closes: a frozen agent would survive the
 // close and wake as an orphan.
 func TestStopWorkerThawsBeforeStopping(t *testing.T) {
-	rec := &testutil.Recorder{Respond: func(name string, args []string) (sandbox.RunResult, error) {
+	rec := &testutil.Recorder{Respond: func(name string, args []string) (machine.RunResult, error) {
 		argv := strings.Join(args, " ")
 		switch {
 		case name == "docker" && strings.HasPrefix(argv, "inspect "):
-			return sandbox.RunResult{Stdout: "paused"}, nil
+			return machine.RunResult{Stdout: "paused"}, nil
 		case name == "herdr" && strings.Contains(argv, "agent get"):
-			return sandbox.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w1:p1"}}}`}, nil
+			return machine.RunResult{Stdout: `{"result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"w1:p1"}}}`}, nil
 		case name == "herdr" && strings.Contains(argv, "pane process-info"):
-			return sandbox.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
+			return machine.RunResult{Stdout: `{"result":{"process_info":{"foreground_process_group_id":42,"shell_pid":7}}}`}, nil
 		}
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
 	d := &Dispatcher{
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
+		Launcher: &agent.Launcher{Runner: rec.Run},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
 	}
 	task := &tasks.Task{ID: "task_abc", Status: tasks.Paused, AgentSessionID: "herder-task_abc"}
 	if err := d.StopWorker(context.Background(), task); err != nil {
@@ -475,9 +467,9 @@ func TestSpecForTaskLocalRemote(t *testing.T) {
 // single engine call even when the source ref parses as an issue number.
 func TestAdvanceIssueLabelsSkipsLocalRepo(t *testing.T) {
 	calls := 0
-	engine := &deliver.Engine{Runner: func(ctx context.Context, name string, args ...string) (sandbox.RunResult, error) {
+	engine := &deliver.Engine{Runner: func(ctx context.Context, name string, args ...string) (machine.RunResult, error) {
 		calls++
-		return sandbox.RunResult{}, nil
+		return machine.RunResult{}, nil
 	}}
 	d := &Dispatcher{Store: nil, Engine: engine}
 	repo := testConfig().Repositories["acme/web"]
@@ -501,9 +493,9 @@ func TestLaunchUsesDisplayNameForWorkspace(t *testing.T) {
 	rec := &testutil.Recorder{Respond: launchRespond}
 	d := &Dispatcher{
 		Store:    store,
-		Launcher: &agent.Launcher{Runner: rec.HerdrRun},
-		Provider: &sandbox.DockerProvider{Runner: rec.DockerRun},
-		Engine:   &deliver.Engine{Runner: rec.DockerRun},
+		Launcher: &agent.Launcher{Runner: rec.Run},
+		Provider: &sandbox.DockerProvider{Runner: rec.Run},
+		Engine:   &deliver.Engine{Runner: rec.Run},
 		Logf:     func(string, ...any) {},
 	}
 	if err := d.Launch(context.Background(), testConfig(), &task, "", ""); err != nil {

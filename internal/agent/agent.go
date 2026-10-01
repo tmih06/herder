@@ -7,15 +7,15 @@
 //
 // Why: black-box runners hide the worker; Herder stays glass-box by keeping
 // the agent in a real Herdr pane the host can watch, prompt, and attach.
-// Approach: Stage 1 CLI orchestration (SPEC section 17) against the real
+// Approach: CLI orchestration (SPEC section 17) against the real
 // Herdr 0.9.x surface, forwarded to the worker's container-local herdr
 // server (issue #19): every call carries `--machine <task-id>`, so
-// `workspace create` yields a shell pane inside the sandbox, `pane run`
-// starts the real agent binary, in-container Herdr detects it by its own
-// process inspection — no comm spoofing — `agent rename` binds the
-// deterministic session name, and `agent prompt` seeds the task contract.
-// The Runner seam scripts subprocesses in tests; the socket API comes
-// later.
+// `workspace create` yields a shell pane inside the sandbox and
+// `agent start <name> --kind <kind> --pane <id>` lets the remote Herdr
+// run the canonical binary, detect the real process (no comm spoofing),
+// bind the deterministic session name, and gate on interactive
+// readiness; `agent prompt` seeds the task contract. The machine.Runner
+// seam scripts subprocesses in tests.
 // Inputs: task + repo/agent config + a provisioned worker (container plus
 // saved machine profile). Flow: ResolveProfile -> BuildPrompt ->
 // Launcher.Start records the session name; attach re-enters via
@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -37,6 +36,7 @@ import (
 	"time"
 
 	"github.com/tmih06/herder/internal/config"
+	"github.com/tmih06/herder/internal/machine"
 	"github.com/tmih06/herder/internal/sandbox"
 	"github.com/tmih06/herder/internal/tasks"
 	"github.com/tmih06/herder/internal/textutil"
@@ -46,30 +46,9 @@ import (
 // agent needs the working rules, not the entire handbook.
 const instructionCap = 8000
 
-// runTimeout bounds one Herdr CLI invocation: machine-forwarded calls open
-// an SSH connection to the worker, so the bound covers transport plus the
-// remote call and must still fail fast instead of hanging a task launch.
-const runTimeout = 2 * time.Minute
-
-// agentCommands maps a configured agent kind to the binary invoked inside
-// the sandbox. v0.1 covers the Herdr-supported CLI agents from the
-// validated config allow-list; an unmapped kind is a caller-visible error.
-var agentCommands = map[string]string{
-	"codex":    "codex",
-	"claude":   "claude",
-	"opencode": "opencode",
-	"gemini":   "gemini",
-}
-
-// CommandForKind reports the sandbox binary for an agent kind.
-func CommandForKind(kind string) (string, bool) {
-	cmd, ok := agentCommands[kind]
-	return cmd, ok
-}
-
 // sessionNameSafe mirrors sandbox.ContainerName's charset rule: Herdr
-// session names must match ^[a-z][a-z0-9_-]{0,31}$, so anything outside
-// the class becomes a dash instead of failing `agent rename` at launch.
+// agent names must match ^[a-z][a-z0-9_-]{0,31}$, so anything outside
+// the class becomes a dash instead of failing `agent start` at launch.
 var sessionNameSafe = regexp.MustCompile(`[^a-z0-9_-]+`)
 
 // SessionName derives the deterministic Herdr session for a task.
@@ -223,52 +202,11 @@ func LoadRepoInstructions(workspace string) string {
 	return ""
 }
 
-// RunResult is one finished Herdr invocation: split streams plus exit.
-type RunResult struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
-}
-
-// Runner runs one subprocess; the injectable seam behind Launcher so tests
-// script Herdr results instead of needing a live server.
-type Runner func(ctx context.Context, name string, args ...string) (RunResult, error)
-
-// DefaultRunner resolves the binary in PATH and captures both streams,
-// translating ExitError into ExitCode so a failed Herdr call is data the
-// launcher can turn into a task event, not a transport mystery.
-func DefaultRunner(ctx context.Context, name string, args ...string) (RunResult, error) {
-	path, err := exec.LookPath(name)
-	if err != nil {
-		return RunResult{}, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, runTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, args...)
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			return RunResult{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exit.ExitCode()}, nil
-		}
-		return RunResult{}, err
-	}
-	return RunResult{Stdout: stdout.String(), Stderr: stderr.String()}, nil
-}
-
 // Launcher starts agents, seeds prompts, and probes sessions through the
-// Herdr CLI forwarded to the worker's machine. DetectTimeout bounds the
-// post-launch wait for the remote Herdr to classify the agent kind
-// (default detectTimeout); PollInterval spaces those probes (default
-// pollInterval). Both exist for tests.
+// Herdr CLI forwarded to the worker's machine.
 type Launcher struct {
-	// Runner executes subprocesses; nil means DefaultRunner.
-	Runner Runner
-	// DetectTimeout bounds the agent-detection wait after pane run.
-	DetectTimeout time.Duration
-	// PollInterval spaces detection probes.
-	PollInterval time.Duration
+	// Runner executes subprocesses; nil means machine.DefaultRunner.
+	Runner machine.Runner
 }
 
 // StartInput describes one agent launch: the deterministic session name,
@@ -294,18 +232,19 @@ type StartResult struct {
 	WorkspaceID string
 }
 
-// detectTimeout is the default bound on the remote Herdr classifying the
-// agent kind: detection polls the pane's foreground process over SSH, so
-// a few seconds covers scheduling jitter without hanging a launch.
-const detectTimeout = 15 * time.Second
-
-// pollInterval spaces detection probes inside DetectTimeout.
-const pollInterval = 250 * time.Millisecond
-
-// promptReadyTimeout bounds the agent_not_ready retry window on the first
-// prompt: Herdr may detect the agent before it reports the pane ready for
-// input, so a short retry absorbs the gap.
+// promptReadyTimeout bounds the agent_not_ready retry window on a prompt:
+// `agent start` returns ready agents and reports blocked ones, but a
+// re-seeded session can catch the agent mid-classification — a short
+// retry absorbs the gap.
 const promptReadyTimeout = 10 * time.Second
+
+// paneReadyTimeout bounds the agent_pane_busy retry on a freshly created
+// pane: `agent start` requires the pane's shell to own the foreground, and
+// a brand-new pane can still be initializing when the create call returns.
+const paneReadyTimeout = 10 * time.Second
+
+// paneReadyPoll spaces agent_pane_busy retries inside paneReadyTimeout.
+const paneReadyPoll = 500 * time.Millisecond
 
 // machineArgv prefixes every forwarded Herdr call with the machine
 // selector: `herdr --machine <label> <args...>`.
@@ -316,31 +255,26 @@ func machineArgv(machineLabel string, args ...string) []string {
 // Start launches the agent in a pane on the worker's container-local
 // Herdr server and seeds its prompt.
 // Flow (herdr 0.9.x, verified live): create a one-pane workspace labelled
-// with the session name at the container's /workspace, `pane run` the
-// agent binary, poll `agent get <pane>` until the remote Herdr classifies
-// the real process as the agent kind, `agent rename` the detected agent
-// to the deterministic session name, then `agent prompt` the task
-// contract — every call forwarded with `--machine <task-id>`.
+// with the session name at the container's /workspace, then a single
+// `agent start <name> --kind <kind> --pane <id>` — the remote Herdr runs
+// the kind's canonical executable, detects the real process, binds the
+// session name, and returns only once the agent is ready for input —
+// then `agent prompt` the task contract. Every call is forwarded with
+// `--machine <task-id>`.
 // Unknown kinds fail before any subprocess so the caller can fail the task
 // with a clear event instead of hanging (acceptance criterion). Any
 // failure after the pane exists closes it best-effort — closing the
-// workspace's last pane removes the workspace, so no layout leaks.
+// workspace's last pane removes the workspace, so no layout leaks. The
+// one exception is agent_not_ready: `agent start` returns it when the
+// agent boots to a blocked screen, and the named agent stays live for
+// human intervention — the pane is kept so the session can still bind.
 func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error) {
-	cmd, ok := CommandForKind(in.AgentKind)
-	if !ok {
+	if !config.IsSupportedAgentKind(in.AgentKind) {
 		return StartResult{}, fmt.Errorf("agent: unknown agent kind %q (want codex, claude, opencode, gemini)", in.AgentKind)
 	}
 	if strings.TrimSpace(in.Machine) == "" {
 		return StartResult{}, fmt.Errorf("agent: no machine configured for %s", in.Session)
 	}
-	// `pane run` joins its argv with raw spaces and the pane's shell
-	// re-parses the result, so the command token must be space- and
-	// metachar-free. A violation would type a broken or injected command
-	// line into the pane — refuse before it runs.
-	if strings.ContainsAny(cmd, " \t\n\"'\\$`;&|<>(){}[]") {
-		return StartResult{}, fmt.Errorf("agent: pane run command %q is not shell-safe", cmd)
-	}
-	run := l.runner()
 	// A previous launch under this label can leave a dead workspace
 	// behind (a remote server restart restores panes as shells; the name
 	// record is gone but the workspace lingers). Close same-label
@@ -350,9 +284,8 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		label = in.Session
 	}
 	l.closeStaleWorkspaces(ctx, in.Machine, label)
-	out, err := run(ctx, "herdr", machineArgv(in.Machine, "workspace", "create",
-		"--label", label, "--cwd", sandbox.ContainerWorkspace,
-		"--env", "HERDR_AGENT="+in.AgentKind, "--no-focus")...)
+	out, err := l.runner()(ctx, "herdr", machineArgv(in.Machine, "workspace", "create",
+		"--label", label, "--cwd", sandbox.ContainerWorkspace, "--no-focus")...)
 	if err != nil {
 		return StartResult{}, fmt.Errorf("agent: workspace create %s: %w", in.Session, err)
 	}
@@ -369,29 +302,14 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		l.closePaneBestEffort(in.Machine, paneID)
 		return res, err
 	}
-	if out, err := run(ctx, "herdr", machineArgv(in.Machine, "pane", "run", paneID, cmd)...); err != nil {
-		return fail(fmt.Errorf("agent: pane run %s: %w", in.Session, err))
-	} else if out.ExitCode != 0 {
-		return fail(fmt.Errorf("agent: pane run %s: %s", in.Session, textutil.FirstLine(out.Stderr)))
-	}
-	if err := l.waitDetected(ctx, in.Machine, paneID, in.AgentKind); err != nil {
+	if err := l.startAgent(ctx, in.Machine, in.Session, in.AgentKind, paneID); err != nil {
+		if strings.Contains(err.Error(), "agent_not_ready") {
+			// Blocked during startup (e.g. a first-run trust or sign-in
+			// screen): the agent is live and already holds the session
+			// name, so keep the pane — a human can unblock and re-seed.
+			return res, err
+		}
 		return fail(err)
-	}
-	if out, err := run(ctx, "herdr", machineArgv(in.Machine, "agent", "rename", paneID, in.Session)...); err != nil {
-		return fail(fmt.Errorf("agent: rename %s: %w", in.Session, err))
-	} else if out.ExitCode != 0 {
-		// A stale pane can still hold the session name after its agent
-		// died (Herdr keeps the record until the pane closes): clear the
-		// dead claimant and retry once before failing the launch.
-		if !strings.Contains(out.Stderr, "agent_name_taken") ||
-			l.clearSessionName(ctx, in.Machine, in.Session) != nil {
-			return fail(fmt.Errorf("agent: rename %s: %s", in.Session, textutil.FirstLine(out.Stderr)))
-		}
-		if out, err := run(ctx, "herdr", machineArgv(in.Machine, "agent", "rename", paneID, in.Session)...); err != nil {
-			return fail(fmt.Errorf("agent: rename %s: %w", in.Session, err))
-		} else if out.ExitCode != 0 {
-			return fail(fmt.Errorf("agent: rename %s: %s", in.Session, textutil.FirstLine(out.Stderr)))
-		}
 	}
 
 	if err := l.SendPrompt(ctx, in.Machine, in.Session, in.Prompt); err != nil {
@@ -400,6 +318,47 @@ func (l *Launcher) Start(ctx context.Context, in StartInput) (StartResult, error
 		return res, err
 	}
 	return res, nil
+}
+
+// startAgent runs `agent start` on the new pane: the remote Herdr picks the
+// canonical executable for the kind, watches real process detection, binds
+// the session name, and returns only at interactive readiness (default
+// 30 s). Two native answers need orchestration here: agent_pane_busy means
+// the fresh pane's shell has not claimed the foreground yet — retry inside
+// paneReadyTimeout — and agent_name_taken means a stale record still holds
+// the session name — clear it once, guarded, and retry before failing.
+// Other failures (timeout, transport, unknown pane) propagate as the
+// launch error.
+func (l *Launcher) startAgent(ctx context.Context, machineLabel, session, kind, paneID string) error {
+	paneReadyAt := time.Now().Add(paneReadyTimeout)
+	clearedName := false
+	for {
+		out, err := l.runner()(ctx, "herdr", machineArgv(machineLabel, "agent", "start",
+			session, "--kind", kind, "--pane", paneID)...)
+		if err != nil {
+			return fmt.Errorf("agent: start %s: %w", session, err)
+		}
+		if out.ExitCode == 0 {
+			return nil
+		}
+		switch {
+		case strings.Contains(out.Stderr, "agent_pane_busy") && time.Now().Before(paneReadyAt):
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("agent: start %s: %w", session, ctx.Err())
+			case <-time.After(paneReadyPoll):
+				continue
+			}
+		case strings.Contains(out.Stderr, "agent_name_taken") && !clearedName:
+			clearedName = true
+			if err := l.clearSessionName(ctx, machineLabel, session); err != nil {
+				return fmt.Errorf("agent: start %s: %s", session, textutil.FirstLine(out.Stderr))
+			}
+			continue
+		default:
+			return fmt.Errorf("agent: start %s: %s", session, textutil.FirstLine(out.Stderr))
+		}
+	}
 }
 
 // clearSessionName frees a session name held by a stale pane: `agent
@@ -427,36 +386,6 @@ func (l *Launcher) clearSessionName(ctx context.Context, machineLabel, session s
 		return fmt.Errorf("%s", textutil.FirstLine(out.Stderr))
 	}
 	return nil
-}
-
-// waitDetected polls `agent get <pane>` until the remote Herdr reports
-// the pane's agent as the expected kind: detection keys on the real
-// in-container process, so the poll proves the agent is up, not that it
-// finished initializing (real agents buffer stdin; the prompt retry
-// covers the rest). Returns a named error on timeout or a transport
-// failure.
-func (l *Launcher) waitDetected(ctx context.Context, machineLabel, paneID, kind string) error {
-	deadline := l.DetectTimeout
-	if deadline <= 0 {
-		deadline = detectTimeout
-	}
-	interval := l.PollInterval
-	if interval <= 0 {
-		interval = pollInterval
-	}
-	ctx, cancel := context.WithTimeout(ctx, deadline)
-	defer cancel()
-	for {
-		info, err := l.Get(ctx, machineLabel, paneID)
-		if err == nil && info.Kind == kind {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("agent: %s not detected in pane %s within %s", kind, paneID, deadline)
-		case <-time.After(interval):
-		}
-	}
 }
 
 // closePaneBestEffort closes a pane on the worker's server after a failed
@@ -500,20 +429,21 @@ func (l *Launcher) closeStaleWorkspaces(ctx context.Context, machineLabel, sessi
 }
 
 // SendPrompt delivers the seeded prompt to a live Herdr session via
-// `agent prompt`. Purpose: keep the send contract — trailing-newline
-// normalization, agent_not_ready retry, and error wording — in one place
-// so Start and any later re-seed caller share it. Inputs: machine label,
-// session name (or pane id), and prompt text. Returns a wrapped transport
-// error, or the first stderr line on a nonzero exit. `agent prompt`
-// rejects a blocked agent with agent_blocked — that refusal is the
-// honest answer, so it is returned rather than bypassed with raw pane
-// input.
+// `agent prompt`. Purpose: keep the send contract — liveness check,
+// trailing-newline normalization, agent_not_ready retry, and error
+// wording — in one place so Start and any later re-seed caller share it.
+// Inputs: machine label, session name (or pane id), and prompt text.
+// Returns a wrapped transport error, or the first stderr line on a
+// nonzero exit. `agent prompt` rejects a blocked agent with
+// agent_blocked — that refusal is the honest answer, so it is returned
+// rather than bypassed with raw pane input.
 func (l *Launcher) SendPrompt(ctx context.Context, machineLabel, session, prompt string) error {
 	// `agent prompt` types the text into the session's pane: when the
 	// agent is dead the pane sits at its shell and the prompt executes
-	// as shell commands inside the sandbox. Refuse unless the agent
-	// process is still foreground — a stale named record is not a live
-	// agent.
+	// as shell commands inside the sandbox. Herdr clears the record on
+	// agent exit, but its detection lags the kill by a beat — in that
+	// window the record still resolves while the pane is already a
+	// shell. Refuse unless the agent process is still foreground.
 	info, err := l.Get(ctx, machineLabel, session)
 	if err != nil {
 		return fmt.Errorf("agent: prompt %s: %w", session, err)
@@ -571,10 +501,10 @@ func (l *Launcher) PromptDelivered(ctx context.Context, machineLabel, session, t
 // Info is the parsed `agent get` report for one live session: the
 // detected kind, the normalized status Herdr reports, the pane identity
 // needed to stop or attach the worker, and whether the agent process is
-// actually still running. Herdr keeps a named agent's record after the
-// process exits (the pane falls back to its shell while `agent get`
-// still answers), so Running comes from `pane process-info`: the pane's
-// foreground process group must differ from its shell.
+// actually still running. Herdr clears the record when the agent exits,
+// but detection lags the kill — Running comes from `pane process-info`:
+// the pane's foreground process group must differ from its shell, so a
+// record caught in the exit window cannot masquerade as live.
 type Info struct {
 	Kind    string
 	Status  string
@@ -673,8 +603,8 @@ var ErrSessionGone = errors.New("session gone")
 
 // IsLive reports whether a Herdr session's agent is still running on the
 // worker's machine: the named record must answer AND the pane's
-// foreground must still be the agent — Herdr keeps the record after the
-// process exits, so a bare successful Get is not proof of life.
+// foreground must still be the agent — detection clears the record on
+// exit but lags the kill, so a bare successful Get is not proof of life.
 // Transport errors read as not-live; the subsequent Start surfaces the
 // real cause.
 func (l *Launcher) IsLive(ctx context.Context, machineLabel, session string) bool {
@@ -818,10 +748,10 @@ func parseWorkspaceCreate(stdout string) (paneID, workspaceID string) {
 	return parsed.Result.RootPane.PaneID, parsed.Result.Workspace.WorkspaceID
 }
 
-// runner resolves the injectable Runner default.
-func (l *Launcher) runner() Runner {
+// runner resolves the injectable machine.Runner default.
+func (l *Launcher) runner() machine.Runner {
 	if l.Runner != nil {
 		return l.Runner
 	}
-	return DefaultRunner
+	return machine.DefaultRunner
 }

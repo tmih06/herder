@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -198,25 +199,6 @@ func commitWork(t *testing.T, workspace, rel, content string) {
 	}
 }
 
-// taskStatus re-reads one task's status from the store.
-func taskStatus(t *testing.T, cfgPath, id string) string {
-	t.Helper()
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := storage.Open(cfg.Database.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	task, err := store.GetTask(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(task.Status)
-}
-
 // taskEvents re-reads one task's event types in order.
 func taskEvents(t *testing.T, cfgPath, id string) []string {
 	t.Helper()
@@ -238,15 +220,6 @@ func taskEvents(t *testing.T, cfgPath, id string) []string {
 		types = append(types, e.Type)
 	}
 	return types
-}
-
-func hasEvent(types []string, want string) bool {
-	for _, got := range types {
-		if got == want {
-			return true
-		}
-	}
-	return false
 }
 
 // ghCalls returns the recorded gh argv lines containing the fragment.
@@ -279,7 +252,7 @@ func TestTaskValidatePasses(t *testing.T) {
 	if !strings.Contains(out, "passed") {
 		t.Errorf("output should report the pass, got %q", out)
 	}
-	if got := taskStatus(t, path, id); got != "REVIEWING" {
+	if got := readTask(t, path, id).Status; got != "REVIEWING" {
 		t.Errorf("status = %s, want REVIEWING", got)
 	}
 	events := taskEvents(t, path, id)
@@ -287,7 +260,7 @@ func TestTaskValidatePasses(t *testing.T) {
 		"validation.started", "validation.command.started",
 		"validation.command.succeeded", "validation.passed",
 	} {
-		if !hasEvent(events, want) {
+		if !slices.Contains(events, want) {
 			t.Errorf("missing event %s, got %v", want, events)
 		}
 	}
@@ -304,7 +277,7 @@ func TestTaskValidateFailsRoutesToAgent(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("validate exit = %d, want 1 (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "RUNNING" {
+	if got := readTask(t, path, id).Status; got != "RUNNING" {
 		t.Errorf("status = %s, want RUNNING (returned to agent)", got)
 	}
 	session := agent.SessionName(id)
@@ -316,7 +289,7 @@ func TestTaskValidateFailsRoutesToAgent(t *testing.T) {
 		t.Errorf("prompt must carry the failure output, got %q", prompt)
 	}
 	events := taskEvents(t, path, id)
-	if !hasEvent(events, "validation.failed") || !hasEvent(events, "validation.retry") {
+	if !slices.Contains(events, "validation.failed") || !slices.Contains(events, "validation.retry") {
 		t.Errorf("missing failure routing events, got %v", events)
 	}
 	cfg, _ := config.Load(path)
@@ -339,10 +312,10 @@ func TestTaskValidateFailsToHuman(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("validate exit = %d, want 1", code)
 	}
-	if got := taskStatus(t, path, id); got != "WAITING_FOR_HUMAN" {
+	if got := readTask(t, path, id).Status; got != "WAITING_FOR_HUMAN" {
 		t.Errorf("status = %s, want WAITING_FOR_HUMAN", got)
 	}
-	if !hasEvent(taskEvents(t, path, id), "validation.awaiting_human") {
+	if !slices.Contains(taskEvents(t, path, id), "validation.awaiting_human") {
 		t.Errorf("missing awaiting_human event, got %v", taskEvents(t, path, id))
 	}
 }
@@ -365,7 +338,7 @@ func TestTaskDeliverForbiddenBlocksPR(t *testing.T) {
 	if calls := ghCalls(t, state, "pr create"); len(calls) != 0 {
 		t.Errorf("no PR may open on failed validation, ran %v", calls)
 	}
-	if got := taskStatus(t, path, id); got == "PR_OPEN" || got == "DONE" {
+	if got := readTask(t, path, id).Status; got == "PR_OPEN" || got == "DONE" {
 		t.Errorf("status = %s, must not reach delivery", got)
 	}
 }
@@ -409,7 +382,7 @@ func TestTaskDeliverOpensPR(t *testing.T) {
 	if !strings.Contains(out, "https://github.com/acme/web/pull/201") {
 		t.Errorf("output should name the PR, got %q", out)
 	}
-	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+	if got := readTask(t, path, id).Status; got != "PR_OPEN" {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 	for _, frag := range []string{"pr create", "issue comment", "issue edit"} {
@@ -438,7 +411,7 @@ func TestTaskDeliverOpensPR(t *testing.T) {
 	}
 	events := taskEvents(t, path, id)
 	for _, want := range []string{"delivery.started", "pull_request.created", "issue.commented", "issue.labels_updated", "delivery.completed"} {
-		if !hasEvent(events, want) {
+		if !slices.Contains(events, want) {
 			t.Errorf("missing event %s, got %v", want, events)
 		}
 	}
@@ -462,7 +435,7 @@ func TestTaskDeliverIdempotentPR(t *testing.T) {
 	if !strings.Contains(out, "pull/201") {
 		t.Errorf("existing PR url must surface, got %q", out)
 	}
-	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+	if got := readTask(t, path, id).Status; got != "PR_OPEN" {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 }
@@ -488,7 +461,7 @@ func TestTaskDeliverNoPR(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("deliver exit = %d (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "REVIEWING" {
+	if got := readTask(t, path, id).Status; got != "REVIEWING" {
 		t.Errorf("status = %s, want REVIEWING", got)
 	}
 	if calls := ghCalls(t, state, "pr create"); len(calls) != 0 {
@@ -510,13 +483,13 @@ func TestTaskDone(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("done exit = %d (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "DONE" {
+	if got := readTask(t, path, id).Status; got != "DONE" {
 		t.Errorf("status = %s, want DONE", got)
 	}
 	if calls := ghCalls(t, state, "--add-label completed"); len(calls) == 0 {
 		t.Errorf("completed label must be applied, calls %v", ghCalls(t, state, "issue edit"))
 	}
-	if !hasEvent(taskEvents(t, path, id), "task.completed") {
+	if !slices.Contains(taskEvents(t, path, id), "task.completed") {
 		t.Errorf("missing task.completed event, got %v", taskEvents(t, path, id))
 	}
 }
@@ -541,7 +514,7 @@ func TestTaskDoneRequiresPR(t *testing.T) {
 	if !strings.Contains(errOut, "deliver") {
 		t.Errorf("stderr should point at task deliver, got %q", errOut)
 	}
-	if got := taskStatus(t, path, id); got != "REVIEWING" {
+	if got := readTask(t, path, id).Status; got != "REVIEWING" {
 		t.Errorf("status = %s, want REVIEWING", got)
 	}
 }
@@ -569,7 +542,7 @@ func TestTaskDoneNoPR(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("done exit = %d (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "DONE" {
+	if got := readTask(t, path, id).Status; got != "DONE" {
 		t.Errorf("status = %s, want DONE", got)
 	}
 }
@@ -601,7 +574,7 @@ func TestDeliverPRUsesInspectedMount(t *testing.T) {
 	if !strings.Contains(errOut, "resolve") {
 		t.Errorf("stderr should name the rev-parse failure, got %q", errOut)
 	}
-	if got := taskStatus(t, path, id); got != "REVIEWING" {
+	if got := readTask(t, path, id).Status; got != "REVIEWING" {
 		t.Errorf("status = %s, want REVIEWING", got)
 	}
 }
@@ -624,7 +597,7 @@ func TestTaskDeliverRevalidatesMovedBranch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("deliver exit = %d (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+	if got := readTask(t, path, id).Status; got != "PR_OPEN" {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 	events := taskEvents(t, path, id)
@@ -676,7 +649,7 @@ func TestTaskDeliverResumesDelivering(t *testing.T) {
 	if !strings.Contains(out, "pull/201") {
 		t.Errorf("resumed delivery must report the PR, got %q", out)
 	}
-	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+	if got := readTask(t, path, id).Status; got != "PR_OPEN" {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 }
@@ -722,7 +695,7 @@ func TestTaskDeliverLocalRepo(t *testing.T) {
 	if !strings.Contains(out, "branch herder/7 pushed to "+upstream) {
 		t.Errorf("output should name the pushed branch and path, got %q", out)
 	}
-	if got := taskStatus(t, path, id); got != "PR_OPEN" {
+	if got := readTask(t, path, id).Status; got != "PR_OPEN" {
 		t.Errorf("status = %s, want PR_OPEN", got)
 	}
 	// The branch must really exist on the local upstream.
@@ -736,12 +709,12 @@ func TestTaskDeliverLocalRepo(t *testing.T) {
 	}
 	events := taskEvents(t, path, id)
 	for _, want := range []string{"delivery.started", "delivery.completed"} {
-		if !hasEvent(events, want) {
+		if !slices.Contains(events, want) {
 			t.Errorf("missing event %s, got %v", want, events)
 		}
 	}
 	for _, unwanted := range []string{"pull_request.created", "issue.commented", "issue.labels_updated"} {
-		if hasEvent(events, unwanted) {
+		if slices.Contains(events, unwanted) {
 			t.Errorf("local delivery must not emit %s, got %v", unwanted, events)
 		}
 	}
@@ -749,7 +722,7 @@ func TestTaskDeliverLocalRepo(t *testing.T) {
 	if code, _, errOut := runCmd(t, "--config", path, "task", "done", id); code != 0 {
 		t.Fatalf("done exit = %d (%s)", code, errOut)
 	}
-	if got := taskStatus(t, path, id); got != "DONE" {
+	if got := readTask(t, path, id).Status; got != "DONE" {
 		t.Errorf("status = %s, want DONE", got)
 	}
 }

@@ -11,8 +11,8 @@
 // caller is itself the trigger), then one atomic storage.Claim covering
 // delivery dedup, source dedup, and the insert. Concurrency caps belong
 // to the scheduler (issue #7), so bursts queue instead of being denied.
-// A mutex serializes same-process deliveries; UNIQUE rows cover sibling
-// processes.
+// Storage serializes transactions and enforces delivery/source uniqueness
+// across goroutines and controller processes.
 // Inputs: TriggerEvent deliveries plus the loaded config and open store.
 // Flow: adapter Verify+Parse -> Handle validates -> static gate -> Claim
 // or RecordDenied. Returns: Outcome with the durable decision and the new
@@ -26,7 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"unicode"
 
 	"github.com/tmih06/herder/internal/config"
 	"github.com/tmih06/herder/internal/storage"
@@ -94,7 +94,6 @@ type Outcome struct {
 type Handler struct {
 	cfg   *config.Config
 	store *storage.Store
-	mu    sync.Mutex
 }
 
 // New builds a Handler over the loaded config and open store.
@@ -125,8 +124,6 @@ func (h *Handler) Handle(ev TriggerEvent) (Outcome, error) {
 	if strings.TrimSpace(ev.IssueRef) == "" {
 		return Outcome{}, errors.New("ingest: delivery needs an issue ref")
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	sourceRef := SourceRef(ev.Provider, ev.Repository, ev.IssueRef)
 	if ev.DenyReason != "" {
@@ -248,8 +245,10 @@ func BranchName(issueRef, title string) string {
 // characters: alphanumerics kept, every other run becomes one dash.
 func Slug(title string) string {
 	var b strings.Builder
+	b.Grow(min(len(title), 40))
 	dash := false
-	for _, r := range strings.ToLower(title) {
+	for _, r := range title {
+		r = unicode.ToLower(r)
 		switch {
 		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -260,12 +259,11 @@ func Slug(title string) string {
 				dash = true
 			}
 		}
+		if b.Len() == 40 {
+			break
+		}
 	}
-	slug := strings.Trim(b.String(), "-")
-	if len(slug) > 40 {
-		slug = strings.Trim(slug[:40], "-")
-	}
-	return slug
+	return strings.TrimRight(b.String(), "-")
 }
 
 // matchTrigger returns the first trigger label present on the issue, or

@@ -48,7 +48,7 @@ event, and failure lands as a structured event — the event log answers
 | `agent: workspace create …` fails, task FAILED with `agent.start_failed` | The worker's container-local herdr server isn't answering (or `herdr` missing in the worker image) | Check `herdr --machine <task-id> status server`; the image must ship `herdr` (see `demo/Dockerfile.worker`); then `herder task retry <id>` |
 | `machine: add …` fails during provision | SSH into the container failed — missing Host block, keypair, or sshd in the image | `ssh <container>` should reach `sshd -i` via the `config.d` block; check `herder doctor` ssh section and that the image ships `openssh-server` |
 | `worker herdr server unreachable` in events, task WAITING_FOR_HUMAN | Container runs but its herdr server died or never started | `docker logs herder-<task>` shows the entrypoint; the entrypoint is `herdr server` — a crash exits the container |
-| `agent prompt` retries then fails (`agent_not_ready`) | Herdr pane exists but the agent inside hasn't come up | Check the pane via `herder task attach <id>` / `task logs`; retry once the agent binary is installed in the sandbox image |
+| Native `agent start` returns `agent_not_ready` | The named agent is live but blocked at startup, such as a trust or sign-in screen | Use `task attach` / `task logs` to unblock it, then `task start` to re-seed; Herder keeps the pane rather than killing it |
 | `docker found but daemon not answering` / `permission denied … docker.sock` | dockerd down, or your user lacks socket access | Start dockerd; add user to the `docker` group or fix socket permissions |
 | Provision fails with a dirty-workspace error (`DirtyError`) | Re-provisioning would discard uncommitted work | Inspect `<statedir>/sandboxes/<task>/`, commit or clean by hand, then re-provision — Herder refuses rather than destroys |
 | `ingest` prints `duplicate` | Same `delivery_id` or same issue already claimed | Expected no-op; the surviving task id is printed. Not a bug |
@@ -58,6 +58,9 @@ event, and failure lands as a structured event — the event log answers
 | `sandbox … not ready` on `task start` | Container missing or not running | `herder sandbox provision <task-id>` first; `sandbox inspect <id>` shows status |
 | `task logs`/`attach` fails | Session gone (`ErrSessionGone`) or machine unreachable | The pane exited; `task inspect` shows `agent.exited`/`worker.disconnected` — `task retry <id>` starts a fresh attempt |
 | Stale machine profiles in `herdr machine list` | A worker was removed without `sandbox destroy` | `herder sandbox destroy <task-or-container>` removes the profile and SSH files; `herdr machine remove <id>` cleans leftovers by hand |
+| Inbound webhook or direct submission returns HTTP 413 | Body exceeds the 1 MiB limit | Reduce the payload; oversized bodies are rejected before recording a delivery or creating a task |
+| `doctor` reports controller OK and storage FAIL | Config parsed successfully, but the database or its parent directory cannot be opened | Check `database.path`, directory ownership, and filesystem permissions; changing the config syntax is not the fix |
+| `status` reports `daemon returned …` and exits nonzero | The daemon returned an HTTP error, not an empty task list | Check daemon logs and `doctor`; a failed status request no longer prints `0 tasks` |
 
 ## Still stuck
 

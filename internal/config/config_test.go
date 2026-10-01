@@ -22,17 +22,6 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 }
 
-// The checked-in example and the `herder init` builtin must stay identical.
-func TestExampleMatchesBuiltin(t *testing.T) {
-	raw, err := os.ReadFile("../../examples/herder.yaml")
-	if err != nil {
-		t.Fatalf("read example: %v", err)
-	}
-	if string(raw) != ExampleYAML {
-		t.Error("examples/herder.yaml drifts from config.ExampleYAML; update both")
-	}
-}
-
 // writeConfig writes a config body to a temp file and returns its path.
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
@@ -48,8 +37,6 @@ server:
   listen: 127.0.0.1:8787
 database:
   path: /tmp/herder-test/herder.db
-herdr:
-  mode: socket
 scheduler:
   max_workers: 2
 repositories:

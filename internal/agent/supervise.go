@@ -7,8 +7,7 @@
 // Why: a running agent is supervised, not fire-and-forget; the terminal
 // is never the sole state database, so every observed change lands on the
 // owning task where `task inspect` and the status view can surface it.
-// Approach: Stage 1 CLI orchestration — `agent get` per bound session on
-// a ticker (the socket event subscription is the Stage 2 upgrade). All
+// Approach: `agent get` per bound session on a ticker. All
 // mutations go through storage so poll results are transactional with
 // their events.
 // Inputs: open store, launcher, poll interval. Flow: Run -> PollOnce per
@@ -122,10 +121,11 @@ func (s *Supervisor) pollTask(ctx context.Context, task *tasks.Task) {
 		s.logf("herder: supervise: %s: %v", task.ID, err)
 		return
 	}
-	// Herdr keeps the named record after the agent process exits, so a
-	// successful Get is not proof of life: the pane's foreground must
-	// still be the agent. A dead agent is the same exit the gone-session
-	// path handles — the pane stays for post-mortem reads.
+	// Detection clears the record when the agent exits, but it lags the
+	// kill: a record caught in that window still answers Get, so the
+	// pane's foreground must still be the agent. A dead agent is the
+	// same exit the gone-session path handles — the pane stays for
+	// post-mortem reads.
 	if !info.Running {
 		s.onExited(ctx, task)
 		return

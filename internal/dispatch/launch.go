@@ -67,7 +67,7 @@ func (d *Dispatcher) Launch(ctx context.Context, cfg *config.Config, task *tasks
 		return d.failTaskStart(ctx, task,
 			fmt.Sprintf("agent profile %q unknown and no usable default", task.AgentProfile))
 	}
-	if _, ok := agent.CommandForKind(prof.Kind); !ok {
+	if !config.IsSupportedAgentKind(prof.Kind) {
 		return d.failTaskStart(ctx, task, fmt.Sprintf("unknown agent kind %q", prof.Kind))
 	}
 	container := sandbox.ContainerName(task.ID)
@@ -224,15 +224,17 @@ func (d *Dispatcher) reuseSession(ctx context.Context, task *tasks.Task,
 	return nil
 }
 
-// emitEvent appends one agent lifecycle event with a JSON payload.
-// Purpose: launch, reuse, and failure report their event types from one
-// place so the marshal and error naming cannot drift between paths.
-// Returns the append error named for the caller to print once.
+// emitEvent appends one lifecycle event with a JSON payload.
+// Purpose: launch, provision, reuse, label, and failure paths report
+// their event types from one place so the marshal and error naming
+// cannot drift between paths.
+// Returns the append error named with the event type for the caller to
+// print once.
 func (d *Dispatcher) emitEvent(taskID, eventType string, payload any) error {
 	raw, _ := json.Marshal(payload)
 	if _, err := d.Store.AppendEvent(taskID, eventType,
 		d.actorType(), d.actorID(), string(raw)); err != nil {
-		return fmt.Errorf("record agent event: %w", err)
+		return fmt.Errorf("record %s event: %w", eventType, err)
 	}
 	return nil
 }

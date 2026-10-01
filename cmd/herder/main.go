@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -241,7 +242,7 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 	defer signal.Stop(sigCh)
 	select {
 	case err := <-errCh:
-		if err != nil && !strings.Contains(err.Error(), "Server closed") {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(ew, "herder: serve: %v\n", err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -250,7 +251,7 @@ func cmdDaemon(path string, w, ew io.Writer) int {
 			fmt.Fprintf(ew, "herder: worker drain timed out\n")
 			return 1
 		}
-		if err != nil && !strings.Contains(err.Error(), "Server closed") {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return 1
 		}
 		return 0
@@ -307,6 +308,10 @@ func cmdStatus(path string, w, ew io.Writer) int {
 		return 1
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(ew, "herder: daemon returned %s\n", resp.Status)
+		return 1
+	}
 	var payload struct {
 		Tasks []tasks.Task `json:"tasks"`
 	}
@@ -314,11 +319,7 @@ func cmdStatus(path string, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: decode daemon response: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(w, "%d tasks\n", len(payload.Tasks))
-	for _, t := range payload.Tasks {
-		fmt.Fprintf(w, "- %s %s agent=%s %s %s %s\n",
-			t.ID, t.Status, orDash(t.AgentState), t.SourceRef, t.Repository, t.AgentProfile)
-	}
+	printTasks(w, payload.Tasks)
 	return 0
 }
 
@@ -328,18 +329,17 @@ func cmdStatus(path string, w, ew io.Writer) int {
 func cmdDoctor(path string, w, ew io.Writer) int {
 	cfg, cfgErr := config.Load(path)
 	var store *storage.Store
+	var storeErr error
 	if cfgErr == nil {
-		var openErr error
-		store, openErr = storage.Open(cfg.Database.Path)
-		if openErr != nil {
-			cfgErr = openErr
-			_ = store
-			store = nil
-		} else {
+		store, storeErr = storage.Open(cfg.Database.Path)
+		if storeErr == nil {
 			defer store.Close()
 		}
 	}
 	report := health.Build(cfg, path, cfgErr, store)
+	if storeErr != nil {
+		report.Storage.Detail = storeErr.Error()
+	}
 	for _, section := range []health.Check{report.Controller, report.Storage, report.Herdr, report.Docker, report.SSH} {
 		fmt.Fprintf(w, "%-10s %s — %s\n", section.Name+":", section.State, section.Detail)
 	}
@@ -417,12 +417,18 @@ func taskList(store *storage.Store, w, ew io.Writer) int {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
+	printTasks(w, found)
+	return 0
+}
+
+// printTasks renders the shared CLI and daemon task-list format.
+// Inputs are the ordered tasks; all output goes to w.
+func printTasks(w io.Writer, found []tasks.Task) {
 	fmt.Fprintf(w, "%d tasks\n", len(found))
 	for _, t := range found {
 		fmt.Fprintf(w, "- %s %s agent=%s %s %s %s\n",
 			t.ID, t.Status, orDash(t.AgentState), t.SourceRef, t.Repository, t.AgentProfile)
 	}
-	return 0
 }
 
 // orDash renders an unset agent state for list output.
@@ -505,12 +511,10 @@ func taskCreate(cfg *config.Config, store *storage.Store, args []string, w, ew i
 			profile, strings.Join(config.AgentNames(cfg), ", "))
 		return 1
 	}
-	displayName := tasks.SanitizeDisplayName(*name)
-	if displayName == "" {
-		displayName = ingest.DisplayName(ingest.TriggerEvent{
-			Provider: *provider, Repository: *repo, IssueRef: issueRefPart(*sourceRef),
-		})
-	}
+	displayName := ingest.DisplayName(ingest.TriggerEvent{
+		Provider: *provider, Repository: *repo, IssueRef: issueRefPart(*sourceRef),
+		Name: *name,
+	})
 	created, err := store.CreateTask(storage.CreateInput{
 		SourceProvider: *provider, SourceRef: *sourceRef,
 		Repository: *repo, AgentProfile: profile, BranchName: *branch, Goal: *goal,
