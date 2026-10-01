@@ -251,7 +251,7 @@ func Slug(title string) string {
 		r = unicode.ToLower(r)
 		switch {
 		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
-			b.WriteByte(byte(r))
+			b.WriteRune(r)
 			dash = false
 		default:
 			if !dash && b.Len() > 0 {

@@ -42,7 +42,6 @@ func IsSupportedAgentKind(kind string) bool {
 	return slices.Contains(supportedAgentKinds, kind)
 }
 
-
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9_.\-/]+$`)
 
 // Config is the root of examples/herder.yaml.
@@ -67,11 +66,10 @@ type DatabaseConfig struct {
 	Path string `yaml:"path"`
 }
 
-
 // GithubConfig holds the env-expanded webhook signing secret.
 // Empty skips signature verification for local development only.
 type GithubConfig struct {
-	WebhookSecret  string `yaml:"webhook_secret"`
+	WebhookSecret string `yaml:"webhook_secret"`
 }
 
 // LinearConfig holds the Linear webhook signing secret (env-expanded)
@@ -222,8 +220,8 @@ type DeliveryLabels struct {
 
 // DeliveryConfig controls pull-request delivery.
 type DeliveryConfig struct {
-	CreatePR  bool           `yaml:"create_pr"`
-	Labels    DeliveryLabels `yaml:"labels"`
+	CreatePR bool           `yaml:"create_pr"`
+	Labels   DeliveryLabels `yaml:"labels"`
 }
 
 // LabelSet returns the configured stage labels with spec defaults filled:
@@ -438,7 +436,6 @@ func validPort(s string) bool {
 	n, err := strconv.Atoi(s)
 	return err == nil && n >= 1 && n <= 65535
 }
-
 
 // sortedKeys returns the map keys in sorted order for stable messages.
 // Purpose: one helper for every name list in errors and CLI output.

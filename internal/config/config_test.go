@@ -22,7 +22,6 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 }
 
-
 // writeConfig writes a config body to a temp file and returns its path.
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()

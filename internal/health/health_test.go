@@ -43,4 +43,3 @@ func TestCheckPassesOnGoodSetup(t *testing.T) {
 		t.Error("good setup must report OK")
 	}
 }
-
