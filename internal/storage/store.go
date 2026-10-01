@@ -250,11 +250,11 @@ func (s *Store) CreateTask(in CreateInput) (tasks.Task, error) {
 		SourceRef:      in.SourceRef,
 		Repository:     in.Repository,
 		AgentProfile:   in.AgentProfile,
+		BranchName:     in.BranchName,
 		Goal:           in.Goal,
 		DisplayName:    in.DisplayName,
 		Priority:       in.Priority,
 	})
-	task.BranchName = in.BranchName
 	actorType, actorID := orDefault(in.ActorType, "controller"), orDefault(in.ActorID, "cli")
 	event := tasks.CreatedEvent(task, actorType, actorID)
 	tx, err := s.db.Begin()
@@ -324,8 +324,30 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	if err != nil {
 		return tasks.Event{}, err
 	}
+	event, err := transitionTx(tx, &task, to, actorType, actorID)
+	if err != nil {
+		return tasks.Event{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return tasks.Event{}, fmt.Errorf("storage: commit: %w", err)
+	}
+	return event, nil
+}
+
+// transitionTx applies one validated jump inside the caller's
+// transaction and commits the status columns plus the task.transition
+// event together. Entering RUNNING stamps started_at so the agent
+// timeout measures each attempt's wall clock from dispatch — except
+// resuming from PAUSED or BLOCKED, which continues the same attempt and
+// keeps the original stamp so an interrupted worker cannot outrun its
+// timeout budget. The UPDATE always writes the full
+// status/started_at/updated_at triple so Transition and claimOnce's
+// multi-hop walk share one write path. Inputs: open tx, the task row
+// (mutated in place), the target state, actor attribution. Returns the
+// minted event, or the state-machine error with nothing written.
+func transitionTx(tx *sql.Tx, task *tasks.Task, to tasks.State, actorType, actorID string) (tasks.Event, error) {
 	from := task.Status
-	event, err := tasks.ApplyTransition(&task, to, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
+	event, err := tasks.ApplyTransition(task, to, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
 	if err != nil {
 		return tasks.Event{}, err
 	}
@@ -338,9 +360,6 @@ func (s *Store) Transition(id string, to tasks.State, actorType, actorID string)
 	}
 	if err := insertEvent(tx, event); err != nil {
 		return tasks.Event{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return tasks.Event{}, fmt.Errorf("storage: commit: %w", err)
 	}
 	return event, nil
 }
@@ -361,36 +380,23 @@ type Binding struct {
 
 // SetBinding records the durable link without touching task status:
 // sandbox provision stores the container and machine profile, agent
-// start stores the session name and remote pane/workspace ids. Unknown
-// ids fail with ErrNotFound; updated_at moves so crash recovery can
-// tell a fresh link from a stale one.
+// start stores the session name and remote pane/workspace ids. The
+// merge happens in the UPDATE itself — COALESCE(NULLIF(?, ”), column)
+// keeps the stored value for fields the caller left empty — so two
+// partial updates can never interleave into a lost write, and unknown
+// ids still fail with ErrNotFound. updated_at moves so crash recovery
+// can tell a fresh link from a stale one.
 func (s *Store) SetBinding(id string, b Binding) error {
-	task, err := s.GetTask(id)
-	if err != nil {
-		return err
-	}
-	if b.SandboxID != "" {
-		task.SandboxID = b.SandboxID
-	}
-	if b.MachineID != "" {
-		task.MachineID = b.MachineID
-	}
-	if b.SessionID != "" {
-		task.AgentSessionID = b.SessionID
-	}
-	if b.RemoteWorkspaceID != "" {
-		task.RemoteWorkspaceID = b.RemoteWorkspaceID
-	}
-	if b.RemotePaneID != "" {
-		task.RemotePaneID = b.RemotePaneID
-	}
-	task.UpdatedAt = time.Now().UTC()
-	res, err := s.db.Exec(`UPDATE tasks SET sandbox_id = ?, machine_id = ?,
-		agent_session_id = ?, remote_workspace_id = ?, remote_pane_id = ?,
+	res, err := s.db.Exec(`UPDATE tasks SET
+		sandbox_id = COALESCE(NULLIF(?, ''), sandbox_id),
+		machine_id = COALESCE(NULLIF(?, ''), machine_id),
+		agent_session_id = COALESCE(NULLIF(?, ''), agent_session_id),
+		remote_workspace_id = COALESCE(NULLIF(?, ''), remote_workspace_id),
+		remote_pane_id = COALESCE(NULLIF(?, ''), remote_pane_id),
 		updated_at = ? WHERE id = ?`,
-		task.SandboxID, task.MachineID, task.AgentSessionID,
-		task.RemoteWorkspaceID, task.RemotePaneID,
-		formatTime(task.UpdatedAt), id)
+		b.SandboxID, b.MachineID, b.SessionID,
+		b.RemoteWorkspaceID, b.RemotePaneID,
+		formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("storage: set binding: %w", err)
 	}
@@ -406,9 +412,8 @@ func (s *Store) SetBinding(id string, b Binding) error {
 // for partial updates, not clears. Unknown ids fail with ErrNotFound;
 // updated_at moves so recovery can tell a fresh clear from a stale link.
 func (s *Store) ClearSessionBinding(id string) error {
-	if _, err := s.GetTask(id); err != nil {
-		return err
-	}
+	// updated_at always changes, so zero rows affected means the task
+	// does not exist: no existence pre-read is needed.
 	res, err := s.db.Exec(`UPDATE tasks SET agent_session_id = '', updated_at = ? WHERE id = ?`,
 		formatTime(time.Now().UTC()), id)
 	if err != nil {
@@ -512,11 +517,7 @@ func (s *Store) restartAttempt(id, newProfile, eventType, actorType, actorID str
 	}
 	now := time.Now().UTC()
 	if task.Status != tasks.Queued && task.Status != tasks.Retrying {
-		event, err := tasks.ApplyTransition(&task, tasks.Retrying, orDefault(actorType, "controller"), orDefault(actorID, "cli"))
-		if err != nil {
-			return tasks.Task{}, err
-		}
-		if err := insertEvent(tx, event); err != nil {
+		if _, err := transitionTx(tx, &task, tasks.Retrying, actorType, actorID); err != nil {
 			return tasks.Task{}, err
 		}
 	}
@@ -697,6 +698,8 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 			}
 		}
 		return outcome, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return ClaimOutcome{}, fmt.Errorf("storage: read delivery: %w", err)
 	}
 	if survivor, err := getTaskBySourceTx(tx, req.SourceProvider, req.SourceRef); err == nil {
 		reason := fmt.Sprintf("issue %s:%s already claimed by %s", req.SourceProvider, req.SourceRef, survivor.ID)
@@ -707,6 +710,8 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 			return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
 		}
 		return ClaimOutcome{Decision: DecisionDuplicate, Reason: reason, Task: survivor}, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return ClaimOutcome{}, fmt.Errorf("storage: read source task: %w", err)
 	}
 
 	task := tasks.New(tasks.NewInput{
@@ -714,6 +719,7 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 		SourceRef:      req.SourceRef,
 		Repository:     req.Repository,
 		AgentProfile:   req.AgentProfile,
+		BranchName:     req.BranchName,
 		Goal:           req.Goal,
 		DisplayName:    req.DisplayName,
 		Priority:       req.Priority,
@@ -740,16 +746,9 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 	if err := insertEvent(tx, tasks.CreatedEvent(task, actorType, actorID)); err != nil {
 		return ClaimOutcome{}, err
 	}
+	const acceptedReason = "policy accepted; task claimed and queued"
 	for _, to := range []tasks.State{tasks.Eligible, tasks.Claimed, tasks.Queued} {
-		event, err := tasks.ApplyTransition(&task, to, actorType, actorID)
-		if err != nil {
-			return ClaimOutcome{}, err
-		}
-		if _, err := tx.Exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-			string(task.Status), formatTime(task.UpdatedAt), task.ID); err != nil {
-			return ClaimOutcome{}, fmt.Errorf("storage: update status: %w", err)
-		}
-		if err := insertEvent(tx, event); err != nil {
+		if _, err := transitionTx(tx, &task, to, actorType, actorID); err != nil {
 			return ClaimOutcome{}, err
 		}
 	}
@@ -761,18 +760,18 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 	}); err != nil {
 		return ClaimOutcome{}, err
 	}
-	if err := insertDeliveryTx(tx, Delivery{
+	if _, err := insertDeliveryTx(tx, Delivery{
 		DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
 		SourceRef: req.SourceRef, Repository: req.Repository,
-		Decision: DecisionAccepted, Reason: "policy accepted; task claimed and queued",
+		Decision: DecisionAccepted, Reason: acceptedReason,
 		TaskID: task.ID, CreatedAt: time.Now().UTC(),
-	}); err != nil {
+	}, ""); err != nil {
 		return ClaimOutcome{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return ClaimOutcome{}, fmt.Errorf("storage: commit: %w", err)
 	}
-	return ClaimOutcome{Decision: DecisionAccepted, Reason: "policy accepted; task claimed and queued", Task: task}, nil
+	return ClaimOutcome{Decision: DecisionAccepted, Reason: acceptedReason, Task: task}, nil
 }
 
 // isConflict reports SQLite uniqueness violations from a lost cross-process
@@ -780,13 +779,10 @@ func (s *Store) claimOnce(req ClaimRequest) (ClaimOutcome, error) {
 // Purpose: lets Claim retry once as a re-read instead of surfacing a
 // constraint error for what is really a duplicate delivery.
 func isConflict(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") ||
-		strings.Contains(msg, "PRIMARY KEY constraint") ||
-		strings.Contains(msg, "constraint failed")
+	// modernc.org/sqlite phrases every uniqueness violation (UNIQUE,
+	// PRIMARY KEY, CHECK) as "<...> constraint failed", so one
+	// substring covers the whole family.
+	return err != nil && strings.Contains(err.Error(), "constraint failed")
 }
 
 // RecordDenied durably logs a delivery refused before claiming: unknown or
@@ -807,16 +803,6 @@ func (s *Store) RecordDenied(deliveryID, provider, sourceRef, repository, reason
 		Decision: DecisionPolicyDenied, Reason: reason,
 		CreatedAt: time.Now().UTC(),
 	}
-	// ON CONFLICT DO NOTHING plus the re-read inside recordDeniedOnce
-	// already turn a lost race into the rival row; no retry needed.
-	got, created, err := recordDeniedOnce(s, denied)
-	return got, created, err
-}
-
-// recordDeniedOnce inserts one denial unless the delivery id is taken.
-// Purpose: one attempt of RecordDenied. Returns created=false with a nil
-// error when the row already exists, so the caller can report duplicate.
-func recordDeniedOnce(s *Store, denied Delivery) (Delivery, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Delivery{}, false, fmt.Errorf("storage: begin: %w", err)
@@ -824,22 +810,20 @@ func recordDeniedOnce(s *Store, denied Delivery) (Delivery, bool, error) {
 	defer func() { _ = tx.Rollback() }()
 	if existing, err := getDeliveryTx(tx, denied.DeliveryID); err == nil {
 		return existing, false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Delivery{}, false, fmt.Errorf("storage: read delivery: %w", err)
 	}
-	const insert = `INSERT INTO webhook_deliveries
-		(delivery_id, source_provider, source_ref, repository, decision, reason, task_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(delivery_id) DO NOTHING`
-	res, err := tx.Exec(insert, denied.DeliveryID, denied.SourceProvider, denied.SourceRef,
-		denied.Repository, denied.Decision, denied.Reason, denied.TaskID, formatTime(denied.CreatedAt))
+	// ON CONFLICT DO NOTHING plus the re-read below turn a lost
+	// cross-process race into the rival row; no retry is needed.
+	res, err := insertDeliveryTx(tx, denied, ` ON CONFLICT(delivery_id) DO NOTHING`)
 	if err != nil {
-		return Delivery{}, false, fmt.Errorf("storage: insert delivery: %w", err)
+		return Delivery{}, false, err
 	}
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		existing, rerr := getDeliveryTx(tx, denied.DeliveryID)
 		if rerr != nil {
 			return Delivery{}, false, fmt.Errorf("storage: re-read denied delivery: %w", rerr)
 		}
-		_ = tx.Rollback()
 		return existing, false, nil
 	}
 	if err := tx.Commit(); err != nil {
@@ -850,16 +834,26 @@ func recordDeniedOnce(s *Store, denied Delivery) (Delivery, bool, error) {
 
 // GetDelivery returns one recorded delivery or ErrDeliveryNotFound.
 func (s *Store) GetDelivery(id string) (Delivery, error) {
-	var d Delivery
-	var createdAt string
-	err := s.db.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id).Scan(
-		&d.DeliveryID, &d.SourceProvider, &d.SourceRef, &d.Repository,
-		&d.Decision, &d.Reason, &d.TaskID, &createdAt)
+	d, err := scanDelivery(s.db.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Delivery{}, ErrDeliveryNotFound
 	}
 	if err != nil {
 		return Delivery{}, fmt.Errorf("storage: get delivery: %w", err)
+	}
+	return d, nil
+}
+
+// scanDelivery scans one deliveryColumns row and parses its timestamp.
+// Inputs: a row in deliveryColumns order. Returns sql.ErrNoRows
+// unwrapped so callers map it to ErrDeliveryNotFound or the claim path's
+// not-yet-recorded branch.
+func scanDelivery(row rowScanner) (Delivery, error) {
+	var d Delivery
+	var createdAt string
+	if err := row.Scan(&d.DeliveryID, &d.SourceProvider, &d.SourceRef,
+		&d.Repository, &d.Decision, &d.Reason, &d.TaskID, &createdAt); err != nil {
+		return Delivery{}, err
 	}
 	var perr error
 	if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
@@ -879,15 +873,9 @@ func (s *Store) ListDeliveries() ([]Delivery, error) {
 	defer rows.Close()
 	out := []Delivery{}
 	for rows.Next() {
-		var d Delivery
-		var createdAt string
-		if err := rows.Scan(&d.DeliveryID, &d.SourceProvider, &d.SourceRef,
-			&d.Repository, &d.Decision, &d.Reason, &d.TaskID, &createdAt); err != nil {
+		d, err := scanDelivery(rows)
+		if err != nil {
 			return nil, fmt.Errorf("storage: scan delivery: %w", err)
-		}
-		var perr error
-		if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
-			return nil, fmt.Errorf("storage: parse delivery time: %w", perr)
 		}
 		out = append(out, d)
 	}
@@ -1038,41 +1026,24 @@ func (s *Store) ReleaseLease(taskID, owner string) error {
 // so the event belongs to the caller's recovery path.
 // Inputs: the cutoff time. Returns the evicted owners by task id.
 func (s *Store) ExpireLeases(now time.Time) (map[string]string, error) {
-	tx, err := s.db.Begin()
+	// DELETE ... RETURNING evicts and reports in one statement, so no
+	// transaction or scan-then-delete ordering is needed.
+	rows, err := s.db.Query(`DELETE FROM leases WHERE expires_at <= ? RETURNING task_id, owner`,
+		formatTime(now))
 	if err != nil {
-		return nil, fmt.Errorf("storage: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	// The scan runs in a closure so rows.Close is deferred like every
-	// other query in this file — the tx's single connection must be free
-	// before the DELETE below runs on it.
-	expired := map[string]string{}
-	err = func() error {
-		rows, err := tx.Query(`SELECT task_id, owner FROM leases WHERE expires_at <= ?`, formatTime(now))
-		if err != nil {
-			return fmt.Errorf("storage: list expired leases: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var taskID, owner string
-			if err := rows.Scan(&taskID, &owner); err != nil {
-				return fmt.Errorf("storage: scan expired lease: %w", err)
-			}
-			expired[taskID] = owner
-		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("storage: list expired leases: %w", err)
-		}
-		return nil
-	}()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM leases WHERE expires_at <= ?`, formatTime(now)); err != nil {
 		return nil, fmt.Errorf("storage: expire leases: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("storage: commit: %w", err)
+	defer rows.Close()
+	expired := map[string]string{}
+	for rows.Next() {
+		var taskID, owner string
+		if err := rows.Scan(&taskID, &owner); err != nil {
+			return nil, fmt.Errorf("storage: scan expired lease: %w", err)
+		}
+		expired[taskID] = owner
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: expire leases: %w", err)
 	}
 	return expired, nil
 }
@@ -1121,29 +1092,14 @@ const deliveryColumns = `SELECT delivery_id, source_provider, source_ref, reposi
 // the task insert commit or roll back together.
 // Returns sql.ErrNoRows (unmapped) when the delivery is new.
 func getDeliveryTx(tx *sql.Tx, id string) (Delivery, error) {
-	var d Delivery
-	var createdAt string
-	if err := tx.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id).Scan(
-		&d.DeliveryID, &d.SourceProvider, &d.SourceRef, &d.Repository,
-		&d.Decision, &d.Reason, &d.TaskID, &createdAt); err != nil {
-		return Delivery{}, err
-	}
-	var perr error
-	if d.CreatedAt, perr = parseTime(createdAt); perr != nil {
-		return Delivery{}, fmt.Errorf("storage: parse delivery time: %w", perr)
-	}
-	return d, nil
+	return scanDelivery(tx.QueryRow(deliveryColumns+` WHERE delivery_id = ?`, id))
 }
 
 // getTaskBySourceTx loads a task by provider issue inside a transaction.
 // Purpose: the already-claimed check inside the claim transaction.
 // Returns sql.ErrNoRows (unmapped) when the issue is unclaimed.
 func getTaskBySourceTx(tx *sql.Tx, provider, ref string) (tasks.Task, error) {
-	task, err := scanTask(tx.QueryRow(taskColumns+` WHERE source_provider = ? AND source_ref = ?`, provider, ref))
-	if err != nil {
-		return tasks.Task{}, err
-	}
-	return task, nil
+	return scanTask(tx.QueryRow(taskColumns+` WHERE source_provider = ? AND source_ref = ?`, provider, ref))
 }
 
 // insertTaskTx inserts one task row inside the caller's transaction.
@@ -1169,16 +1125,20 @@ func insertTaskTx(tx *sql.Tx, task tasks.Task, conflictSuffix string) (sql.Resul
 
 // insertDeliveryTx records one delivery row inside the caller's transaction.
 // Purpose: single choke point so claim, duplicate, and denial paths log
-// the same way. Returns wrapped errors only.
-func insertDeliveryTx(tx *sql.Tx, d Delivery) error {
+// the same way; conflictSuffix carries RecordDenied's ON CONFLICT clause
+// (empty elsewhere). Inputs: open tx, the delivery, and a leading-space
+// conflict suffix appended to the INSERT. Returns the Exec result so
+// callers can inspect RowsAffected, plus wrapped errors only.
+func insertDeliveryTx(tx *sql.Tx, d Delivery, conflictSuffix string) (sql.Result, error) {
 	const insert = `INSERT INTO webhook_deliveries
 		(delivery_id, source_provider, source_ref, repository, decision, reason, task_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	if _, err := tx.Exec(insert, d.DeliveryID, d.SourceProvider, d.SourceRef,
-		d.Repository, d.Decision, d.Reason, d.TaskID, formatTime(d.CreatedAt)); err != nil {
-		return fmt.Errorf("storage: insert delivery: %w", err)
+	res, err := tx.Exec(insert+conflictSuffix, d.DeliveryID, d.SourceProvider, d.SourceRef,
+		d.Repository, d.Decision, d.Reason, d.TaskID, formatTime(d.CreatedAt))
+	if err != nil {
+		return nil, fmt.Errorf("storage: insert delivery: %w", err)
 	}
-	return nil
+	return res, nil
 }
 
 // recordDuplicateTx logs one deduplicated delivery inside the claim
@@ -1187,12 +1147,12 @@ func insertDeliveryTx(tx *sql.Tx, d Delivery) error {
 // Inputs: open claim tx, the losing request, the surviving task, the
 // human-readable reason, actor attribution. Returns wrapped errors only.
 func recordDuplicateTx(tx *sql.Tx, req ClaimRequest, survivor tasks.Task, reason, actorType, actorID string) error {
-	if err := insertDeliveryTx(tx, Delivery{
+	if _, err := insertDeliveryTx(tx, Delivery{
 		DeliveryID: req.DeliveryID, SourceProvider: req.SourceProvider,
 		SourceRef: req.SourceRef, Repository: req.Repository,
 		Decision: DecisionDuplicate, Reason: reason, TaskID: survivor.ID,
 		CreatedAt: time.Now().UTC(),
-	}); err != nil {
+	}, ""); err != nil {
 		return err
 	}
 	return insertEvent(tx, tasks.Event{
@@ -1212,7 +1172,7 @@ func (s *Store) ListEvents(taskID string) ([]tasks.Event, error) {
 		return nil, fmt.Errorf("storage: list events: %w", err)
 	}
 	defer rows.Close()
-	var out []tasks.Event
+	out := []tasks.Event{}
 	for rows.Next() {
 		var event tasks.Event
 		var createdAt string

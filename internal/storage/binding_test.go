@@ -3,7 +3,10 @@ package storage
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -75,6 +78,52 @@ func TestSetBindingRoundTrip(t *testing.T) {
 
 	if err := store.SetBinding("task_missing", Binding{SandboxID: "sbx", SessionID: "sess"}); err == nil {
 		t.Error("binding an unknown task should fail")
+	}
+}
+
+// TestSetBindingConcurrentMerge proves two partial updates racing on
+// disjoint fields both land: the merge happens in the UPDATE statement
+// itself, so neither caller's read-modify-write can lose the other's
+// write (pre-atomic SetBinding let the second commit clobber the first).
+func TestSetBindingConcurrentMerge(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "herder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTask(createInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const goroutines = 8
+	errs := make(chan error, goroutines*2)
+	var ready sync.WaitGroup
+	ready.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(i int) {
+			ready.Done()
+			errs <- store.SetBinding(task.ID, Binding{SandboxID: fmt.Sprintf("sbx-%d", i)})
+			errs <- store.SetBinding(task.ID, Binding{SessionID: fmt.Sprintf("sess-%d", i)})
+		}(i)
+	}
+	ready.Wait()
+	for i := 0; i < goroutines*2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent SetBinding = %v", err)
+		}
+	}
+	got, err := store.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Whatever each racer wrote must survive: the sandbox id is one of
+	// the written values and the session id is one of the written values.
+	if got.SandboxID == "" || !strings.HasPrefix(got.SandboxID, "sbx-") {
+		t.Errorf("sandbox = %q, want one of the raced sbx-* values", got.SandboxID)
+	}
+	if got.AgentSessionID == "" || !strings.HasPrefix(got.AgentSessionID, "sess-") {
+		t.Errorf("session = %q, want one of the raced sess-* values", got.AgentSessionID)
 	}
 }
 

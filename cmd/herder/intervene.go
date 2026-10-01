@@ -265,68 +265,18 @@ func taskStop(store *storage.Store, args []string, w, ew io.Writer) int {
 	return 0
 }
 
-// taskRetry starts a fresh attempt (SPEC section 22): the dispatch
-// lease is taken first, the live session closes, the container thaws
-// if paused, the attempt counter increments through RETRYING ->
-// QUEUED, and the launch flow runs again on the same sandbox and
-// workspace. The lease must precede the RETRYING commit: a scheduler
-// reconcile tick in the gap would see a lease-less RETRYING task,
-// requeue it with a spurious "retry abandoned" dispatch_failed event,
-// and let dispatchOne steal the launch — so holdRestartLease claims
-// the lease while the task still wears its pre-retry state and keeps
-// it across the whole requeue-and-launch. A foreign lease refuses
-// before the worker is touched or the attempt minted: a dispatch
-// already in progress is the honest error, not a post-commit
-// surprise. Launch's own HoldLease sees the same-owner lease and
-// proceeds. A missing container leaves the task QUEUED with a
-// provision hint instead of failing it.
+// taskRetry starts a fresh attempt on the same sandbox and workspace.
+// The shared restart path holds the dispatch lease before changing state.
 func taskRetry(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	task, code := oneTask(store, args, "retry", ew)
 	if code != 0 {
 		return code
 	}
-	if code := guardRestart(&task, "retry", ew); code != 0 {
-		return code
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
-	defer cancel()
-	d := newDispatcher(store, w, ew)
-	lctx, release, err := holdRestartLease(ctx, d, &task)
-	if err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	if release != nil {
-		defer release()
-	}
-	if err := d.StopWorker(lctx, &task); err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	updated, err := store.Retry(task.ID, "human", "cli")
-	if err != nil {
-		fmt.Fprintf(ew, "herder: retry task %s: %v\n", task.ID, err)
-		return 1
-	}
-	if code := requeue(store, &updated, ew); code != 0 {
-		return code
-	}
-	fmt.Fprintf(w, "herder: task %s retrying (attempt %d)\n", updated.ID, updated.Attempt)
-	if err := d.Launch(lctx, cfg, &updated, "", ""); err != nil {
-		fmt.Fprintf(ew, "herder: %v\n", err)
-		return 1
-	}
-	return 0
+	return restartTask(cfg, store, &task, "", w, ew)
 }
 
-// taskHandoff moves the task to a different agent kind on a fresh
-// attempt (SPEC section 22): the dispatch lease is taken first (the
-// same lease-first ordering as taskRetry, so a scheduler tick cannot
-// requeue the lease-less RETRYING commit or steal the launch), the
-// old session closes, the profile swap and attempt increment commit
-// atomically with an agent.handed_off event, and the new agent
-// launches into the same sandbox and workspace — history and work
-// preserved, never an untraceable new job.
+// taskHandoff validates the replacement profile before stopping a worker,
+// then restarts the task with its existing sandbox and work.
 func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew io.Writer) int {
 	fs := flag.NewFlagSet("handoff", flag.ContinueOnError)
 	fs.SetOutput(ew)
@@ -346,22 +296,37 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 			*profile, strings.Join(config.AgentNames(cfg), ", "))
 		return 1
 	}
-	if _, ok := agent.CommandForKind(prof.Kind); !ok {
+	if !config.IsSupportedAgentKind(prof.Kind) {
 		fmt.Fprintf(ew, "herder: agent profile %q has unknown kind %q\n", *profile, prof.Kind)
 		return 1
 	}
-	task, err := store.GetTask(fs.Arg(0))
-	if err != nil {
-		fmt.Fprintf(ew, "herder: task %q not found\n", fs.Arg(0))
-		return 1
+	task, code := oneTask(store, fs.Args(), "handoff", ew)
+	if code != 0 {
+		return code
+	}
+	return restartTask(cfg, store, &task, *profile, w, ew)
+}
+
+// restartTask owns retry/handoff ordering: validate, lease, stop, commit
+// the fresh attempt, requeue, and launch. An empty profile retries with
+// the current agent; a replacement records the handoff and seeds its prior
+// profile. Holding the lease before RETRYING prevents reconciliation from
+// requeueing the task or a competing dispatcher from launching it.
+// Returns the CLI exit code; every refusal leaves existing work intact.
+func restartTask(cfg *config.Config, store *storage.Store, task *tasks.Task,
+	profile string, w, ew io.Writer,
+) int {
+	verb := "retry"
+	if profile != "" {
+		verb = "handoff"
+	}
+	if code := guardRestart(task, verb, ew); code != 0 {
+		return code
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	if code := guardRestart(&task, "handoff", ew); code != 0 {
-		return code
-	}
 	d := newDispatcher(store, w, ew)
-	lctx, release, err := holdRestartLease(ctx, d, &task)
+	lctx, release, err := holdRestartLease(ctx, d, task)
 	if err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
@@ -369,22 +334,32 @@ func taskHandoff(cfg *config.Config, store *storage.Store, args []string, w, ew 
 	if release != nil {
 		defer release()
 	}
-	if err := d.StopWorker(lctx, &task); err != nil {
+	if err := d.StopWorker(lctx, task); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}
-	prior := task.AgentProfile
-	updated, err := store.Handoff(task.ID, *profile, "human", "cli")
+	var updated tasks.Task
+	prior := ""
+	if profile == "" {
+		updated, err = store.Retry(task.ID, "human", "cli")
+	} else {
+		prior = task.AgentProfile
+		updated, err = store.Handoff(task.ID, profile, "human", "cli")
+	}
 	if err != nil {
-		fmt.Fprintf(ew, "herder: handoff task %s: %v\n", task.ID, err)
+		fmt.Fprintf(ew, "herder: %s task %s: %v\n", verb, task.ID, err)
 		return 1
 	}
 	if code := requeue(store, &updated, ew); code != 0 {
 		return code
 	}
-	fmt.Fprintf(w, "herder: task %s handed off %s -> %s (attempt %d)\n",
-		updated.ID, prior, *profile, updated.Attempt)
-	if err := d.Launch(lctx, cfg, &updated, *profile, prior); err != nil {
+	if profile == "" {
+		fmt.Fprintf(w, "herder: task %s retrying (attempt %d)\n", updated.ID, updated.Attempt)
+	} else {
+		fmt.Fprintf(w, "herder: task %s handed off %s -> %s (attempt %d)\n",
+			updated.ID, prior, profile, updated.Attempt)
+	}
+	if err := d.Launch(lctx, cfg, &updated, profile, prior); err != nil {
 		fmt.Fprintf(ew, "herder: %v\n", err)
 		return 1
 	}

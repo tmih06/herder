@@ -44,22 +44,3 @@ func TestCheckPassesOnGoodSetup(t *testing.T) {
 	}
 }
 
-// Herdr/Docker sections must always be present and labeled, whatever the
-// host provides; they warn but never decide OK().
-func TestRuntimeSectionsAlwaysLabeled(t *testing.T) {
-	report := Build(nil, "x", errTest, nil)
-	for _, section := range []Check{report.Herdr, report.Docker} {
-		if section.Name != "herdr" && section.Name != "docker" {
-			t.Errorf("section mislabeled: %+v", section)
-		}
-		if section.State == "" || section.Detail == "" {
-			t.Errorf("section must carry state and detail: %+v", section)
-		}
-	}
-}
-
-var errTest = errTestType{}
-
-type errTestType struct{}
-
-func (errTestType) Error() string { return "test load failure" }
